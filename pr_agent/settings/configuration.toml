@@ -27,7 +27,7 @@ disable_auto_feedback = false
 ai_timeout=120 # 2 minutes
 skip_keys = []
 custom_reasoning_model = false # when true, disables system messages and temperature controls for models that don't support chat-style inputs
-response_language="en-US" # Language locales code for PR responses in ISO 3166 and ISO 639 format (e.g., "en-US", "it-IT", "zh-CN", ...)
+response_language="zh-CN" # Language locales code for PR responses in ISO 3166 and ISO 639 format (e.g., "en-US", "it-IT", "zh-CN", ...)
 repo_context_files = ["AGENTS.md"] # Repository-relative files (e.g. AGENTS.md, CLAUDE.md) to include as AI prompt context; set to [] to disable
 repo_context_from_default_branch = true # Read repo context files from the repository default branch (trusts only default-branch content). Set to false to read from the PR target branch instead.
 repo_context_max_lines = 500 # Maximum total rendered lines for repo context, including wrapper tags
@@ -110,20 +110,20 @@ enable_help_text=false # Determines whether to include help text in the PR revie
 
 [pr_description] # /describe #
 publish_labels=false
-add_original_user_description=true
+add_original_user_description=false
 generate_ai_title=false
 use_bullet_points=true
 extra_instructions = ""
-enable_pr_type=true
+enable_pr_type=false
 final_update_message = true
 enable_help_text=false
 enable_help_comment=false
-enable_pr_diagram=true # adds a section with a diagram of the PR changes
+enable_pr_diagram=false # adds a section with a diagram of the PR changes
 # describe as comment
 publish_description_as_comment=false
 publish_description_as_comment_persistent=true
 ## changes walkthrough section
-enable_semantic_files_types=true
+enable_semantic_files_types=false
 collapsible_file_list='adaptive' # true, false, 'adaptive'
 collapsible_file_list_threshold=6
 inline_file_summary=false # false, true, 'table'
@@ -141,11 +141,28 @@ extra_instructions = ""
 
 
 [pr_code_suggestions] # /improve #
-commitable_code_suggestions = false
+# commitable_code_suggestions=true switches /improve from summarized-table mode
+# to inline-diff-comment mode. In inline mode each suggestion is published as a
+# GitLab DiffNote (positioned on the source line) with a ```suggestion``` block,
+# which makes GitLab render the native "Apply suggestion" button. The author
+# still has to confirm in GitLab's review dialog before the change is committed,
+# which is the human-in-the-loop step this fork is designed for.
+commitable_code_suggestions = true
+# Cap the number of inline suggestions per /improve invocation so a noisy
+# review cannot blow the prompt budget.
+num_code_suggestions = 5
+# Ask the LLM to put the new code into the ``improved_code`` field,
+# without nested ```` ``` ```` fences inside that field (they leak into the
+# final suggestion block and confuse GitLab).
+extra_instructions = """
+每条建议请把建议后的代码完整填入 YAML 的 ``improved_code`` 字段, 不要在 ``improved_code`` 内重复添加 ```` ``` ```` 标记; pr-agent 会自动用 ```suggestion 块包住 improved_code, 用户在 GitLab UI 上可以直接点击 "Apply suggestion" 按钮。
+"""
+# dual_publishing_score_threshold keeps the summarized-table UX for the
+# overview while also publishing inline DiffNotes for important suggestions.
+# Set to -1 to disable the inline re-publish and rely on inline mode alone
+# (the table will then no longer be emitted by /improve).
 dual_publishing_score_threshold=-1 # -1 to disable, [0-10] to set the threshold (>=) for publishing a code suggestion both in a table and as committable
 focus_only_on_problems=true
-#
-extra_instructions = ""
 enable_help_text=false
 enable_chat_text=false
 persistent_comment=true

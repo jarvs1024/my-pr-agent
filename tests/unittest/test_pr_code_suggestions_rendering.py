@@ -174,12 +174,18 @@ async def test_push_inline_publishes_no_suggestions_comment_when_empty():
 # ---------------------------------------------------------------------------
 
 def test_generate_summarized_suggestions_empty_returns_placeholder():
-    tool = _make_tool()
-    out = tool.generate_summarized_suggestions({"code_suggestions": []})
-    assert "PR Code Suggestions" in out
-    assert "No suggestions found to improve this PR." in out
-    # No table is rendered when empty
-    assert "<table>" not in out
+    settings = get_settings()
+    snapshot = snapshot_settings(["config.response_language"])
+    settings.set("config.response_language", "en-US")
+    try:
+        tool = _make_tool()
+        out = tool.generate_summarized_suggestions({"code_suggestions": []})
+        assert "PR Code Suggestions" in out
+        assert "No suggestions found to improve this PR." in out
+        # No table is rendered when empty
+        assert "<table>" not in out
+    finally:
+        restore_settings(snapshot)
 
 
 def test_generate_summarized_suggestions_renders_table_and_sorts_by_score():
@@ -251,13 +257,19 @@ def test_generate_summarized_suggestions_escapes_angle_bracket_strings_in_summar
 
 
 def test_generate_summarized_suggestions_includes_score_why_block_when_present():
-    git_provider = MagicMock()
-    git_provider.get_line_link.return_value = ""
-    tool = _make_tool(git_provider)
-    suggestion = _suggestion(score_why="Catches a real bug.")
-    out = tool.generate_summarized_suggestions({"code_suggestions": [suggestion]})
-    assert "Suggestion importance[1-10]: 7" in out
-    assert "Why: Catches a real bug." in out
+    settings = get_settings()
+    snapshot = snapshot_settings(["config.response_language"])
+    settings.set("config.response_language", "en-US")
+    try:
+        git_provider = MagicMock()
+        git_provider.get_line_link.return_value = ""
+        tool = _make_tool(git_provider)
+        suggestion = _suggestion(score_why="Catches a real bug.")
+        out = tool.generate_summarized_suggestions({"code_suggestions": [suggestion]})
+        assert "Suggestion importance[1-10]: 7" in out
+        assert "Why: Catches a real bug." in out
+    finally:
+        restore_settings(snapshot)
 
 
 # ---------------------------------------------------------------------------
