@@ -150,7 +150,7 @@ extra_instructions = ""
 commitable_code_suggestions = true
 # Cap the number of inline suggestions per /improve invocation so a noisy
 # review cannot blow the prompt budget.
-num_code_suggestions = 5
+num_code_suggestions = 8
 # Ask the LLM to put the new code into the ``improved_code`` field,
 # without nested ```` ``` ```` fences inside that field (they leak into the
 # final suggestion block and confuse GitLab).
@@ -158,7 +158,32 @@ extra_instructions = """
 每条建议请把建议后的代码完整填入 YAML 的 ``improved_code`` 字段, 不要在 ``improved_code`` 内重复添加 ```` ``` ```` 标记; pr-agent 会自动用 ```suggestion 块包住 improved_code, 用户在 GitLab UI 上可以直接点击 "Apply suggestion" 按钮。
 
 ``suggestion_content``、``label`` 等文字字段必须用中文 (zh-CN) 输出, 包括 importance 评分标签后的描述。
+
+# Project-specific (auto-review-test) — force LLM to follow the AGENTS.md rule keys when emitting suggestions:
+#   ZLG-RULE-NO-LOG-EXC, ZLG-RULE-DOCSTRING-REQUIRED, ZLG-RULE-NO-BARE-PRINT,
+#   ZLG-RULE-TYPEHINTS, ZLG-RULE-FORBIDDEN-COMMENT
+# Each suggestion MUST cite the relevant rule key inside ``suggestion_content``
+# in the form "违反 `ZLG-RULE-XX`", and the ``improved_code`` snippet MUST
+# enforce the rule (e.g. replace ``except Exception: pass`` with
+# ``logging.exception(...)`` + re-raise; add a docstring and type hints;
+# remove the ``ZLG-VIOLATION-MARKER`` comment).
+
+# Coverage requirement: when ANY of the ZLG-RULE-* keys in AGENTS.md applies to the
+# diff, emit AT LEAST one suggestion for each distinct rule violated. Don't drop
+# a rule just because the chunk only covers a few hunks; the same rule must be
+# cited in any chunk that contains a violation. The total cap is set by
+# ``num_code_suggestions`` below (raised to 8 so 5 AGENTS.md rules can each get
+# one suggestion, with room for critical non-rule fixes like the ``buggy_add``
+# logic bug).
 """
+
+# Required rule citation map (emit one suggestion per row when violated):
+#   ZLG-RULE-NO-LOG-EXC         -> replace bare ``except Exception: pass`` with ``logging.exception`` + re-raise
+#   ZLG-RULE-DOCSTRING-REQUIRED  -> add a single-line docstring under each affected ``def``
+#   ZLG-RULE-NO-BARE-PRINT      -> replace ``print(...)`` in production code with ``logging.info(...)``
+#   ZLG-RULE-TYPEHINTS          -> add Python type annotations to affected function signatures
+#   ZLG-RULE-FORBIDDEN-COMMENT  -> delete the literal line containing ``ZLG-VIOLATION-MARKER``
+
 # dual_publishing_score_threshold keeps the summarized-table UX for the
 # overview while also publishing inline DiffNotes for important suggestions.
 # Set to -1 to disable the inline re-publish and rely on inline mode alone

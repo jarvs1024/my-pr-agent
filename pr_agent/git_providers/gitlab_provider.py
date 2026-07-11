@@ -362,6 +362,24 @@ class GitLabProvider(GitProvider):
             get_logger().warning(f"Error retrieving file {file_path} from branch {branch}: {e}")
             return ''
 
+    def get_repo_file_content(self, file_path: str, from_default_branch: bool = False) -> str:
+        # Mirrors the GitLab-side support added in upstream PR-agent#2387 for repo-context files
+        # (e.g. AGENTS.md). When `from_default_branch` is true we read from the project default
+        # branch, otherwise fall back to the MR target branch; missing files resolve to ''.
+        try:
+            if from_default_branch:
+                ref = self.gl.projects.get(self.id_project).default_branch
+            else:
+                # __init__ always populates self.mr via _set_merge_request, so no fallback look-up needed.
+                ref = getattr(self.mr, "target_branch", None) or self.gl.projects.get(self.id_project).default_branch
+            file_obj = self.gl.projects.get(self.id_project).files.get(file_path=file_path, ref=ref)
+            return decode_if_bytes(file_obj.decode())
+        except GitlabGetError:
+            return ''
+        except Exception as e:
+            get_logger().warning(f"Error retrieving repo file {file_path}: {e}")
+            return ''
+
     def create_or_update_pr_file(self, file_path: str, branch: str, contents="", message="") -> None:
         """Create or update a file in the GitLab repository."""
         try:
