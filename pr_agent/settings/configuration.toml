@@ -156,6 +156,8 @@ num_code_suggestions = 5
 # final suggestion block and confuse GitLab).
 extra_instructions = """
 每条建议请把建议后的代码完整填入 YAML 的 ``improved_code`` 字段, 不要在 ``improved_code`` 内重复添加 ```` ``` ```` 标记; pr-agent 会自动用 ```suggestion 块包住 improved_code, 用户在 GitLab UI 上可以直接点击 "Apply suggestion" 按钮。
+
+``suggestion_content``、``label`` 等文字字段必须用中文 (zh-CN) 输出, 包括 importance 评分标签后的描述。
 """
 # dual_publishing_score_threshold keeps the summarized-table UX for the
 # overview while also publishing inline DiffNotes for important suggestions.
