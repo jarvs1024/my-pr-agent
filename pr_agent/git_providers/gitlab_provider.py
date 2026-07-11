@@ -767,6 +767,18 @@ class GitLabProvider(GitProvider):
         except Exception as e:
             get_logger().exception(f"Failed to remove comment, error: {e}")
 
+    def resolve_discussion(self, discussion_id: str) -> bool:
+        """Mark a MR discussion as resolved (used by the /dismiss reply command)."""
+        try:
+            discussion = self.mr.discussions.get(discussion_id)
+            discussion.resolved = True
+            discussion.save()
+            get_logger().info(f"Resolved MR discussion {discussion_id}")
+            return True
+        except Exception as e:
+            get_logger().exception(f"Failed to resolve discussion {discussion_id}: {e}")
+            return False
+
     def get_title(self):
         return self.mr.title
 

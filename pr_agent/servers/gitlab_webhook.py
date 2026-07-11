@@ -266,12 +266,31 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
             if 'merge_request' in data:
                 mr = data['merge_request']
                 url = mr.get('url')
-                comment_id = data.get('object_attributes', {}).get('id')
-                provider = get_git_provider_with_context(pr_url=url)
+                obj_attrs = data.get('object_attributes', {})
+                comment_id = obj_attrs.get('id')
+                body = obj_attrs.get('note', '')
+                note_type = obj_attrs.get('type')
 
+                # /dismiss on a reply to an inline suggestion → resolve that MR discussion.
+                # GitLab marks inline comments as DiffNote whether they start a new thread
+                # or reply to an existing one; the discriminator is that a reply carries a
+                # discussion_id pointing at the parent thread.
+                if note_type == 'DiffNote' and body.strip() == '/dismiss':
+                    discussion_id = obj_attrs.get('discussion_id')
+                    if discussion_id:
+                        provider = get_git_provider_with_context(pr_url=url)
+                        ok = provider.resolve_discussion(discussion_id)
+                        if ok:
+                            get_logger().info(f"/dismiss resolved MR discussion {discussion_id}")
+                        else:
+                            get_logger().warning(f"/dismiss failed to resolve discussion {discussion_id}")
+                        return JSONResponse(status_code=status.HTTP_200_OK,
+                                            content=jsonable_encoder({"message": "dismissed" if ok else "dismiss failed"}))
+                    # top-level /dismiss on a new inline note — fall through to normal handling
+
+                provider = get_git_provider_with_context(pr_url=url)
                 get_logger().info(f"A comment has been added to a merge request: {url}")
-                body = data.get('object_attributes', {}).get('note')
-                if data.get('object_attributes', {}).get('type') == 'DiffNote' and '/ask' in body: # /ask_line
+                if note_type == 'DiffNote' and '/ask' in body: # /ask_line
                     body = handle_ask_line(body, data)
 
                 await handle_request(url, body, log_context, sender_id, notify=lambda: provider.add_eyes_reaction(comment_id))
