@@ -282,7 +282,7 @@ def build_repo_context(git_provider) -> str:
     return repo_context
 
 
-RULE_KEY_PATTERN = re.compile(r"(?<![`\w])(ZLG-RULE-[A-Z0-9-]+)(?![`\w])")
+RULE_KEY_PATTERN = re.compile(r"(?<![\w])(ZLG-RULE-[A-Z0-9-]+)(?![\w])")
 
 
 def extract_rule_keys(repo_context_text: str) -> list[str]:

@@ -15,7 +15,7 @@ from pr_agent.telemetry import models
 from pr_agent.telemetry.store import get_default_store
 
 
-_RULE_KEY_RE = re.compile(r"(?<![`\w])(ZLG-RULE-[A-Z0-9-]+)(?![`\w])")
+_RULE_KEY_RE = re.compile(r"(?<![\w])(ZLG-RULE-[A-Z0-9-]+)(?![\w])")
 
 
 def extract_rule_keys_from_text(text: str) -> list[str]:

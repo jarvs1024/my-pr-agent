@@ -15,6 +15,7 @@ from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
 from pr_agent.algo.git_patch_processing import decouple_and_convert_to_hunks_with_lines_numbers
 from pr_agent.algo.repo_context import build_repo_context, extract_rule_keys
+from pr_agent.algo.improve_coverage import compute_uncovered_rules, render_uncovered_details
 from pr_agent.telemetry import events as telemetry_events
 from pr_agent.algo.pr_processing import (add_ai_metadata_to_diff_files,
                                          get_pr_diff, get_pr_multi_diffs,
@@ -184,6 +185,13 @@ class PRCodeSuggestions:
                         pr_body += "<hr>\n\n<details> <summary><strong>💡 Tool usage guide:</strong></summary><hr> \n\n"
                         pr_body += HelpMessage.get_improve_usage_guide()
                         pr_body += "\n</details>\n"
+
+                    # Surface AGENTS.md rule coverage gap so reviewers see which rule_keys
+                    # the LLM silently dropped. Computed from the same `data` we just
+                    # received; relies on `agents_md_rules` already injected into `self.vars`.
+                    _required_rules = self.vars.get("agents_md_rules") or []
+                    _uncovered = compute_uncovered_rules(_required_rules, data.get("code_suggestions") or [])
+                    pr_body += render_uncovered_details(_uncovered)
 
                     # Output the relevant configurations if enabled
                     if get_settings().get('config', {}).get('output_relevant_configurations', False):
