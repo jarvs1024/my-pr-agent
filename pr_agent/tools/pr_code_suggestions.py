@@ -238,6 +238,23 @@ class PRCodeSuggestions:
                         get_logger().exception(f"Failed to update persistent review, error: {e}")
         finally:
             if _run_id:
+                try:
+                    _gp_final = self.git_provider
+                    _final_mr = (
+                        getattr(_gp_final, "id_mr", None)
+                        or getattr(getattr(_gp_final, "pr", None), "iid", None)
+                        or 0
+                    )
+                    _raw_pid = getattr(_gp_final, "id_project", None) or 0
+                    _final_pid = _raw_pid if isinstance(_raw_pid, int) else 0
+                    if not _final_pid and isinstance(_raw_pid, str):
+                        try:
+                            _final_pid = _gp_final.gl.projects.get(_raw_pid).id
+                        except Exception:
+                            _final_pid = 0
+                except Exception:
+                    _final_mr = 0
+                    _final_pid = 0
                 telemetry_events.emit_run_finished(
                     _run_id,
                     status=_run_status["name"],
@@ -245,6 +262,9 @@ class PRCodeSuggestions:
                     rule_keys=_run_status.get("rule_keys", []),
                     error=_run_status.get("error"),
                     duration_ms=int((time.monotonic() - _run_started_at) * 1000),
+                    mr_id=int(_final_mr or 0),
+                    project_id=int(_final_pid or 0),
+                    command="improve",
                 )
 
     async def add_self_review_text(self, pr_body):

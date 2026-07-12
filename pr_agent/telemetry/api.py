@@ -44,18 +44,23 @@ def health() -> dict:
 
 
 @router.get("/metrics/overview")
-def metrics_overview() -> dict:
-    return get_default_store().overview()
+def metrics_overview(since: Optional[str] = None) -> dict:
+    return get_default_store().overview(since=since)
 
 
 @router.get("/metrics/rules")
-def metrics_rules() -> list[dict]:
-    return get_default_store().per_rule_stats()
+def metrics_rules(since: Optional[str] = None) -> list[dict]:
+    return get_default_store().per_rule_stats(since=since)
+
+
+@router.get("/metrics/authors")
+def metrics_authors(since: Optional[str] = None) -> list[dict]:
+    return get_default_store().per_author_stats(since=since)
 
 
 @router.get("/mrs")
-def list_mrs(limit: int = 50, project_id: Optional[int] = None) -> list[dict]:
-    return get_default_store().list_mrs(limit=limit, project_id=project_id)
+def list_mrs(limit: int = 50, project_id: Optional[int] = None, state: Optional[str] = None, since: Optional[str] = None) -> list[dict]:
+    return get_default_store().list_mrs(limit=limit, project_id=project_id, state=state, since=since)
 
 
 @router.get("/mrs/{project_id}/{mr_id}")

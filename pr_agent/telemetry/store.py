@@ -129,6 +129,26 @@ class TelemetryStore:
         elif self.backend == "jsonl":
             self._write_jsonl("mr_activity", d)
 
+    def update_run_finished(self, run_id: str, status: str, error=None, duration_ms=None) -> None:
+        """Backfill mr_id/project_id/command into the existing started row, then set finish fields.
+
+        The started row is created with empty fields (because emit_run_finished runs in a
+        fire-and-forget finally block where we don't have the calling tool's context). We
+        therefore store whatever fields we know here, and the API caller can update the rest
+        through subsequent calls if needed.
+        """
+        if self.backend != "sqlite" or self._db is None:
+            return
+        sets = ["status=?", "finished_at=?", "error=?", "duration_ms=?"]
+        from datetime import datetime, timezone
+        params = [status, datetime.now(timezone.utc).isoformat(timespec="seconds"), error, duration_ms]
+        with self._lock:
+            self._db.execute(
+                f"UPDATE review_runs SET {', '.join(sets)} WHERE run_id=?",
+                (*params, run_id),
+            )
+            self._db.commit()
+
     def record_run(self, run) -> None:
         d = run.to_dict()
         if self.backend == "sqlite":
@@ -187,14 +207,24 @@ class TelemetryStore:
 
     # ---------- reads ----------
 
-    def list_mrs(self, limit: int = 50, project_id: Optional[int] = None):
+    def list_mrs(self, limit: int = 50, project_id: Optional[int] = None, state: Optional[str] = None, since: Optional[str] = None):
         if self.backend != "sqlite" or self._db is None:
             return []
+        clauses = []
+        params: list = []
+        if project_id is not None:
+            clauses.append("project_id=?")
+            params.append(project_id)
+        if state is not None:
+            clauses.append("state=?")
+            params.append(state)
+        if since is not None:
+            clauses.append("last_seen_at >= ?")
+            params.append(since)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
         with self._lock:
-            if project_id is not None:
-                cur = self._db.execute("SELECT * FROM mr_activity WHERE project_id=? ORDER BY last_seen_at DESC LIMIT ?", (project_id, limit))
-            else:
-                cur = self._db.execute("SELECT * FROM mr_activity ORDER BY last_seen_at DESC LIMIT ?", (limit,))
+            cur = self._db.execute(f"SELECT * FROM mr_activity{where} ORDER BY last_seen_at DESC LIMIT ?", params)
             rows = cur.fetchall()
         return [_row_to_mr(r) for r in rows]
 
@@ -233,20 +263,27 @@ class TelemetryStore:
             rows = cur.fetchall()
         return [_row_to_action(r) for r in rows]
 
-    def overview(self):
+    def overview(self, since: Optional[str] = None):
         if self.backend != "sqlite" or self._db is None:
             return {}
+        mr_clause = " WHERE last_seen_at >= ?" if since else ""
+        sug_clause = " WHERE posted_at >= ?" if since else ""
+        run_clause = " WHERE started_at >= ?" if since else ""
+        mr_params = (since,) if since else ()
+        sug_params = (since,) if since else ()
+        run_params = (since,) if since else ()
         with self._lock:
-            mr_count = self._db.execute("SELECT COUNT(*) FROM mr_activity").fetchone()[0]
-            merged = self._db.execute("SELECT COUNT(*) FROM mr_activity WHERE state='merged'").fetchone()[0]
-            open_mrs = self._db.execute("SELECT COUNT(*) FROM mr_activity WHERE state='opened'").fetchone()[0]
-            sug_total = self._db.execute("SELECT COUNT(*) FROM suggestions").fetchone()[0]
-            sug_applied = self._db.execute("SELECT COUNT(*) FROM suggestions WHERE state='applied'").fetchone()[0]
-            sug_dismissed = self._db.execute("SELECT COUNT(*) FROM suggestions WHERE state='dismissed'").fetchone()[0]
-            sug_open = self._db.execute("SELECT COUNT(*) FROM suggestions WHERE state='open'").fetchone()[0]
-            run_total = self._db.execute("SELECT COUNT(*) FROM review_runs").fetchone()[0]
-            run_failed = self._db.execute("SELECT COUNT(*) FROM review_runs WHERE status='failed'").fetchone()[0]
+            mr_count = self._db.execute(f"SELECT COUNT(*) FROM mr_activity{mr_clause}", mr_params).fetchone()[0]
+            merged = self._db.execute(f"SELECT COUNT(*) FROM mr_activity WHERE state='merged'{(' AND last_seen_at >= ?' if since else '')}", mr_params).fetchone()[0]
+            open_mrs = self._db.execute(f"SELECT COUNT(*) FROM mr_activity WHERE state='opened'{(' AND last_seen_at >= ?' if since else '')}", mr_params).fetchone()[0]
+            sug_total = self._db.execute(f"SELECT COUNT(*) FROM suggestions{sug_clause}", sug_params).fetchone()[0]
+            sug_applied = self._db.execute(f"SELECT COUNT(*) FROM suggestions WHERE state='applied'{(' AND posted_at >= ?' if since else '')}", sug_params).fetchone()[0]
+            sug_dismissed = self._db.execute(f"SELECT COUNT(*) FROM suggestions WHERE state='dismissed'{(' AND posted_at >= ?' if since else '')}", sug_params).fetchone()[0]
+            sug_open = self._db.execute(f"SELECT COUNT(*) FROM suggestions WHERE state='open'{(' AND posted_at >= ?' if since else '')}", sug_params).fetchone()[0]
+            run_total = self._db.execute(f"SELECT COUNT(*) FROM review_runs{run_clause}", run_params).fetchone()[0]
+            run_failed = self._db.execute(f"SELECT COUNT(*) FROM review_runs WHERE status='failed'{(' AND started_at >= ?' if since else '')}", run_params).fetchone()[0]
         return {
+            "since": since,
             "mrs": {"total": mr_count, "merged": merged, "open": open_mrs},
             "suggestions": {
                 "total": sug_total,
@@ -259,11 +296,83 @@ class TelemetryStore:
             "runs": {"total": run_total, "failed": run_failed, "success_rate": ((run_total - run_failed) / run_total) if run_total else 0.0},
         }
 
-    def per_rule_stats(self):
+    def per_author_stats(self, since: Optional[str] = None):
         if self.backend != "sqlite" or self._db is None:
             return []
+        # MR per author: group by mr_activity.author
+        mr_clause = " WHERE last_seen_at >= ?" if since else ""
+        sug_clause = " WHERE posted_at >= ?" if since else ""
+        run_clause = " WHERE started_at >= ?" if since else ""
+        params = (since,) if since else ()
         with self._lock:
-            cur = self._db.execute("SELECT rule_keys, state, COUNT(*) FROM suggestions GROUP BY rule_keys, state")
+            mr_rows = self._db.execute(
+                f"SELECT author, COUNT(*) AS mr_count, "
+                f"SUM(CASE WHEN state='merged' THEN 1 ELSE 0 END) AS merged "
+                f"FROM mr_activity{mr_clause} GROUP BY author", params
+            ).fetchall()
+            sug_rows = self._db.execute(
+                f"SELECT mr.author, s.state, COUNT(*) FROM suggestions s "
+                f"JOIN mr_activity mr ON mr.project_id = s.project_id AND mr.mr_id = s.mr_id "
+                f"{sug_clause.replace('WHERE', 'WHERE s.', 1) if since else ''} "
+                f"GROUP BY mr.author, s.state", sug_params if since else ()
+            ).fetchall() if since else self._db.execute(
+                "SELECT mr.author, s.state, COUNT(*) FROM suggestions s "
+                "JOIN mr_activity mr ON mr.project_id = s.project_id AND mr.mr_id = s.mr_id "
+                "GROUP BY mr.author, s.state"
+            ).fetchall()
+            run_rows = self._db.execute(
+                f"SELECT mr.author, r.command, COUNT(*), "
+                f"SUM(CASE WHEN r.status='failed' THEN 1 ELSE 0 END) "
+                f"FROM review_runs r JOIN mr_activity mr ON mr.project_id = r.project_id AND mr.mr_id = r.mr_id "
+                f"{run_clause.replace('WHERE', 'WHERE r.', 1) if since else ''} "
+                f"GROUP BY mr.author, r.command", params if since else ()
+            ).fetchall() if since else self._db.execute(
+                "SELECT mr.author, r.command, COUNT(*), "
+                "SUM(CASE WHEN r.status='failed' THEN 1 ELSE 0 END) "
+                "FROM review_runs r JOIN mr_activity mr ON mr.project_id = r.project_id AND mr.mr_id = r.mr_id "
+                "GROUP BY mr.author, r.command"
+            ).fetchall()
+
+        # Build per-author aggregate
+        agg: dict = {}
+        for author, mr_count, merged in mr_rows:
+            agg.setdefault(author or "unknown", {"mr_count": 0, "merged_count": 0, "suggestion_total": 0, "suggestion_applied": 0, "suggestion_dismissed": 0, "runs_by_command": {}})
+            agg[author or "unknown"]["mr_count"] = mr_count
+            agg[author or "unknown"]["merged_count"] = merged
+        for author, state, count in sug_rows:
+            entry = agg.setdefault(author or "unknown", {"mr_count": 0, "merged_count": 0, "suggestion_total": 0, "suggestion_applied": 0, "suggestion_dismissed": 0, "runs_by_command": {}})
+            entry["suggestion_total"] += count
+            if state == "applied":
+                entry["suggestion_applied"] += count
+            elif state == "dismissed":
+                entry["suggestion_dismissed"] += count
+        for author, command, count, failed in run_rows:
+            entry = agg.setdefault(author or "unknown", {"mr_count": 0, "merged_count": 0, "suggestion_total": 0, "suggestion_applied": 0, "suggestion_dismissed": 0, "runs_by_command": {}})
+            entry["runs_by_command"][command or "unknown"] = {"total": count, "failed": failed or 0}
+
+        result = []
+        for author, s in sorted(agg.items()):
+            total = s["suggestion_total"]
+            applied = s["suggestion_applied"]
+            result.append({
+                "author": author,
+                "mr_count": s["mr_count"],
+                "merged_count": s["merged_count"],
+                "suggestion_total": total,
+                "suggestion_applied": applied,
+                "suggestion_dismissed": s["suggestion_dismissed"],
+                "adoption_rate": (applied / total) if total else 0.0,
+                "runs_by_command": s["runs_by_command"],
+            })
+        return result
+
+    def per_rule_stats(self, since: Optional[str] = None):
+        if self.backend != "sqlite" or self._db is None:
+            return []
+        clause = " WHERE posted_at >= ?" if since else ""
+        params = (since,) if since else ()
+        with self._lock:
+            cur = self._db.execute(f"SELECT rule_keys, state, COUNT(*) FROM suggestions{clause} GROUP BY rule_keys, state", params)
             rows = cur.fetchall()
         from collections import defaultdict
         agg = defaultdict(lambda: {"applied": 0, "dismissed": 0, "open": 0, "superseded": 0, "total": 0})

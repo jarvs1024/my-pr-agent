@@ -6,6 +6,7 @@ but swallowed.
 """
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Iterable, Optional
 
@@ -88,8 +89,52 @@ def emit_run_finished(
     rule_keys: Optional[Iterable[str]] = None,
     error: Optional[str] = None,
     duration_ms: Optional[int] = None,
+    mr_id: Optional[int] = None,
+    project_id: Optional[int] = None,
+    command: Optional[str] = None,
 ) -> None:
+    """Mark the run as finished.
+
+    If ``mr_id`` / ``project_id`` / ``command`` are passed, we UPDATE the existing
+    started row in place so the JOINs in ``per_author_stats`` work. Otherwise we
+    fall back to recording a fresh row with empty fields (legacy behaviour).
+    """
     try:
+        store = get_default_store()
+        if mr_id is not None and project_id is not None and command:
+            # Backfill into the started row + set finish fields in one UPDATE
+            from datetime import datetime, timezone
+            sets = [
+                "mr_id=?",
+                "project_id=?",
+                "command=?",
+                "status=?",
+                "finished_at=?",
+                "error=?",
+                "duration_ms=?",
+                "suggestion_count=?",
+                "rule_keys_cited=?",
+            ]
+            params = [
+                int(mr_id),
+                int(project_id),
+                command,
+                status,
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                error,
+                duration_ms,
+                suggestion_count,
+                json.dumps(list(rule_keys or []), ensure_ascii=False),
+            ]
+            if hasattr(store, "_db") and store._db is not None:
+                with store._lock:
+                    store._db.execute(
+                        f"UPDATE review_runs SET {', '.join(sets)} WHERE run_id=?",
+                        (*params, run_id),
+                    )
+                    store._db.commit()
+            return
+        # Legacy path: insert a fresh row (will overwrite the started row via PK)
         from datetime import datetime, timezone
         run = models.ReviewRun(
             run_id=run_id,
@@ -103,7 +148,7 @@ def emit_run_finished(
             suggestion_count=suggestion_count,
             rule_keys_cited=list(rule_keys or []),
         )
-        get_default_store().record_run(run)
+        store.record_run(run)
     except Exception as e:
         get_logger().warning(f"telemetry.emit_run_finished failed: {e}")
 
