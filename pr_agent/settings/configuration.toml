@@ -169,11 +169,11 @@ num_code_suggestions = 5
 extra_instructions = """
 每条建议请把建议后的代码完整填入 YAML 的 ``improved_code`` 字段, 不要在 ``improved_code`` 内重复添加 ```` ``` ```` 标记; pr-agent 会自动用 ```suggestion 块包住 improved_code, 用户在 GitLab UI 上可以直接点击 "Apply suggestion" 按钮。
 
-``improved_code`` 必须是自包含的: 用户在 GitLab 上点 "Apply suggestion" 后, 替换进去的代码必须能直接 import/run, 不依赖同文件里其它位置已有的 import. 具体来说:
-- 改进后的代码里新引入的每个名字 (``json``, ``hmac``, ``logging``, ``sqlite3`` 等) 都必须在 ``improved_code`` 里写出对应的 ``import`` 语句; 不能假设读者已经在文件顶部 import 过.
-- 改进后的代码若是新加的独立 ``def``/``class``, 也必须自包含 ``import``, 不能依赖文件其它位置的 import.
-- 不需要重复 ``from __future__ import ...`` 之类的元语句, 也不需要重写同文件已有的无关 import.
-- 如果 diff 行之外但同一文件里的 import 已经覆盖, 仍然要在 ``improved_code`` 里写出来, 避免替换后 NameError.
+``improved_code`` 必须是针对 PR diff 的最小变更: 不要为了"自包含"而在 ``improved_code`` 里塞 ``import`` 语句, 也不要重写文件里已有但本次 diff 没涉及的 import. 规则:
+- 只改 diff 实际涉及的代码行 (function body / 表达式 / 局部逻辑); 顶部 / 文件其它位置的 ``import`` 不属于本次 diff 的范围, 让它们原样保留.
+- 如果改动后的代码用到了当前 diff 行范围外、但同一文件其它位置已有的 import (例如文件顶部已经 ``import json``, 本次只把 ``pickle.loads`` 换成 ``json.loads``), 不要在 ``improved_code`` 里再写 ``import json``: Apply 后文件顶部已有, 不需要重复.
+- 如果改动后的代码用到了一个**文件里完全没出现**的 import (例如 diff 是新增的独立函数, 函数体里用到 ``hmac`` 但文件其它位置没有 ``import hmac``), 此时**不要**把 import 直接塞进 ``improved_code`` 里: 那样会在函数体里产生局部 import, 或者在 Apply 多条 suggestion 时造成顶部 import 重复; 改为单独发一条针对顶部 import 块的 suggestion, 让用户在文件顶部一次性加齐所有缺失的 import.
+- 不要在 ``improved_code`` 里写 ``from __future__ import ...`` 之类的元语句.
 
 ``suggestion_content``、``label`` 等文字字段必须用中文 (zh-CN) 输出, 包括 importance 评分标签后的描述。
 
