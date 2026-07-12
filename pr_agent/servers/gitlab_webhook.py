@@ -65,6 +65,17 @@ def is_bot_user(data) -> bool:
         # logic to ignore bot users (unlike Github, no direct flag for bot users in gitlab)
         sender_name = (data.get("user", {}).get("name") or "unknown").lower()
         sender_username = (data.get("user", {}).get("username") or "").lower()
+        # Bot-username exemptions: a CI job that posts on behalf of a service
+        # account (e.g. ``review-bot``) is a legitimate trigger source, not
+        # self-echo. Operators list those usernames in
+        # ``config.allowed_bot_usernames`` so the agent runs the requested
+        # command instead of silently dropping the webhook.
+        allowed = get_settings().get("config.allowed_bot_usernames", []) or []
+        if isinstance(allowed, str):
+            allowed = [a for a in allowed.split(",") if a.strip()]
+        allowed = {a.lower() for a in allowed}
+        if sender_username and sender_username in allowed:
+            return False
         bot_indicators = ['codium', 'bot_', 'bot-', '_bot', '-bot']
         # also match username with trailing -bot (e.g. "review-bot") to avoid
         # the agent re-processing its own comment as a new command

@@ -62,6 +62,10 @@ ignore_language_framework = [] # a list of code-generation languages or framewor
 #
 restricted_mode = false # when true, skip operations that require elevated permissions (e.g. pushing code to the repository)
 is_auto_command = false # will be auto-set to true if the command is triggered by an automation
+# Bot-account usernames whose webhooks should still run commands. Used to let
+# a CI job that posts on behalf of a service account (e.g. ``review-bot``)
+# trigger /review or /improve without being dropped by the bot-echo guard.
+allowed_bot_usernames = []
 enable_ai_metadata = false # will enable adding ai metadata
 reasoning_effort = "medium" # "none", "minimal", "low", "medium", "high", "xhigh"
 # extended thinking for Claude reasoning models
