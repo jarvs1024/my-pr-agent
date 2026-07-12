@@ -82,6 +82,18 @@ Extra user-provided instructions (should be addressed with high priority):
 ======
 {%- endif %}
 
+
+{%- if agents_md_rules %}
+
+
+Repository rule hints (project-specific AGENTS.md rule keys that should be cited in `suggestion_content` when violated):
+======
+{% for rule in agents_md_rules %}- `{{ rule }}`
+{% endfor %}When you emit a `code_suggestions` entry that fixes one of the above violations, mention the rule key verbatim inside `suggestion_content` (e.g. "违反 `{{ agents_md_rules[0] }}`"). Skip rules that do not apply.
+======
+{%- endif %}
+
+
 {%- if repo_context %}
 
 

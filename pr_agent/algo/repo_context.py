@@ -1,3 +1,4 @@
+import re
 import time
 from collections import OrderedDict
 from html import escape
@@ -279,3 +280,25 @@ def build_repo_context(git_provider) -> str:
     if not had_fetch_error:
         _store_repo_context(git_provider, context_files, max_lines, repo_context)
     return repo_context
+
+
+RULE_KEY_PATTERN = re.compile(r"(?<![`\w])(ZLG-RULE-[A-Z0-9-]+)(?![`\w])")
+
+
+def extract_rule_keys(repo_context_text: str) -> list[str]:
+    """Pull rule keys (e.g. ``ZLG-RULE-NO-LOG-EXC``) out of rendered repo context.
+
+    The pattern matches both backtick-wrapped (`` `ZLG-RULE-...` ``) and bare
+    occurrences while skipping alphanumeric continuations on either side, so
+    generic glob patterns like ``*.py`` are never picked up. Order is preserved
+    and duplicates are removed.
+    """
+    if not repo_context_text:
+        return []
+    seen: list[str] = []
+    for match in RULE_KEY_PATTERN.finditer(repo_context_text):
+        key = match.group(1)
+        if key not in seen:
+            seen.append(key)
+    return seen
+

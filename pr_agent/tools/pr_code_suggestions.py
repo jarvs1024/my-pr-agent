@@ -14,7 +14,7 @@ from pr_agent.algo import MAX_TOKENS
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
 from pr_agent.algo.git_patch_processing import decouple_and_convert_to_hunks_with_lines_numbers
-from pr_agent.algo.repo_context import build_repo_context
+from pr_agent.algo.repo_context import build_repo_context, extract_rule_keys
 from pr_agent.algo.pr_processing import (add_ai_metadata_to_diff_files,
                                          get_pr_diff, get_pr_multi_diffs,
                                          retry_with_fallback_models)
@@ -59,6 +59,8 @@ class PRCodeSuggestions:
             get_settings().set("config.enable_ai_metadata", False)
             get_logger().debug(f"AI metadata is disabled for this command")
 
+        _repo_context_for_vars = build_repo_context(self.git_provider)
+
         self.vars = {
             "title": self.git_provider.pr.title,
             "branch": self.git_provider.get_pr_branch(),
@@ -68,7 +70,8 @@ class PRCodeSuggestions:
             "diff_no_line_numbers": "",  # empty diff for initial calculation
             "num_code_suggestions": num_code_suggestions,
             "extra_instructions": get_settings().pr_code_suggestions.extra_instructions,
-            "repo_context": build_repo_context(self.git_provider),
+            "repo_context": _repo_context_for_vars,
+            "agents_md_rules": extract_rule_keys(_repo_context_for_vars),
             "commit_messages_str": self.git_provider.get_commit_messages(),
             "relevant_best_practices": "",
             "is_ai_metadata": get_settings().get("config.enable_ai_metadata", False),
@@ -500,8 +503,14 @@ class PRCodeSuggestions:
         data = load_yaml(predictions.strip(),
                          keys_fix_yaml=["relevant_file", "suggestion_content", "existing_code", "improved_code"],
                          first_key="code_suggestions", last_key="label")
+        if data is None:
+            # YAML parser gave up on the LLM output — treat as no suggestions
+            # instead of crashing later with 'NoneType' is not subscriptable.
+            return {"code_suggestions": []}
         if isinstance(data, list):
             data = {'code_suggestions': data}
+        if not isinstance(data, dict) or "code_suggestions" not in data:
+            return {"code_suggestions": []}
 
         # remove or edit invalid suggestions
         suggestion_list = []
