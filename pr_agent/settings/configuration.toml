@@ -169,6 +169,12 @@ num_code_suggestions = 5
 extra_instructions = """
 每条建议请把建议后的代码完整填入 YAML 的 ``improved_code`` 字段, 不要在 ``improved_code`` 内重复添加 ```` ``` ```` 标记; pr-agent 会自动用 ```suggestion 块包住 improved_code, 用户在 GitLab UI 上可以直接点击 "Apply suggestion" 按钮。
 
+``improved_code`` 必须是自包含的: 用户在 GitLab 上点 "Apply suggestion" 后, 替换进去的代码必须能直接 import/run, 不依赖同文件里其它位置已有的 import. 具体来说:
+- 改进后的代码里新引入的每个名字 (``json``, ``hmac``, ``logging``, ``sqlite3`` 等) 都必须在 ``improved_code`` 里写出对应的 ``import`` 语句; 不能假设读者已经在文件顶部 import 过.
+- 改进后的代码若是新加的独立 ``def``/``class``, 也必须自包含 ``import``, 不能依赖文件其它位置的 import.
+- 不需要重复 ``from __future__ import ...`` 之类的元语句, 也不需要重写同文件已有的无关 import.
+- 如果 diff 行之外但同一文件里的 import 已经覆盖, 仍然要在 ``improved_code`` 里写出来, 避免替换后 NameError.
+
 ``suggestion_content``、``label`` 等文字字段必须用中文 (zh-CN) 输出, 包括 importance 评分标签后的描述。
 
 如果本次评审的上下文里注入了 ``AGENTS.md`` / ``CLAUDE.md`` (见 ``[config].repo_context_files``), 把它当作本仓库的最高优先规约来源:
