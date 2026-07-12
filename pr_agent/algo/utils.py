@@ -61,6 +61,59 @@ class TodoItem(TypedDict):
 class PRReviewHeader(str, Enum):
     REGULAR = "## PR Reviewer Guide"
     INCREMENTAL = "## Incremental PR Reviewer Guide"
+    REGULAR_ZH = "## PR 评审指南"
+    INCREMENTAL_ZH = "## 增量 PR 评审指南"
+
+
+def _is_zh_locale() -> bool:
+    # Match the same locale detection upstream uses: anything starting with
+    # ``zh`` is treated as Chinese. Anything else falls back to English
+    # templates so existing English-only deployments see no change.
+    try:
+        lang = (get_settings().get("config.response_language") or "").strip().lower()
+    except Exception:
+        lang = ""
+    return lang.startswith("zh")
+
+
+def _review_header(incremental: bool) -> str:
+    if _is_zh_locale():
+        return PRReviewHeader.INCREMENTAL_ZH.value if incremental else PRReviewHeader.REGULAR_ZH.value
+    return PRReviewHeader.INCREMENTAL.value if incremental else PRReviewHeader.REGULAR.value
+
+# Translation table for review-panel section labels (English -> Simplified
+# Chinese). Only consulted when ``config.response_language`` starts with
+# ``zh``; otherwise the upstream English keys are used so English-only
+# deployments see no change. Keys are matched case-insensitively against
+# ``key_nice`` (the human-readable form derived from the YAML field name).
+_KEY_TRANSLATIONS = {
+    "estimated effort to review": "预估评审工作量",
+    "relevant tests": "相关测试",
+    "no relevant tests": "无相关测试",
+    "security concerns": "安全顾虑",
+    "no security concerns identified": "未识别到安全顾虑",
+    "no major issues detected": "未检测到主要问题",
+    "key issues to review": "待评审的关键问题",
+    "recommended focus areas for review": "建议重点评审的方向",
+    "score": "评分",
+    "can be split": "可拆分",
+    "focused pr": "聚焦的 PR",
+    "relevant ticket": "关联工单",
+    "todo sections": "TODO 章节",
+    "insights from user answers": "来自用户回答的洞察",
+    "code feedback": "代码反馈",
+    "contribution time cost estimate": "贡献时间成本估算",
+    "ticket compliance check": "工单合规检查",
+}
+
+
+def _translate_label(key_nice: str) -> str:
+    if not _is_zh_locale():
+        return key_nice
+    return _KEY_TRANSLATIONS.get(key_nice.lower(), key_nice)
+
+
+
 
 
 class ReasoningEffort(str, Enum):
@@ -156,15 +209,21 @@ def convert_to_markdown_v2(output_data: dict,
     }
     markdown_text = ""
     if not incremental_review:
-        markdown_text += f"{PRReviewHeader.REGULAR.value} 🔍\n\n"
+        markdown_text += f"{_review_header(False)} 🔍\n\n"
     else:
-        markdown_text += f"{PRReviewHeader.INCREMENTAL.value} 🔍\n\n"
-        markdown_text += f"⏮️ Review for commits since previous PR-Agent review {incremental_review}.\n\n"
+        markdown_text += f"{_review_header(True)} 🔍\n\n"
+        if _is_zh_locale():
+            markdown_text += f"⏮️ 评审自上次 PR-Agent 评审以来的新提交 {incremental_review}.\n\n"
+        else:
+            markdown_text += f"⏮️ Review for commits since previous PR-Agent review {incremental_review}.\n\n"
     if not output_data or not output_data.get('review', {}):
         return ""
 
     if get_settings().get("pr_reviewer.enable_intro_text", False):
-        markdown_text += f"Here are some key observations to aid the review process:\n\n"
+        if _is_zh_locale():
+            markdown_text += "以下是辅助评审过程的一些关键观察:\n\n"
+        else:
+            markdown_text += "Here are some key observations to aid the review process:\n\n"
 
     if gfm_supported:
         markdown_text += "<table>\n"
@@ -174,10 +233,11 @@ def convert_to_markdown_v2(output_data: dict,
         if value is None or value == '' or value == {} or value == []:
             if key.lower() not in ['can_be_split', 'key_issues_to_review']:
                 continue
-        key_nice = key.replace('_', ' ').capitalize()
+        key_nice = _translate_label(key.replace('_', ' ').capitalize())
         emoji = emojis.get(key_nice, "")
         if 'Estimated effort to review' in key_nice:
             key_nice = 'Estimated effort to review'
+            key_nice = _translate_label(key_nice)
             value = str(value).strip()
             if value.isnumeric():
                 value_int = int(value)
