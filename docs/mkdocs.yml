@@ -9,6 +9,7 @@ nav:
   - Installation:
     - 'installation/index.md'
     - PR-Agent: 'installation/pr_agent.md'
+    - Local GitLab + Offline Deploy: 'installation/local_deploy.md'
   - Usage Guide:
     - 'usage-guide/index.md'
     - Introduction: 'usage-guide/introduction.md'
