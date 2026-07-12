@@ -364,6 +364,10 @@ def convert_to_markdown_v2(output_data: dict,
                         if issue_header.lower() == 'possible bug':
                             issue_header = 'Possible Issue'  # Make the header less frightening
                         issue_content = issue.get('issue_content', '').strip()
+                        # Strip LLM-hallucinated file:// references (the real
+                        # line link is already in <summary><a>...</a></summary>).
+                        issue_content = re.sub(r'<file://[^>\s]+>', '', issue_content)
+                        issue_content = re.sub(r'\bfile://[^\s)<>]+', '', issue_content)
                         start_line = int(str(issue.get('start_line', 0)).strip())
                         end_line = int(str(issue.get('end_line', 0)).strip())
 
