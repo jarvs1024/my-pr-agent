@@ -225,6 +225,18 @@ class PRCodeSuggestions:
                     _run_status["rule_keys"] = sorted({k for cs in (data.get("code_suggestions") or []) for k in telemetry_events.extract_rule_keys_from_text(
                         str(cs.get("suggestion_content") or "") + " " + str(cs.get("one_sentence_summary") or "")
                     )})
+
+                    # Inline-only path has no persistent review body for the coverage
+                    # checklist; emit a standalone comment so reviewers still see which
+                    # AGENTS.md rules the LLM silently dropped. No DiffNote created.
+                    if get_settings().config.publish_output:
+                        _inline_uncovered = compute_uncovered_rules(
+                            self.vars.get("agents_md_rules") or [],
+                            data.get("code_suggestions") or [],
+                        )
+                        _inline_details = render_uncovered_details(_inline_uncovered)
+                        if _inline_details:
+                            self.git_provider.publish_comment(_inline_details)
             else:
                 get_logger().info('Code suggestions generated for PR, but not published since publish_output is False.')
                 pr_body = self.generate_summarized_suggestions(data)
@@ -293,6 +305,10 @@ class PRCodeSuggestions:
             t("pr_code_suggestions.header", "## PR Code Suggestions ✨") + "\n\n"
             + t("pr_code_suggestions.no_suggestions", "No code suggestions found for the PR.")
         )
+        # Surface AGENTS.md rule coverage gap when /improve came back empty — useful for
+        # the "LLM produced no suggestions" branch which has no inline markers to inspect.
+        _uncovered = compute_uncovered_rules(self.vars.get("agents_md_rules") or [], [])
+        pr_body += render_uncovered_details(_uncovered)
         if (get_settings().config.publish_output and
                 get_settings().pr_code_suggestions.get('publish_output_no_suggestions', True)):
             get_logger().warning('No code suggestions found for the PR.')
