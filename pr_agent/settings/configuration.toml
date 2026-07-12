@@ -503,3 +503,20 @@ pr_commands = [
     "/review",
     "/improve",
 ]
+
+
+# ----------------------------------------------------------------------
+# Review telemetry (read by pr_agent.telemetry)
+# ----------------------------------------------------------------------
+[telemetry]
+# Backend for telemetry storage. One of: "sqlite" (default), "jsonl", "off".
+# Override at runtime with the REVIEW_TELEMETRY_BACKEND env var.
+backend = "sqlite"
+# SQLite database path (when backend="sqlite"). Override with REVIEW_TELEMETRY_DB_PATH.
+sqlite_path = "/tmp/pr-agent-telemetry.db"
+# JSONL sink path (when backend="jsonl"). Override with REVIEW_TELEMETRY_JSONL_PATH.
+jsonl_path = "/tmp/pr-agent-telemetry.jsonl"
+# Optional bearer token required to read /api/v1/telemetry/* endpoints.
+# Empty/unset means open access (intended for local dev only). Set via
+# REVIEW_TELEMETRY_HTTP_TOKEN env var on the pr-agent container.
+http_token = ""

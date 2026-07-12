@@ -1,0 +1,352 @@
+"""SQLite (default) / JSONL (opt-in) event store for review telemetry.
+
+The store is process-local. When REVIEW_TELEMETRY_BACKEND=jsonl, every record
+is appended to a JSONL file. When =sqlite (default), records go into a small
+SQLite database with one table per event kind.
+
+The store is intentionally simple: no schema migrations, no transactions
+beyond the per-write ones. Reads are best-effort and tolerate partial rows.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import threading
+from pathlib import Path
+from typing import Any, Optional
+
+from pr_agent.log import get_logger
+from pr_agent.telemetry import models
+
+
+_SQLITE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS mr_activity (
+    mr_id INTEGER NOT NULL,
+    project_id INTEGER NOT NULL,
+    source_branch TEXT,
+    target_branch TEXT,
+    title TEXT,
+    author TEXT,
+    state TEXT,
+    opened_at TEXT,
+    last_seen_at TEXT,
+    merged_at TEXT,
+    url TEXT,
+    head_sha TEXT,
+    PRIMARY KEY (project_id, mr_id)
+);
+
+CREATE TABLE IF NOT EXISTS review_runs (
+    run_id TEXT PRIMARY KEY,
+    mr_id INTEGER,
+    project_id INTEGER,
+    command TEXT,
+    status TEXT,
+    model TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    error TEXT,
+    duration_ms INTEGER,
+    suggestion_count INTEGER DEFAULT 0,
+    rule_keys_cited TEXT,
+    triggered_by TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_runs_mr ON review_runs(mr_id);
+
+CREATE TABLE IF NOT EXISTS suggestions (
+    suggestion_id TEXT PRIMARY KEY,
+    mr_id INTEGER NOT NULL,
+    project_id INTEGER NOT NULL,
+    file TEXT,
+    line INTEGER,
+    label TEXT,
+    importance INTEGER,
+    one_sentence_summary TEXT,
+    rule_keys TEXT,
+    score INTEGER,
+    posted_at TEXT,
+    state TEXT,
+    applied_at TEXT,
+    dismissed_at TEXT,
+    dismissed_by TEXT,
+    note_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_sug_mr ON suggestions(mr_id);
+CREATE INDEX IF NOT EXISTS idx_sug_state ON suggestions(state);
+
+CREATE TABLE IF NOT EXISTS action_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL,
+    action TEXT NOT NULL,
+    suggestion_id TEXT,
+    mr_id INTEGER,
+    actor TEXT,
+    note TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_act_mr ON action_events(mr_id);
+"""
+
+
+class TelemetryStore:
+    def __init__(self, backend: str, sqlite_path: Optional[str] = None, jsonl_path: Optional[str] = None) -> None:
+        self.backend = backend
+        self._lock = threading.Lock()
+        self._jsonl_fp = None
+        self._db = None
+        if backend == "sqlite":
+            path = sqlite_path or os.environ.get("REVIEW_TELEMETRY_DB_PATH", "/tmp/pr-agent-telemetry.db")
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            self._db = sqlite3.connect(path, check_same_thread=False)
+            self._db.executescript(_SQLITE_SCHEMA)
+            self._db.commit()
+        elif backend == "jsonl":
+            path = jsonl_path or os.environ.get("REVIEW_TELEMETRY_JSONL_PATH", "/tmp/pr-agent-telemetry.jsonl")
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            self._jsonl_fp = open(path, "a", encoding="utf-8")
+        elif backend == "off":
+            pass
+        else:
+            raise ValueError(f"Unknown telemetry backend: {backend!r}")
+
+    def _write_jsonl(self, kind: str, payload: dict) -> None:
+        if self._jsonl_fp is None:
+            return
+        line = json.dumps({"_kind": kind, **payload}, ensure_ascii=False)
+        with self._lock:
+            self._jsonl_fp.write(line + "\n")
+            self._jsonl_fp.flush()
+
+    def record_mr(self, mr) -> None:
+        d = mr.to_dict()
+        if self.backend == "sqlite":
+            with self._lock:
+                self._db.execute(
+                    "INSERT OR REPLACE INTO mr_activity (mr_id, project_id, source_branch, target_branch, title, author, state, opened_at, last_seen_at, merged_at, url, head_sha) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (d["mr_id"], d["project_id"], d["source_branch"], d["target_branch"], d["title"], d["author"], d["state"], d["opened_at"], d["last_seen_at"], d["merged_at"], d["url"], d["head_sha"]),
+                )
+                self._db.commit()
+        elif self.backend == "jsonl":
+            self._write_jsonl("mr_activity", d)
+
+    def record_run(self, run) -> None:
+        d = run.to_dict()
+        if self.backend == "sqlite":
+            with self._lock:
+                self._db.execute(
+                    "INSERT OR REPLACE INTO review_runs (run_id, mr_id, project_id, command, status, model, started_at, finished_at, error, duration_ms, suggestion_count, rule_keys_cited, triggered_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (d["run_id"], d["mr_id"], d["project_id"], d["command"], d["status"], d["model"], d["started_at"], d["finished_at"], d["error"], d["duration_ms"], d["suggestion_count"], json.dumps(d["rule_keys_cited"], ensure_ascii=False), d["triggered_by"]),
+                )
+                self._db.commit()
+        elif self.backend == "jsonl":
+            self._write_jsonl("review_run", d)
+
+    def record_suggestion(self, suggestion) -> None:
+        d = suggestion.to_dict()
+        if self.backend == "sqlite":
+            with self._lock:
+                self._db.execute(
+                    "INSERT OR REPLACE INTO suggestions (suggestion_id, mr_id, project_id, file, line, label, importance, one_sentence_summary, rule_keys, score, posted_at, state, applied_at, dismissed_at, dismissed_by, note_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (d["suggestion_id"], d["mr_id"], d["project_id"], d["file"], d["line"], d["label"], d["importance"], d["one_sentence_summary"], json.dumps(d["rule_keys"], ensure_ascii=False), d["score"], d["posted_at"], d["state"], d["applied_at"], d["dismissed_at"], d["dismissed_by"], d["note_id"]),
+                )
+                self._db.commit()
+        elif self.backend == "jsonl":
+            self._write_jsonl("suggestion", d)
+
+    def record_action(self, action) -> None:
+        d = action.to_dict()
+        if self.backend == "sqlite":
+            with self._lock:
+                self._db.execute(
+                    "INSERT INTO action_events (at, action, suggestion_id, mr_id, actor, note) VALUES (?,?,?,?,?,?)",
+                    (d["at"], d["action"], d["suggestion_id"], d["mr_id"], d["actor"], d["note"]),
+                )
+                self._db.commit()
+        elif self.backend == "jsonl":
+            self._write_jsonl("action", d)
+
+    def update_suggestion_state(self, suggestion_id: str, state: str, **fields) -> None:
+        if self.backend != "sqlite" or self._db is None:
+            return
+        sets = ["state=?", "applied_at=?", "dismissed_at=?", "dismissed_by=?"]
+        params = [state, fields.get("applied_at"), fields.get("dismissed_at"), fields.get("dismissed_by")]
+        with self._lock:
+            self._db.execute(
+                f"UPDATE suggestions SET {', '.join(sets)} WHERE suggestion_id=?",
+                (*params, suggestion_id),
+            )
+            self._db.commit()
+
+    def get_suggestion_by_note_id(self, note_id: int):
+        if self.backend != "sqlite" or self._db is None:
+            return None
+        with self._lock:
+            cur = self._db.execute("SELECT * FROM suggestions WHERE note_id=? ORDER BY posted_at DESC LIMIT 1", (note_id,))
+            row = cur.fetchone()
+        return _row_to_suggestion(row) if row else None
+
+    # ---------- reads ----------
+
+    def list_mrs(self, limit: int = 50, project_id: Optional[int] = None):
+        if self.backend != "sqlite" or self._db is None:
+            return []
+        with self._lock:
+            if project_id is not None:
+                cur = self._db.execute("SELECT * FROM mr_activity WHERE project_id=? ORDER BY last_seen_at DESC LIMIT ?", (project_id, limit))
+            else:
+                cur = self._db.execute("SELECT * FROM mr_activity ORDER BY last_seen_at DESC LIMIT ?", (limit,))
+            rows = cur.fetchall()
+        return [_row_to_mr(r) for r in rows]
+
+    def get_mr(self, project_id: int, mr_id: int):
+        if self.backend != "sqlite" or self._db is None:
+            return None
+        with self._lock:
+            cur = self._db.execute("SELECT * FROM mr_activity WHERE project_id=? AND mr_id=?", (project_id, mr_id))
+            row = cur.fetchone()
+        return _row_to_mr(row) if row else None
+
+    def list_suggestions(self, mr_id: int, project_id: Optional[int] = None):
+        if self.backend != "sqlite" or self._db is None:
+            return []
+        with self._lock:
+            if project_id is not None:
+                cur = self._db.execute("SELECT * FROM suggestions WHERE project_id=? AND mr_id=? ORDER BY posted_at", (project_id, mr_id))
+            else:
+                cur = self._db.execute("SELECT * FROM suggestions WHERE mr_id=? ORDER BY posted_at", (mr_id,))
+            rows = cur.fetchall()
+        return [_row_to_suggestion(r) for r in rows]
+
+    def list_runs(self, mr_id: int, limit: int = 20):
+        if self.backend != "sqlite" or self._db is None:
+            return []
+        with self._lock:
+            cur = self._db.execute("SELECT * FROM review_runs WHERE mr_id=? ORDER BY started_at DESC LIMIT ?", (mr_id, limit))
+            rows = cur.fetchall()
+        return [_row_to_run(r) for r in rows]
+
+    def list_actions(self, mr_id: int, limit: int = 50):
+        if self.backend != "sqlite" or self._db is None:
+            return []
+        with self._lock:
+            cur = self._db.execute("SELECT * FROM action_events WHERE mr_id=? ORDER BY at DESC LIMIT ?", (mr_id, limit))
+            rows = cur.fetchall()
+        return [_row_to_action(r) for r in rows]
+
+    def overview(self):
+        if self.backend != "sqlite" or self._db is None:
+            return {}
+        with self._lock:
+            mr_count = self._db.execute("SELECT COUNT(*) FROM mr_activity").fetchone()[0]
+            merged = self._db.execute("SELECT COUNT(*) FROM mr_activity WHERE state='merged'").fetchone()[0]
+            open_mrs = self._db.execute("SELECT COUNT(*) FROM mr_activity WHERE state='opened'").fetchone()[0]
+            sug_total = self._db.execute("SELECT COUNT(*) FROM suggestions").fetchone()[0]
+            sug_applied = self._db.execute("SELECT COUNT(*) FROM suggestions WHERE state='applied'").fetchone()[0]
+            sug_dismissed = self._db.execute("SELECT COUNT(*) FROM suggestions WHERE state='dismissed'").fetchone()[0]
+            sug_open = self._db.execute("SELECT COUNT(*) FROM suggestions WHERE state='open'").fetchone()[0]
+            run_total = self._db.execute("SELECT COUNT(*) FROM review_runs").fetchone()[0]
+            run_failed = self._db.execute("SELECT COUNT(*) FROM review_runs WHERE status='failed'").fetchone()[0]
+        return {
+            "mrs": {"total": mr_count, "merged": merged, "open": open_mrs},
+            "suggestions": {
+                "total": sug_total,
+                "applied": sug_applied,
+                "dismissed": sug_dismissed,
+                "open": sug_open,
+                "adoption_rate": (sug_applied / sug_total) if sug_total else 0.0,
+                "dismissal_rate": (sug_dismissed / sug_total) if sug_total else 0.0,
+            },
+            "runs": {"total": run_total, "failed": run_failed, "success_rate": ((run_total - run_failed) / run_total) if run_total else 0.0},
+        }
+
+    def per_rule_stats(self):
+        if self.backend != "sqlite" or self._db is None:
+            return []
+        with self._lock:
+            cur = self._db.execute("SELECT rule_keys, state, COUNT(*) FROM suggestions GROUP BY rule_keys, state")
+            rows = cur.fetchall()
+        from collections import defaultdict
+        agg = defaultdict(lambda: {"applied": 0, "dismissed": 0, "open": 0, "superseded": 0, "total": 0})
+        for rule_keys_json, state, count in rows:
+            try:
+                keys = json.loads(rule_keys_json or "[]")
+            except Exception:
+                keys = []
+            for k in keys:
+                agg[k][state] = agg[k].get(state, 0) + count
+                agg[k]["total"] += count
+        out = []
+        for rule, stats in sorted(agg.items()):
+            total = stats["total"]
+            applied = stats.get("applied", 0)
+            dismissed = stats.get("dismissed", 0)
+            out.append({
+                "rule_key": rule,
+                "total": total,
+                "applied": applied,
+                "dismissed": dismissed,
+                "open": stats.get("open", 0),
+                "superseded": stats.get("superseded", 0),
+                "adoption_rate": (applied / total) if total else 0.0,
+            })
+        return out
+
+    def close(self) -> None:
+        if self._jsonl_fp is not None:
+            try:
+                self._jsonl_fp.close()
+            except Exception:
+                pass
+            self._jsonl_fp = None
+        if self._db is not None:
+            try:
+                self._db.close()
+            except Exception:
+                pass
+            self._db = None
+
+
+_DEFAULT: Optional[TelemetryStore] = None
+_DEFAULT_LOCK = threading.Lock()
+
+
+def get_default_store() -> TelemetryStore:
+    global _DEFAULT
+    with _DEFAULT_LOCK:
+        if _DEFAULT is None:
+            backend = os.environ.get("REVIEW_TELEMETRY_BACKEND", "sqlite").strip().lower()
+            if backend not in {"sqlite", "jsonl", "off"}:
+                get_logger().warning(f"Unknown REVIEW_TELEMETRY_BACKEND={backend!r}, falling back to 'off'")
+                backend = "off"
+            _DEFAULT = TelemetryStore(backend)
+    return _DEFAULT
+
+
+def _row_to_mr(row):
+    cols = ["mr_id", "project_id", "source_branch", "target_branch", "title", "author", "state", "opened_at", "last_seen_at", "merged_at", "url", "head_sha"]
+    return dict(zip(cols, row))
+
+
+def _row_to_suggestion(row):
+    cols = ["suggestion_id", "mr_id", "project_id", "file", "line", "label", "importance", "one_sentence_summary", "rule_keys", "score", "posted_at", "state", "applied_at", "dismissed_at", "dismissed_by", "note_id"]
+    d = dict(zip(cols, row))
+    try:
+        d["rule_keys"] = json.loads(d["rule_keys"] or "[]")
+    except Exception:
+        d["rule_keys"] = []
+    return d
+
+
+def _row_to_run(row):
+    cols = ["run_id", "mr_id", "project_id", "command", "status", "model", "started_at", "finished_at", "error", "duration_ms", "suggestion_count", "rule_keys_cited", "triggered_by"]
+    d = dict(zip(cols, row))
+    try:
+        d["rule_keys_cited"] = json.loads(d["rule_keys_cited"] or "[]")
+    except Exception:
+        d["rule_keys_cited"] = []
+    return d
+
+
+def _row_to_action(row):
+    cols = ["id", "at", "action", "suggestion_id", "mr_id", "actor", "note"]
+    return dict(zip(cols, row))

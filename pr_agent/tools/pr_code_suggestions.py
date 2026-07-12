@@ -15,6 +15,7 @@ from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
 from pr_agent.algo.git_patch_processing import decouple_and_convert_to_hunks_with_lines_numbers
 from pr_agent.algo.repo_context import build_repo_context, extract_rule_keys
+from pr_agent.telemetry import events as telemetry_events
 from pr_agent.algo.pr_processing import (add_ai_metadata_to_diff_files,
                                          get_pr_diff, get_pr_multi_diffs,
                                          retry_with_fallback_models)
@@ -98,6 +99,34 @@ class PRCodeSuggestions:
         self.progress_response = None
 
     async def run(self):
+        # Telemetry: track this /improve run from start to finish
+        import time
+        _run_id = None
+        _run_started_at = time.monotonic()
+        try:
+            _gp = self.git_provider
+            _mr_id = (
+                getattr(_gp, "id_mr", None)
+                or getattr(getattr(_gp, "pr", None), "iid", None)
+                or 0
+            )
+            _raw_pid = getattr(_gp, "id_project", None) or 0
+            _pid = _raw_pid if isinstance(_raw_pid, int) else 0
+            if not _pid and isinstance(_raw_pid, str):
+                try:
+                    _pid = _gp.gl.projects.get(_raw_pid).id
+                except Exception:
+                    _pid = 0
+            _run_id = telemetry_events.emit_run_started(
+                mr_id=int(_mr_id or 0),
+                project_id=int(_pid or 0),
+                command="improve",
+                triggered_by=getattr(get_settings().config, "is_auto_command", False) and "auto" or "user",
+                model=getattr(get_settings().config, "model", None),
+            )
+        except Exception:
+            _run_id = None
+        _run_status = {"name": "empty", "suggestion_count": 0, "rule_keys": []}
         try:
             if not self.git_provider.get_files():
                 get_logger().info(f"PR has no files: {self.pr_url}, skipping code suggestions")
@@ -183,6 +212,11 @@ class PRCodeSuggestions:
                     await self.push_inline_code_suggestions(data)
                     if self.progress_response:
                         self.git_provider.remove_comment(self.progress_response)
+                    _run_status["name"] = "success"
+                    _run_status["suggestion_count"] = len(data.get("code_suggestions") or [])
+                    _run_status["rule_keys"] = sorted({k for cs in (data.get("code_suggestions") or []) for k in telemetry_events.extract_rule_keys_from_text(
+                        str(cs.get("suggestion_content") or "") + " " + str(cs.get("one_sentence_summary") or "")
+                    )})
             else:
                 get_logger().info('Code suggestions generated for PR, but not published since publish_output is False.')
                 pr_body = self.generate_summarized_suggestions(data)
@@ -191,6 +225,8 @@ class PRCodeSuggestions:
         except Exception as e:
             get_logger().error(f"Failed to generate code suggestions for PR, error: {e}",
                                artifact={"traceback": traceback.format_exc()})
+            _run_status["name"] = "failed"
+            _run_status["error"] = str(e)
             if get_settings().config.publish_output:
                 if self.progress_response:
                     self.git_provider.remove_comment(self.progress_response)
@@ -200,6 +236,16 @@ class PRCodeSuggestions:
                         self.git_provider.publish_comment(t("pr_code_suggestions.failed", "Failed to generate code suggestions for PR"))
                     except Exception as e:
                         get_logger().exception(f"Failed to update persistent review, error: {e}")
+        finally:
+            if _run_id:
+                telemetry_events.emit_run_finished(
+                    _run_id,
+                    status=_run_status["name"],
+                    suggestion_count=_run_status.get("suggestion_count", 0),
+                    rule_keys=_run_status.get("rule_keys", []),
+                    error=_run_status.get("error"),
+                    duration_ms=int((time.monotonic() - _run_started_at) * 1000),
+                )
 
     async def add_self_review_text(self, pr_body):
         text = get_settings().pr_code_suggestions.code_suggestions_self_review_text
@@ -246,6 +292,11 @@ class PRCodeSuggestions:
                 get_logger().info(
                     f"Publishing {len(data_above_threshold['code_suggestions'])} suggestions in dual publishing mode")
                 await self.push_inline_code_suggestions(data_above_threshold)
+                _run_status["name"] = "success"
+                _run_status["suggestion_count"] = len(data_above_threshold.get("code_suggestions") or [])
+                _run_status["rule_keys"] = sorted({k for cs in (data_above_threshold.get("code_suggestions") or []) for k in telemetry_events.extract_rule_keys_from_text(
+                    str(cs.get("suggestion_content") or "") + " " + str(cs.get("one_sentence_summary") or "")
+                )})
         except Exception as e:
             get_logger().error(f"Failed to publish dual publishing suggestions, error: {e}")
 
@@ -599,6 +650,48 @@ class PRCodeSuggestions:
                 get_logger().info(f"Could not parse suggestion: {d}")
 
         is_successful = self.git_provider.publish_code_suggestions(code_suggestions)
+        # Emit telemetry events for the suggestions we just attempted to publish.
+        try:
+            mr_id = (
+                getattr(self.git_provider, "id_mr", None)
+                or getattr(self.git_provider, "pr_id", None)
+                or getattr(getattr(self.git_provider, "pr", None), "iid", None)
+                or getattr(getattr(self.git_provider, "pr", None), "id", 0)
+            )
+            raw_project = (
+                getattr(self.git_provider, "id_project", None)
+                or getattr(self.git_provider, "project_id", None)
+                or 0
+            )
+            # GitLab stores id_project as a namespace path string
+            # (e.g. "root/auto-review-test"); resolve to int via the API
+            # when needed.
+            project_id = raw_project
+            if not isinstance(raw_project, int):
+                try:
+                    gl = getattr(self.git_provider, "gl", None)
+                    if gl is not None and raw_project:
+                        project_id = gl.projects.get(raw_project).id
+                except Exception:
+                    project_id = 0
+            for cs in code_suggestions:
+                original = cs.get("original_suggestion") or {}
+                rule_keys = telemetry_events.extract_rule_keys_from_text(
+                    original.get("suggestion_content", "") + " " + original.get("one_sentence_summary", "")
+                )
+                telemetry_events.emit_suggestion(
+                    mr_id=mr_id,
+                    project_id=project_id,
+                    file=cs.get("relevant_file", ""),
+                    line=int(cs.get("relevant_lines_start") or 0) or None,
+                    label=original.get("label", ""),
+                    importance=int(original.get("score") or 0),
+                    one_sentence_summary=original.get("one_sentence_summary", ""),
+                    rule_keys=rule_keys,
+                    score=original.get("score"),
+                )
+        except Exception as e:
+            get_logger().warning(f"telemetry emit on publish_code_suggestions failed: {e}")
         if not is_successful:
             get_logger().info("Failed to publish code suggestions, trying to publish each suggestion separately")
             for code_suggestion in code_suggestions:

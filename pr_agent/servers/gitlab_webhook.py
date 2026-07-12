@@ -19,12 +19,66 @@ from pr_agent.config_loader import get_settings, global_settings
 from pr_agent.git_providers.utils import apply_repo_settings
 from pr_agent.log import LoggingFormat, get_logger, setup_logger
 from pr_agent.secret_providers import get_secret_provider
+from pr_agent.telemetry import events as telemetry_events, api as telemetry_api
 from pr_agent.git_providers import get_git_provider_with_context
 
 setup_logger(fmt=LoggingFormat.JSON, level=get_settings().get("CONFIG.LOG_LEVEL", "DEBUG"))
 router = APIRouter()
 
 secret_provider = get_secret_provider() if get_settings().get("CONFIG.SECRET_PROVIDER") else None
+
+
+
+def _emit_mr_activity(data: dict, state: str = "opened") -> None:
+    try:
+        object_attributes = data.get("object_attributes", {})
+        project = data.get("project", {})
+        mr_id = object_attributes.get("iid") or object_attributes.get("id")
+        project_id = project.get("id")
+        if not mr_id or not project_id:
+            return
+        last_commit = (object_attributes.get("last_commit") or {})
+        head_sha = last_commit.get("id")
+        author = ""
+        if isinstance(object_attributes.get("author_id"), int):
+            author = f"user:{object_attributes['author_id']}"
+        telemetry_events.emit_mr_activity(
+            mr_id=int(mr_id),
+            project_id=int(project_id),
+            source_branch=object_attributes.get("source_branch", ""),
+            target_branch=object_attributes.get("target_branch", ""),
+            title=object_attributes.get("title", ""),
+            author=author,
+            state=state,
+            url=object_attributes.get("url"),
+            head_sha=head_sha,
+        )
+    except Exception as e:
+        get_logger().warning(f"_emit_mr_activity failed: {e}")
+
+
+def _emit_mr_merged(data: dict) -> None:
+    try:
+        object_attributes = data.get("object_attributes", {})
+        project = data.get("project", {})
+        mr_id = object_attributes.get("iid") or object_attributes.get("id")
+        project_id = project.get("id")
+        if not mr_id or not project_id:
+            return
+        telemetry_events.emit_mr_activity(
+            mr_id=int(mr_id),
+            project_id=int(project_id),
+            source_branch=object_attributes.get("source_branch", ""),
+            target_branch=object_attributes.get("target_branch", ""),
+            title=object_attributes.get("title", ""),
+            author=f"user:{object_attributes.get('author_id', '')}",
+            state="merged",
+            url=object_attributes.get("url"),
+            head_sha=(object_attributes.get("last_commit") or {}).get("id"),
+            merged_at=datetime.utcnow().isoformat() + "Z",
+        )
+    except Exception as e:
+        get_logger().warning(f"_emit_mr_merged failed: {e}")
 
 
 async def handle_request(api_url: str, body: str, log_context: dict, sender_id: str, notify=None):
@@ -238,6 +292,7 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
             if object_attributes.get('action') in ['open', 'reopen']:
                 url = object_attributes.get('url')
                 get_logger().info(f"New merge request: {url}")
+                _emit_mr_activity(data, state='opened')
                 if is_draft(data):
                     get_logger().info(f"Skipping draft MR: {url}")
                     return JSONResponse(status_code=status.HTTP_200_OK, content=jsonable_encoder({"message": "success"}))
@@ -248,6 +303,7 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
             elif object_attributes.get('action') == 'update' and object_attributes.get('oldrev'):
                 url = object_attributes.get('url')
                 get_logger().info(f"New merge request: {url}")
+                _emit_mr_activity(data, state='updated')
                 if is_draft(data):
                     get_logger().info(f"Skipping draft MR: {url}")
                     return JSONResponse(status_code=status.HTTP_200_OK, content=jsonable_encoder({"message": "success"}))
@@ -265,6 +321,10 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                 get_logger().debug(f'A push event has been received: {url}')
                 await _perform_commands_gitlab("push_commands", PRAgent(), url, log_context, data)
                 
+            elif object_attributes.get('action') == 'merge':
+                url = object_attributes.get('url')
+                _emit_mr_merged(data)
+
             # for draft to ready triggered merge requests
             elif object_attributes.get('action') == 'update' and is_draft_ready(data):
                 url = object_attributes.get('url')
@@ -343,6 +403,7 @@ get_settings().config.git_provider = "gitlab"
 middleware = [Middleware(RawContextMiddleware)]
 app = FastAPI(middleware=middleware)
 app.include_router(router)
+telemetry_api.install_routes(app)
 
 
 def start():

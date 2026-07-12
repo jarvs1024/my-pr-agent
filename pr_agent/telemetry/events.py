@@ -1,0 +1,177 @@
+"""Thin emitter used by hooks scattered through the pr-agent codebase.
+
+Every function is best-effort: it never raises into the caller, because
+telemetry is observability, not a control surface. Failures are logged
+but swallowed.
+"""
+from __future__ import annotations
+
+import re
+from typing import Any, Iterable, Optional
+
+from pr_agent.log import get_logger
+from pr_agent.telemetry import models
+from pr_agent.telemetry.store import get_default_store
+
+
+_RULE_KEY_RE = re.compile(r"(?<![`\w])(ZLG-RULE-[A-Z0-9-]+)(?![`\w])")
+
+
+def extract_rule_keys_from_text(text: str) -> list[str]:
+    if not text:
+        return []
+    seen: list[str] = []
+    for m in _RULE_KEY_RE.finditer(text):
+        key = m.group(1)
+        if key not in seen:
+            seen.append(key)
+    return seen
+
+
+def emit_mr_activity(
+    mr_id: int,
+    project_id: int,
+    source_branch: str,
+    target_branch: str,
+    title: str,
+    author: str = "",
+    state: str = "opened",
+    url: Optional[str] = None,
+    head_sha: Optional[str] = None,
+    merged_at: Optional[str] = None,
+) -> None:
+    try:
+        mr = models.MRActivity(
+            mr_id=mr_id,
+            project_id=project_id,
+            source_branch=source_branch,
+            target_branch=target_branch,
+            title=title,
+            author=author,
+            state=state,
+            url=url,
+            head_sha=head_sha,
+            merged_at=merged_at,
+        )
+        get_default_store().record_mr(mr)
+    except Exception as e:
+        get_logger().warning(f"telemetry.emit_mr_activity failed: {e}")
+
+
+def emit_run_started(
+    mr_id: int,
+    project_id: int,
+    command: str,
+    triggered_by: str = "user",
+    model: Optional[str] = None,
+) -> str:
+    """Return a run_id that the caller MUST pass back to emit_run_finished."""
+    run = models.ReviewRun(
+        mr_id=mr_id,
+        project_id=project_id,
+        command=command,
+        status="started",
+        triggered_by=triggered_by,
+        model=model,
+    )
+    try:
+        get_default_store().record_run(run)
+    except Exception as e:
+        get_logger().warning(f"telemetry.emit_run_started failed: {e}")
+    return run.run_id
+
+
+def emit_run_finished(
+    run_id: str,
+    status: str,
+    suggestion_count: int = 0,
+    rule_keys: Optional[Iterable[str]] = None,
+    error: Optional[str] = None,
+    duration_ms: Optional[int] = None,
+) -> None:
+    try:
+        from datetime import datetime, timezone
+        run = models.ReviewRun(
+            run_id=run_id,
+            mr_id=0,
+            project_id=0,
+            command="",
+            status=status,
+            finished_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            error=error,
+            duration_ms=duration_ms,
+            suggestion_count=suggestion_count,
+            rule_keys_cited=list(rule_keys or []),
+        )
+        get_default_store().record_run(run)
+    except Exception as e:
+        get_logger().warning(f"telemetry.emit_run_finished failed: {e}")
+
+
+def emit_suggestion(
+    mr_id: int,
+    project_id: int,
+    file: str,
+    line: Optional[int],
+    label: str,
+    importance: int,
+    one_sentence_summary: str,
+    rule_keys: Iterable[str],
+    score: Optional[int] = None,
+    note_id: Optional[int] = None,
+) -> str:
+    suggestion = models.Suggestion(
+        mr_id=mr_id,
+        project_id=project_id,
+        file=file,
+        line=line,
+        label=label,
+        importance=importance,
+        one_sentence_summary=one_sentence_summary,
+        rule_keys=list(rule_keys),
+        score=score,
+        note_id=note_id,
+    )
+    try:
+        get_default_store().record_suggestion(suggestion)
+    except Exception as e:
+        get_logger().warning(f"telemetry.emit_suggestion failed: {e}")
+    return suggestion.suggestion_id
+
+
+def emit_action(
+    action: str,
+    suggestion_id: str,
+    mr_id: int,
+    actor: str = "",
+    note: str = "",
+) -> None:
+    try:
+        get_default_store().record_action(models.ActionEvent(action=action, suggestion_id=suggestion_id, mr_id=mr_id, actor=actor, note=note))
+    except Exception as e:
+        get_logger().warning(f"telemetry.emit_action failed: {e}")
+
+
+def mark_suggestion_applied(suggestion_id: str) -> None:
+    try:
+        from datetime import datetime, timezone
+        get_default_store().update_suggestion_state(
+            suggestion_id,
+            "applied",
+            applied_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        )
+    except Exception as e:
+        get_logger().warning(f"telemetry.mark_suggestion_applied failed: {e}")
+
+
+def mark_suggestion_dismissed(suggestion_id: str, actor: str = "") -> None:
+    try:
+        from datetime import datetime, timezone
+        get_default_store().update_suggestion_state(
+            suggestion_id,
+            "dismissed",
+            dismissed_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            dismissed_by=actor,
+        )
+    except Exception as e:
+        get_logger().warning(f"telemetry.mark_suggestion_dismissed failed: {e}")
