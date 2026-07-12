@@ -376,11 +376,15 @@ def convert_to_markdown_v2(output_data: dict,
                         if gfm_supported:
                             if reference_link is not None and len(reference_link) > 0:
                                 if relevant_lines_str:
-                                    issue_str = f"<details><summary><a href='{reference_link}'><strong>{issue_header}</strong></a>\n\n{issue_content}\n</summary>\n\n{relevant_lines_str}\n\n</details>"
+                                    # Put only the header in <summary>; keep issue_content
+                                    # (which can contain ``` code blocks) in the body so
+                                    # GitLab does not auto-close <summary> early and end
+                                    # up rendering the <details> as default-open.
+                                    issue_str = f"<details><summary><a href='{reference_link}'><strong>{issue_header}</strong></a></summary>\n\n{issue_content}\n\n{relevant_lines_str}\n\n</details>"
                                 else:
                                     issue_str = f"<a href='{reference_link}'><strong>{issue_header}</strong></a><br>{issue_content}"
                             else:
-                                issue_str = f"<strong>{issue_header}</strong><br>{issue_content}"
+                                issue_str = f"<details><summary><strong>{issue_header}</strong></summary>\n\n{issue_content}\n\n</details>" if issue_content else f"<strong>{issue_header}</strong>"
                         else:
                             if reference_link is not None and len(reference_link) > 0:
                                 issue_str = f"[**{issue_header}**]({reference_link})\n\n{issue_content}\n\n"
