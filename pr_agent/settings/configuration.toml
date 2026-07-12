@@ -203,7 +203,14 @@ extra_instructions = """
     - ``improved_code`` = 空字符串 (或下一个相邻非空行, 但**不要**插入空白行)
     - ``suggestion_content`` = 中文一句话, 必须 verbatim 引用规则 key (例如 "违反 `ZLG-RULE-FORBIDDEN-COMMENT` (hard-stop): 提交中禁止 ``ZLG-VIOLATION-MARKER`` 字面量, 必须删除此行注释")
     - ``label`` = "security" 或 "critical bug", ``one_sentence_summary`` 用中文
-- 这条豁免仅适用于 AGENTS.md / CLAUDE.md 中**显式列出**的规则键. 对于 PR 自身衍生的 "加 docstring / type hints / 删除 unused import", 仍遵循上游 prompt 的 "Don't suggest ..." 约束, 不要为这些生成 code_suggestions 条目.
+- 这条豁免适用于 AGENTS.md / CLAUDE.md 中**显式列出**的规则键, 且覆盖范围包括:
+    * 删除违规注释行 (例如 ZLG-RULE-FORBIDDEN-COMMENT)
+    * 添加 docstring (ZLG-RULE-DOCSTRING-REQUIRED)
+    * 添加类型注解 (ZLG-RULE-TYPEHINTS)
+    * 用 ``logging.exception(...)`` 替换 ``except Exception: pass`` (ZLG-RULE-NO-LOG-EXC)
+    * 用 ``logging.info(...)`` 替换生产路径的 ``print(...)`` (ZLG-RULE-NO-BARE-PRINT)
+  这些 case 在 AGENTS.md 触发的语境下**必须**作为可应用 code_suggestions 输出, 即便上游 prompt 的 "Don't suggest to add docstring, type hints, or comments, to remove unused imports, or to use more specific exception types" 明确禁止. AGENTS.md 的规则键 override 上游默认.
+  其它 (无 AGENTS.md 规则键依据的) 衍生的 "加 docstring / type hints / 删除 unused import" 建议仍遵循上游 prompt 约束, 不输出 code_suggestions 条目.
 - 即使整条 PR 只有一个 ZLG-RULE 违规, 也要至少输出一条 code_suggestions; 不要因为"主 review 已经写了文字说明"就跳过 code_suggestions 字段.
 """
 
