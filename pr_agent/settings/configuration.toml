@@ -195,6 +195,16 @@ extra_instructions = """
 - 同一规则在多个 chunk 里被违反时, 每个 chunk 都要 cite 一次; 但不要为同一条规则生成重复的修复建议.
 - 如果 AGENTS.md 写了非规则性的规约 (例如 "commit 规范 / 分支命名"), 也按字面遵循.
 - 如果本次 prompt 没有注入 AGENTS.md (即 ``repo_context_files`` 没配置或文件缺失), 跳过规则键 cite, 只输出常规改进建议.
+
+# AGENTS.md 触发的修复必须以可应用 suggestion 形式输出 (覆盖上游 prompt 的 "Don't suggest ..." 约束)
+- 当一条 ``ZLG-RULE-*`` (或任何 AGENTS.md 里声明的规则键) 在 PR diff 中被违反时, **必须**在 YAML 的 ``code_suggestions`` 列表里输出一条对应的 suggestion, **不能**只在 ``# PR Code Suggestions`` 的主 review 折叠里写纯文本描述. Apply 按钮是这次评审要交付的核心 UX, 缺失 = 任务未完成.
+- 违反此约束的常见情况是 AGENTS.md 要求"删除某行" (例如 ZLG-RULE-FORBIDDEN-COMMENT 要求删除含 ``ZLG-VIOLATION-MARKER`` 字面量的注释行): 这种情况下:
+    - ``existing_code`` = 那一行 marker 注释 (含前导空格, 与 diff 中原样)
+    - ``improved_code`` = 空字符串 (或下一个相邻非空行, 但**不要**插入空白行)
+    - ``suggestion_content`` = 中文一句话, 必须 verbatim 引用规则 key (例如 "违反 `ZLG-RULE-FORBIDDEN-COMMENT` (hard-stop): 提交中禁止 ``ZLG-VIOLATION-MARKER`` 字面量, 必须删除此行注释")
+    - ``label`` = "security" 或 "critical bug", ``one_sentence_summary`` 用中文
+- 这条豁免仅适用于 AGENTS.md / CLAUDE.md 中**显式列出**的规则键. 对于 PR 自身衍生的 "加 docstring / type hints / 删除 unused import", 仍遵循上游 prompt 的 "Don't suggest ..." 约束, 不要为这些生成 code_suggestions 条目.
+- 即使整条 PR 只有一个 ZLG-RULE 违规, 也要至少输出一条 code_suggestions; 不要因为"主 review 已经写了文字说明"就跳过 code_suggestions 字段.
 """
 
 # dual_publishing_score_threshold keeps the summarized-table UX for the
