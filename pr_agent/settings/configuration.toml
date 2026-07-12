@@ -323,15 +323,26 @@ push_commands = [
 [gitlab]
 url = "https://gitlab.com"
 expand_submodule_diffs = false
-# On MR open/reopen we only auto-run /describe. /review and /improve are kept
-# manual so the author decides when to ask for code suggestions (avoiding
-# token burn on every push).
+# On MR open/reopen we run the full pipeline: /describe updates the MR body,
+# /review writes the review summary, /improve drops inline suggestions.
+# Subsequent pushes re-run the same pipeline so the review follows the
+# latest commit; /describe skips rewriting the MR body (handled by
+# final_update_message=false) and /improve /publish_output=false prevents
+# double posting.
 pr_commands = [
     "/describe --pr_description.final_update_message=false",
+    "/review",
+    "/improve",
 ]
-handle_push_trigger = false
+# Re-run the pipeline on every new commit so reviewers always see
+# findings against the latest code. /describe + /review are cheap on a
+# small MR; /improve is bounded by num_code_suggestions so a noisy push
+# cannot blow the prompt budget.
+handle_push_trigger = true
 push_commands = [
-    "/describe",
+    "/describe --pr_description.final_update_message=false",
+    "/review",
+    "/improve",
 ]
 # Configure SSL validation for GitLab. Can be either set to the path of a custom CA or disabled entirely.
 # ssl_verify = true
