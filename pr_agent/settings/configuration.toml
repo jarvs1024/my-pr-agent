@@ -176,7 +176,15 @@ extra_instructions = """
 ``improved_code`` 必须是针对 PR diff 的最小变更: 不要为了"自包含"而在 ``improved_code`` 里塞 ``import`` 语句, 也不要重写文件里已有但本次 diff 没涉及的 import. 规则:
 - 只改 diff 实际涉及的代码行 (function body / 表达式 / 局部逻辑); 顶部 / 文件其它位置的 ``import`` 不属于本次 diff 的范围, 让它们原样保留.
 - 如果改动后的代码用到了当前 diff 行范围外、但同一文件其它位置已有的 import (例如文件顶部已经 ``import json``, 本次只把 ``pickle.loads`` 换成 ``json.loads``), 不要在 ``improved_code`` 里再写 ``import json``: Apply 后文件顶部已有, 不需要重复.
-- 如果改动后的代码用到了一个**文件里完全没出现**的 import (例如 diff 是新增的独立函数, 函数体里用到 ``hmac`` 但文件其它位置没有 ``import hmac``), 此时**不要**把 import 直接塞进 ``improved_code`` 里: 那样会在函数体里产生局部 import, 或者在 Apply 多条 suggestion 时造成顶部 import 重复; 改为单独发一条针对顶部 import 块的 suggestion, 让用户在文件顶部一次性加齐所有缺失的 import.
+- 如果改动后的代码用到了一个**文件里完全没出现**的 import (例如 diff 是新增的独立函数, 函数体里用到 ``hmac`` 但文件其它位置没有 ``import hmac``), **必须**为缺失的 import 单独发一条 suggestion, 不要把 import 直接塞进函数体的 ``improved_code`` 里 (否则会成为函数内局部 import, 反而破坏风格).
+  这条 import-suggestion 的 ``existing_code`` 必须引用**当前 import 块的最后一行** (diff 里实际存在的 import 行), ``improved_code`` 是该行加上新 import 行; ``suggestion_content`` 必须明确告诉用户"在文件顶部 import 块末尾追加此行". 例:
+    relevant_file: "review_fixture.py"
+    relevant_lines_start: 4   # 指向现有最后一行 import, 这个行号在 diff 中
+    relevant_lines_end: 4
+    existing_code: "import base64"
+    improved_code: "import base64\nimport json"
+    suggestion_content: "函数体用了 ``json.loads`` 但文件顶部未导入 ``json``, Apply 本条会在文件顶部 import 块末尾追加 ``import json``."
+- 同样的规则也用于删除 dead import (例如文件顶部 ``import pickle`` 但 ``pickle`` 在 ``improved_code`` 已不再被使用): 也单独发一条 suggestion, ``existing_code`` 是该 import 行, ``improved_code`` 是空行或下一个相邻 import 行.
 - 不要在 ``improved_code`` 里写 ``from __future__ import ...`` 之类的元语句.
 
 ``suggestion_content``、``label`` 等文字字段必须用中文 (zh-CN) 输出, 包括 importance 评分标签后的描述。
