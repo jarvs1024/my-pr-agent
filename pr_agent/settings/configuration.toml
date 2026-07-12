@@ -156,39 +156,28 @@ extra_instructions = ""
 commitable_code_suggestions = true
 # Cap the number of inline suggestions per /improve invocation so a noisy
 # review cannot blow the prompt budget.
-num_code_suggestions = 8
+num_code_suggestions = 5
 # Ask the LLM to put the new code into the ``improved_code`` field,
 # without nested ```` ``` ```` fences inside that field (they leak into the
 # final suggestion block and confuse GitLab).
+#
+# Project-rule handling: do NOT hard-code any rule keys here. The repo's
+# AGENTS.md / CLAUDE.md is already injected into the prompt at runtime via
+# ``repo_context_files`` (see ``[config]``). The instructions below tell the
+# LLM to discover rule keys from that injected context, so the same config
+# works for any project whose conventions live in AGENTS.md.
 extra_instructions = """
 每条建议请把建议后的代码完整填入 YAML 的 ``improved_code`` 字段, 不要在 ``improved_code`` 内重复添加 ```` ``` ```` 标记; pr-agent 会自动用 ```suggestion 块包住 improved_code, 用户在 GitLab UI 上可以直接点击 "Apply suggestion" 按钮。
 
 ``suggestion_content``、``label`` 等文字字段必须用中文 (zh-CN) 输出, 包括 importance 评分标签后的描述。
 
-# Project-specific (auto-review-test) — force LLM to follow the AGENTS.md rule keys when emitting suggestions:
-#   ZLG-RULE-NO-LOG-EXC, ZLG-RULE-DOCSTRING-REQUIRED, ZLG-RULE-NO-BARE-PRINT,
-#   ZLG-RULE-TYPEHINTS, ZLG-RULE-FORBIDDEN-COMMENT
-# Each suggestion MUST cite the relevant rule key inside ``suggestion_content``
-# in the form "违反 `ZLG-RULE-XX`", and the ``improved_code`` snippet MUST
-# enforce the rule (e.g. replace ``except Exception: pass`` with
-# ``logging.exception(...)`` + re-raise; add a docstring and type hints;
-# remove the ``ZLG-VIOLATION-MARKER`` comment).
-
-# Coverage requirement: when ANY of the ZLG-RULE-* keys in AGENTS.md applies to the
-# diff, emit AT LEAST one suggestion for each distinct rule violated. Don't drop
-# a rule just because the chunk only covers a few hunks; the same rule must be
-# cited in any chunk that contains a violation. The total cap is set by
-# ``num_code_suggestions`` below (raised to 8 so 5 AGENTS.md rules can each get
-# one suggestion, with room for critical non-rule fixes like the ``buggy_add``
-# logic bug).
+如果本次评审的上下文里注入了 ``AGENTS.md`` / ``CLAUDE.md`` (见 ``[config].repo_context_files``), 把它当作本仓库的最高优先规约来源:
+- 先扫描注入文本, 抽取出项目自定义的规则键 (形如 ``<PREFIX>-RULE-KEY`` 或类似约定, 例如 ``ZLG-RULE-NO-LOG-EXC``). 不要假设规则键的前缀, 直接看实际出现的字面量.
+- 对每一条被本次 diff 违反的规则, 在 ``suggestion_content`` 里逐条 cite (例如 "违反 `ZLG-RULE-NO-LOG-EXC`"); ``improved_code`` 必须落实该规则的具体修复方式, 不能只是泛泛改写.
+- 同一规则在多个 chunk 里被违反时, 每个 chunk 都要 cite 一次; 但不要为同一条规则生成重复的修复建议.
+- 如果 AGENTS.md 写了非规则性的规约 (例如 "commit 规范 / 分支命名"), 也按字面遵循.
+- 如果本次 prompt 没有注入 AGENTS.md (即 ``repo_context_files`` 没配置或文件缺失), 跳过规则键 cite, 只输出常规改进建议.
 """
-
-# Required rule citation map (emit one suggestion per row when violated):
-#   ZLG-RULE-NO-LOG-EXC         -> replace bare ``except Exception: pass`` with ``logging.exception`` + re-raise
-#   ZLG-RULE-DOCSTRING-REQUIRED  -> add a single-line docstring under each affected ``def``
-#   ZLG-RULE-NO-BARE-PRINT      -> replace ``print(...)`` in production code with ``logging.info(...)``
-#   ZLG-RULE-TYPEHINTS          -> add Python type annotations to affected function signatures
-#   ZLG-RULE-FORBIDDEN-COMMENT  -> delete the literal line containing ``ZLG-VIOLATION-MARKER``
 
 # dual_publishing_score_threshold keeps the summarized-table UX for the
 # overview while also publishing inline DiffNotes for important suggestions.
