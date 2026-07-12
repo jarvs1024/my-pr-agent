@@ -6,7 +6,7 @@ import textwrap
 import traceback
 from datetime import datetime
 from functools import partial
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from jinja2 import Environment, StrictUndefined
 
@@ -492,7 +492,11 @@ class PRCodeSuggestions:
                 suggestion['improved_code'] += f"\n{suggestion_truncation_message}"
         return suggestion
 
-    def _prepare_pr_code_suggestions(self, predictions: str) -> Dict:
+    def _prepare_pr_code_suggestions(self, predictions: Optional[str]) -> Dict:
+        if not predictions:
+            # chat_completion returned None / aborted / empty — emit a clean empty
+            # payload so callers don't crash with 'NoneType' errors.
+            return {"code_suggestions": []}
         data = load_yaml(predictions.strip(),
                          keys_fix_yaml=["relevant_file", "suggestion_content", "existing_code", "improved_code"],
                          first_key="code_suggestions", last_key="label")

@@ -309,7 +309,10 @@ class LiteLLMAIHandler(BaseAiHandler):
         get_logger().warning("Bedrock call failed with ambient (IMDS) credentials; retrying with static credentials")
 
     def prepare_logs(self, response, system, user, resp, finish_reason):
-        response_log = response.dict().copy()
+        if response is not None and hasattr(response, "dict"):
+            response_log = response.dict().copy() if isinstance(response.dict(), dict) else {"raw": str(response.dict())}
+        else:
+            response_log = {}
         response_log['system'] = system
         response_log['user'] = user
         response_log['output'] = resp
@@ -652,8 +655,14 @@ class LiteLLMAIHandler(BaseAiHandler):
             return resp, finish_reason, mock_response
         else:
             response = await acompletion(**kwargs)
-            if response is None or len(response["choices"]) == 0:
-                raise openai.APIError
+            # Defensive: litellm may return an aborted response with a "choices"
+            # payload that itself is None or whose first element is None
+            # (e.g. upstream finish_reason="abort"). Rather than raising (which
+            # surfaces as "生成代码建议失败" to the user), return (None, "abort")
+            # so callers like _prepare_pr_code_suggestions can fall back to an
+            # empty payload and the user still sees a clean PR-level message.
+            if response is None or not getattr(response, "choices", None) or len(response["choices"]) == 0 or response["choices"][0] is None:
+                return None, "abort", response
             return (response["choices"][0]['message']['content'],
                     response["choices"][0]["finish_reason"],
                     response)

@@ -350,7 +350,19 @@ def _get_all_models(model_type: ModelType = ModelType.REGULAR) -> List[str]:
     fallback_models = get_settings().config.fallback_models
     if not isinstance(fallback_models, list):
         fallback_models = [m.strip() for m in fallback_models.split(",")]
-    all_models = [model] + fallback_models
+    # Drop fallback models that lack a provider prefix and are not a known litellm
+    # model alias. Without a prefix litellm raises BadRequestError instead of routing
+    # to any provider, which turns every retry into a hard failure.
+    cleaned_fallbacks = []
+    for fm in fallback_models:
+        if not fm:
+            continue
+        if "/" in fm or fm.split(":", 1)[0] in {"openai", "anthropic", "azure", "gemini", "bedrock", "vertex_ai-language-models", "cohere", "mistral", "groq", "ollama", "huggingface"}:
+            cleaned_fallbacks.append(fm)
+        else:
+            from loguru import logger as _logger
+            _logger.warning(f"Skipping fallback model '{fm}' (no provider prefix); edit CONFIG__FALLBACK_MODELS to 'openai/{fm}' or similar.")
+    all_models = [model] + cleaned_fallbacks
     return all_models
 
 
