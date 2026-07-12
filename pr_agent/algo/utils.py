@@ -90,6 +90,7 @@ _KEY_TRANSLATIONS = {
     "estimated effort to review": "预估评审工作量",
     "relevant tests": "相关测试",
     "no relevant tests": "无相关测试",
+    "pr contains tests": "PR 包含测试",
     "security concerns": "安全顾虑",
     "no security concerns identified": "未识别到安全顾虑",
     "no major issues detected": "未检测到主要问题",
@@ -100,9 +101,11 @@ _KEY_TRANSLATIONS = {
     "focused pr": "聚焦的 PR",
     "relevant ticket": "关联工单",
     "todo sections": "TODO 章节",
+    "no todo sections": "无 TODO 章节",
     "insights from user answers": "来自用户回答的洞察",
     "code feedback": "代码反馈",
     "contribution time cost estimate": "贡献时间成本估算",
+    "contribution time estimate": "贡献时间估算",
     "ticket compliance check": "工单合规检查",
 }
 
@@ -234,7 +237,8 @@ def convert_to_markdown_v2(output_data: dict,
             if key.lower() not in ['can_be_split', 'key_issues_to_review']:
                 continue
         key_nice = _translate_label(key.replace('_', ' ').capitalize())
-        emoji = emojis.get(key_nice, "")
+        # emojis dict is keyed on the English label; look up via the un-translated form
+        emoji = emojis.get(key.replace('_', ' ').capitalize(), "")
         if 'Estimated effort to review' in key_nice:
             key_nice = 'Estimated effort to review'
             key_nice = _translate_label(key_nice)
@@ -255,86 +259,102 @@ def convert_to_markdown_v2(output_data: dict,
                 markdown_text += f"</td></tr>\n"
             else:
                 markdown_text += f"### {emoji} {key_nice}: {value}\n\n"
-        elif 'relevant tests' in key_nice.lower():
+        elif 'relevant tests' in key.lower().replace('_', ' '):
             value = str(value).strip().lower()
             if gfm_supported:
                 markdown_text += f"<tr><td>"
                 if is_value_no(value):
-                    markdown_text += f"{emoji}&nbsp;<strong>No relevant tests</strong>"
+                    markdown_text += f"{emoji}&nbsp;<strong>{_translate_label('No relevant tests')}</strong>"
                 else:
-                    markdown_text += f"{emoji}&nbsp;<strong>PR contains tests</strong>"
+                    markdown_text += f"{emoji}&nbsp;<strong>{_translate_label('PR contains tests')}</strong>"
                 markdown_text += f"</td></tr>\n"
             else:
                 if is_value_no(value):
-                    markdown_text += f'### {emoji} No relevant tests\n\n'
+                    markdown_text += f'### {emoji} {_translate_label('No relevant tests')}\n\n'
                 else:
-                    markdown_text += f"### {emoji} PR contains tests\n\n"
-        elif 'ticket compliance check' in key_nice.lower():
+                    markdown_text += f"### {emoji} {_translate_label('PR contains tests')}\n\n"
+        elif 'ticket compliance check' in key.lower().replace('_', ' '):
             markdown_text = ticket_markdown_logic(emoji, markdown_text, value, gfm_supported)
-        elif 'contribution time cost estimate' in key_nice.lower():
+        elif 'contribution time cost estimate' in key.lower().replace('_', ' '):
             if gfm_supported:
-                markdown_text += f"<tr><td>{emoji}&nbsp;<strong>Contribution time estimate</strong> (best, average, worst case): "
+                markdown_text += f"<tr><td>{emoji}&nbsp;<strong>{_translate_label('Contribution time estimate')}</strong> (best, average, worst case): "
                 markdown_text += f"{value['best_case'].replace('m', ' minutes')} | {value['average_case'].replace('m', ' minutes')} | {value['worst_case'].replace('m', ' minutes')}"
                 markdown_text += f"</td></tr>\n"
             else:
-                markdown_text += f"### {emoji} Contribution time estimate (best, average, worst case): "
+                markdown_text += f"### {emoji} {_translate_label('Contribution time estimate')} (best, average, worst case): "
                 markdown_text += f"{value['best_case'].replace('m', ' minutes')} | {value['average_case'].replace('m', ' minutes')} | {value['worst_case'].replace('m', ' minutes')}\n\n"
-        elif 'security concerns' in key_nice.lower():
+        elif 'security concerns' in key.lower().replace('_', ' '):
             if gfm_supported:
                 markdown_text += f"<tr><td>"
                 if is_value_no(value):
-                    markdown_text += f"{emoji}&nbsp;<strong>No security concerns identified</strong>"
+                    markdown_text += f"{emoji}&nbsp;<strong>{_translate_label('No security concerns identified')}</strong>"
                 else:
-                    markdown_text += f"{emoji}&nbsp;<strong>Security concerns</strong><br><br>\n\n"
+                    markdown_text += f"{emoji}&nbsp;<strong>{_translate_label('Security concerns')}</strong><br><br>\n\n"
                     value = emphasize_header(value.strip())
                     markdown_text += f"{value}"
                 markdown_text += f"</td></tr>\n"
             else:
                 if is_value_no(value):
-                    markdown_text += f'### {emoji} No security concerns identified\n\n'
+                    markdown_text += f'### {emoji} {_translate_label('No security concerns identified')}\n\n'
                 else:
-                    markdown_text += f"### {emoji} Security concerns\n\n"
+                    markdown_text += f"### {emoji} {_translate_label('Security concerns')}\n\n"
                     value = emphasize_header(value.strip(), only_markdown=True)
                     markdown_text += f"{value}\n\n"
-        elif 'todo sections' in key_nice.lower():
+        elif 'todo sections' in key.lower().replace('_', ' '):
             if gfm_supported:
                 markdown_text += "<tr><td>"
                 if is_value_no(value):
-                    markdown_text += f"✅&nbsp;<strong>No TODO sections</strong>"
+                    markdown_text += f"✅&nbsp;<strong>{_translate_label('No TODO sections')}</strong>"
                 else:
                     markdown_todo_items = format_todo_items(value, git_provider, gfm_supported)
-                    markdown_text += f"{emoji}&nbsp;<strong>TODO sections</strong>\n<br><br>\n"
+                    markdown_text += f"{emoji}&nbsp;<strong>{_translate_label('TODO sections')}</strong>\n<br><br>\n"
                     markdown_text += markdown_todo_items
                 markdown_text += "</td></tr>\n"
             else:
                 if is_value_no(value):
-                    markdown_text += f"### ✅ No TODO sections\n\n"
+                    markdown_text += f"### ✅ {_translate_label('No TODO sections')}\n\n"
                 else:
                     markdown_todo_items = format_todo_items(value, git_provider, gfm_supported)
-                    markdown_text += f"### {emoji} TODO sections\n\n"
+                    markdown_text += f"### {emoji} {_translate_label('TODO sections')}\n\n"
                     markdown_text += markdown_todo_items
-        elif 'can be split' in key_nice.lower():
+        elif 'can be split' in key.lower().replace('_', ' '):
             if gfm_supported:
                 markdown_text += f"<tr><td>"
                 markdown_text += process_can_be_split(emoji, value)
                 markdown_text += f"</td></tr>\n"
-        elif 'key issues to review' in key_nice.lower():
+        elif 'key issues to review' in key.lower().replace('_', ' '):
+            # value is expected to be a list of issues (dicts), but a few
+            # upstream yaml parsers (or a misquoted LLM response) hand it
+            # back as the *string* "['{...}', ...]" instead. Detect that
+            # and lift it back to a list so the issue loop below can run;
+            # otherwise fall back to rendering the raw text as a single
+            # issue body to avoid leaking Python repr into the panel.
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped.startswith('[') and stripped.endswith(']'):
+                    try:
+                        import ast
+                        parsed = ast.literal_eval(stripped)
+                        if isinstance(parsed, list):
+                            value = parsed
+                    except (ValueError, SyntaxError):
+                        pass
             # value is a list of issues
             if is_value_no(value):
                 if gfm_supported:
                     markdown_text += f"<tr><td>"
-                    markdown_text += f"{emoji}&nbsp;<strong>No major issues detected</strong>"
+                    markdown_text += f"{emoji}&nbsp;<strong>{_translate_label('No major issues detected')}</strong>"
                     markdown_text += f"</td></tr>\n"
                 else:
-                    markdown_text += f"### {emoji} No major issues detected\n\n"
+                    markdown_text += f"### {emoji} {_translate_label('No major issues detected')}\n\n"
             else:
                 issues = value
                 if gfm_supported:
                     markdown_text += f"<tr><td>"
                     # markdown_text += f"{emoji}&nbsp;<strong>{key_nice}</strong><br><br>\n\n"
-                    markdown_text += f"{emoji}&nbsp;<strong>Recommended focus areas for review</strong><br><br>\n\n"
+                    markdown_text += f"{emoji}&nbsp;<strong>{_translate_label('Recommended focus areas for review')}</strong><br><br>\n\n"
                 else:
-                    markdown_text += f"### {emoji} Recommended focus areas for review\n\n#### \n"
+                    markdown_text += f"### {emoji} {_translate_label('Recommended focus areas for review')}\n\n#### \n"
                 for i, issue in enumerate(issues):
                     try:
                         if not issue or not isinstance(issue, dict):
