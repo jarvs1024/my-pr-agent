@@ -236,10 +236,9 @@ class PRCodeSuggestions:
                             data.get("code_suggestions") or [],
                         )
                         _inline_total = len(self.vars.get("agents_md_rules") or [])
-                        # Re-render with total so tone matches the no-suggestions branch
-                        # when the LLM produced no suggestions at all (clean diff case).
-                        if _inline_details and _inline_total and len(_inline_uncovered) == _inline_total and not (data.get("code_suggestions") or []):
-                            _inline_details = render_uncovered_details(_inline_uncovered, total_required=_inline_total)
+                        _inline_details = render_uncovered_details(
+                            _inline_uncovered, total_required=_inline_total,
+                        )
                         if _inline_details:
                             self.git_provider.publish_comment(_inline_details)
             else:
