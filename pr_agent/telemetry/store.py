@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS suggestions (
     applied_at TEXT,
     dismissed_at TEXT,
     dismissed_by TEXT,
-    note_id INTEGER
+    note_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sug_mr ON suggestions(mr_id);
 CREATE INDEX IF NOT EXISTS idx_sug_state ON suggestions(state);
@@ -100,6 +100,30 @@ class TelemetryStore:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             self._db = sqlite3.connect(path, check_same_thread=False)
             self._db.executescript(_SQLITE_SCHEMA)
+            # One-off migration: older deployments stored note_id as INTEGER but the
+            # GitLab discussion id is a 40-char SHA1 hash that overflows SQLite
+            # INTEGER. Convert in place via shadow column.
+            try:
+                cols = [r[1] for r in self._db.execute(
+                    "PRAGMA table_info(suggestions)").fetchall()]
+                if "note_id" in cols:
+                    col_type = next((r[2] for r in self._db.execute(
+                        "PRAGMA table_info(suggestions)").fetchall()
+                        if r[1] == "note_id"), None)
+                    if col_type and col_type.upper() != "TEXT":
+                        self._db.execute(
+                            "ALTER TABLE suggestions ADD COLUMN note_id_text TEXT")
+                        self._db.execute(
+                            "UPDATE suggestions SET note_id_text = CAST(note_id AS TEXT)")
+                        self._db.execute(
+                            "ALTER TABLE suggestions DROP COLUMN note_id")
+                        self._db.execute(
+                            "ALTER TABLE suggestions RENAME COLUMN note_id_text TO note_id")
+                        self._db.commit()
+                        get_logger().info(
+                            "telemetry: migrated suggestions.note_id -> TEXT")
+            except Exception as e:
+                get_logger().warning(f"telemetry note_id migration skipped: {e}")
             self._db.commit()
         elif backend == "jsonl":
             _jsonl_env = os.environ.get("REVIEW_TELEMETRY_JSONL_PATH")
@@ -199,7 +223,7 @@ class TelemetryStore:
             )
             self._db.commit()
 
-    def get_suggestion_by_note_id(self, note_id: int):
+    def get_suggestion_by_note_id(self, note_id):
         if self.backend != "sqlite" or self._db is None:
             return None
         with self._lock:

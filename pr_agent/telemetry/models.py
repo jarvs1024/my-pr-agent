@@ -81,7 +81,7 @@ class Suggestion:
     applied_at: Optional[str] = None
     dismissed_at: Optional[str] = None
     dismissed_by: Optional[str] = None
-    note_id: Optional[int] = None  # GitLab note id
+    note_id=None  # GitLab discussion id (hash str)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
