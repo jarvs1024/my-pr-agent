@@ -688,9 +688,9 @@ class PRCodeSuggestions:
                     new_code_snippet = self.dedent_code(relevant_file, relevant_lines_start, new_code_snippet)
 
                 if d.get('score'):
-                    body = f"**Suggestion:** {content} [{label}, importance: {d.get('score')}]\n```suggestion\n" + new_code_snippet + "\n```\n\n<sub>👎 不采纳？在下方回复 `/dismiss` 让 pr-agent 关闭本条建议。</sub>"
+                    body = f"**Suggestion:** {content} [{label}, importance: {d.get('score')}]\n```suggestion\n" + new_code_snippet + "\n```\n\n👎 不采纳？在下方回复 `/dismiss` 让 pr-agent 关闭本条建议。"
                 else:
-                    body = f"**Suggestion:** {content} [{label}]\n```suggestion\n" + new_code_snippet + "\n```\n\n<sub>👎 不采纳？在下方回复 `/dismiss` 让 pr-agent 关闭本条建议。</sub>"
+                    body = f"**Suggestion:** {content} [{label}]\n```suggestion\n" + new_code_snippet + "\n```\n\n👎 不采纳？在下方回复 `/dismiss` 让 pr-agent 关闭本条建议。"
                 code_suggestions.append({'body': body, 'relevant_file': relevant_file,
                                          'relevant_lines_start': relevant_lines_start,
                                          'relevant_lines_end': relevant_lines_end,
