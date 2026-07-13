@@ -95,13 +95,15 @@ class TelemetryStore:
         self._jsonl_fp = None
         self._db = None
         if backend == "sqlite":
-            path = sqlite_path or os.environ.get("REVIEW_TELEMETRY_DB_PATH", "/tmp/pr-agent-telemetry.db")
+            _sqlite_env = os.environ.get("REVIEW_TELEMETRY_DB_PATH")
+            path = sqlite_path or _sqlite_env or (os.environ.get("PR_AGENT_DATA_DIR", "/var/lib/pr-agent") + "/telemetry.db")
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             self._db = sqlite3.connect(path, check_same_thread=False)
             self._db.executescript(_SQLITE_SCHEMA)
             self._db.commit()
         elif backend == "jsonl":
-            path = jsonl_path or os.environ.get("REVIEW_TELEMETRY_JSONL_PATH", "/tmp/pr-agent-telemetry.jsonl")
+            _jsonl_env = os.environ.get("REVIEW_TELEMETRY_JSONL_PATH")
+            path = jsonl_path or _jsonl_env or (os.environ.get("PR_AGENT_DATA_DIR", "/var/lib/pr-agent") + "/telemetry.jsonl")
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             self._jsonl_fp = open(path, "a", encoding="utf-8")
         elif backend == "off":
