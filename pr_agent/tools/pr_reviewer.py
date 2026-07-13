@@ -20,6 +20,7 @@ from pr_agent.algo.utils import (ModelType, PRReviewHeader,
                                  convert_to_markdown_v2, github_action_output,
                                  load_yaml, show_relevant_configurations)
 from pr_agent.config_loader import get_settings
+from pr_agent.telemetry import events as telemetry_events
 from pr_agent.git_providers import (get_git_provider,
                                     get_git_provider_with_context)
 from pr_agent.git_providers.git_provider import (IncrementalPR,
@@ -123,9 +124,38 @@ class PRReviewer:
         return incremental
 
     async def run(self) -> None:
+        # Telemetry: track this /review run from start to finish
+        import time
+        _run_id = None
+        _run_started_at = time.monotonic()
+        try:
+            _gp = self.git_provider
+            _mr_id = (
+                getattr(_gp, "id_mr", None)
+                or getattr(getattr(_gp, "pr", None), "iid", None)
+                or 0
+            )
+            _raw_pid = getattr(_gp, "id_project", None) or 0
+            _pid = _raw_pid if isinstance(_raw_pid, int) else 0
+            if not _pid and isinstance(_raw_pid, str):
+                try:
+                    _pid = _gp.gl.projects.get(_raw_pid).id
+                except Exception:
+                    _pid = 0
+            _run_id = telemetry_events.emit_run_started(
+                mr_id=int(_mr_id or 0),
+                project_id=int(_pid or 0),
+                command="review",
+                triggered_by=getattr(get_settings().config, "is_auto_command", False) and "auto" or "user",
+                model=getattr(get_settings().config, "model", None),
+            )
+        except Exception:
+            _run_id = None
+        _run_status = {"name": "empty"}
         try:
             if not self.git_provider.get_files():
                 get_logger().info(f"PR has no files: {self.pr_url}, skipping review")
+                _run_status["name"] = "skipped"
                 return None
 
             if self.incremental.is_incremental:
@@ -192,8 +222,39 @@ class PRReviewer:
                 self.git_provider.publish_comment(pr_review)
 
             self.git_provider.remove_initial_comment()
+            _run_status["name"] = "success"
         except Exception as e:
             get_logger().error(f"Failed to review PR: {e}")
+            _run_status["name"] = "failed"
+            _run_status["error"] = str(e)
+        finally:
+            if _run_id:
+                try:
+                    _gp_final = self.git_provider
+                    _final_mr = (
+                        getattr(_gp_final, "id_mr", None)
+                        or getattr(getattr(_gp_final, "pr", None), "iid", None)
+                        or 0
+                    )
+                    _raw_pid = getattr(_gp_final, "id_project", None) or 0
+                    _final_pid = _raw_pid if isinstance(_raw_pid, int) else 0
+                    if not _final_pid and isinstance(_raw_pid, str):
+                        try:
+                            _final_pid = _gp_final.gl.projects.get(_raw_pid).id
+                        except Exception:
+                            _final_pid = 0
+                except Exception:
+                    _final_mr = 0
+                    _final_pid = 0
+                telemetry_events.emit_run_finished(
+                    _run_id,
+                    status=_run_status["name"],
+                    duration_ms=int((time.monotonic() - _run_started_at) * 1000),
+                    error=_run_status.get("error"),
+                    mr_id=int(_final_mr or 0),
+                    project_id=int(_final_pid or 0),
+                    command="review",
+                )
 
     def _should_publish_review_no_suggestions(self, pr_review: str) -> bool:
         return get_settings().pr_reviewer.get('publish_output_no_suggestions', True) or "No major issues detected" not in pr_review

@@ -163,7 +163,7 @@ def emit_suggestion(
     one_sentence_summary: str,
     rule_keys: Iterable[str],
     score: Optional[int] = None,
-    note_id: Optional[int] = None,
+    note_id=None,
 ) -> str:
     suggestion = models.Suggestion(
         mr_id=mr_id,

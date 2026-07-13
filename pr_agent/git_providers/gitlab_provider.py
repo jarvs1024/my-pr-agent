@@ -560,8 +560,8 @@ class GitLabProvider(GitProvider):
         body = self.limit_output_characters(body, self.max_comment_chars)
         edit_type, found, source_line_no, target_file, target_line_no = self.search_line(relevant_file,
                                                                                          relevant_line_in_file)
-        self.send_inline_comment(body, edit_type, found, relevant_file, relevant_line_in_file, source_line_no,
-                                 target_file, target_line_no, original_suggestion)
+        return self.send_inline_comment(body, edit_type, found, relevant_file, relevant_line_in_file, source_line_no,
+                                        target_file, target_line_no, original_suggestion)
 
     def create_inline_comment(self, body: str, relevant_file: str, relevant_line_in_file: str, absolute_position: int = None):
         raise NotImplementedError("Gitlab provider does not support creating inline comments yet")
@@ -576,7 +576,7 @@ class GitLabProvider(GitProvider):
     def send_inline_comment(self, body: str, edit_type: str, found: bool, relevant_file: str,
                             relevant_line_in_file: str,
                             source_line_no: int, target_file: str, target_line_no: int,
-                            original_suggestion=None) -> None:
+                            original_suggestion=None) -> "Optional[str]":
         if not found:
             get_logger().info(f"Could not find position for {relevant_file} {relevant_line_in_file}")
         else:
@@ -598,7 +598,17 @@ class GitLabProvider(GitProvider):
                 pos_obj['old_line'] = source_line_no - 1
             get_logger().debug(f"Creating comment in MR {self.id_mr} with body {body} and position {pos_obj}")
             try:
-                self.mr.discussions.create({'body': body, 'position': pos_obj})
+                discussion = self.mr.discussions.create({'body': body, 'position': pos_obj})
+                # python-gitlab returns a RESTObject whose id lives in _attrs.
+                # Reading discussion.attributes["id"] (or getattr(..., 'id'))
+                # gives us the GitLab discussion id needed for /dismiss reconciliation.
+                try:
+                    raw_id = getattr(discussion, 'id', None)
+                    if raw_id is None and hasattr(discussion, 'attributes'):
+                        raw_id = discussion.attributes.get('id')
+                    return str(raw_id) if raw_id else None
+                except Exception:
+                    return None
             except Exception as e:
                 try:
                     # fallback - create a general note on the file in the MR
@@ -638,8 +648,9 @@ class GitLabProvider(GitProvider):
                     diff_code = f"\n\n```diff\n{patch.rstrip()}\n```"
                     body_fallback += diff_code
 
-                    # Create a general note on the file in the MR
-                    self.mr.notes.create({
+                    # Create a general note on the file in the MR. Capture the note id
+                    # so the pr-agent telemetry store can reconcile /dismiss by it.
+                    fallback_note = self.mr.notes.create({
                         'body': body_fallback,
                         'position': {
                             'base_sha': diff.base_commit_sha,
@@ -649,12 +660,22 @@ class GitLabProvider(GitProvider):
                             'file_path': f'{target_file.filename}',
                         }
                     })
+                    try:
+                        _fid = getattr(fallback_note, 'id', None)
+                        if _fid is None and hasattr(fallback_note, 'attributes'):
+                            _fid = fallback_note.attributes.get('id')
+                        if _fid:
+                            return str(_fid)
+                    except Exception:
+                        pass
                     get_logger().debug(f"Created fallback comment in MR {self.id_mr} with position {pos_obj}")
 
                     # get_logger().debug(
                     #     f"Failed to create comment in MR {self.id_mr} with position {pos_obj} (probably not a '+' line)")
                 except Exception as e:
                     get_logger().exception(f"Failed to create comment in MR {self.id_mr}")
+        # Outer fall-through when not found / no diff
+        return None
 
     def get_relevant_diff(self, relevant_file: str, relevant_line_in_file: str) -> Optional[dict]:
         _changes = self.mr.changes()  # dict
@@ -707,8 +728,10 @@ class GitLabProvider(GitProvider):
                 found = True
                 edit_type = 'addition'
 
-                self.send_inline_comment(body, edit_type, found, relevant_file, relevant_line_in_file, source_line_no,
-                                         target_file, target_line_no, original_suggestion)
+                note_id = self.send_inline_comment(body, edit_type, found, relevant_file, relevant_line_in_file, source_line_no,
+                                                   target_file, target_line_no, original_suggestion)
+                if note_id:
+                    suggestion["note_id"] = note_id
             except Exception as e:
                 get_logger().exception(f"Could not publish code suggestion:\nsuggestion: {suggestion}\nerror: {e}")
 

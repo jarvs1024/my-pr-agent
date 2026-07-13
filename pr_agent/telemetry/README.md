@@ -94,11 +94,11 @@ Webhook 处理 MR 事件时 upsert (以 `project_id + mr_id` 为 PK):
 | `applied_at`         | text?  | (reserved, 见 "已知缺口")                       |
 | `dismissed_at`       | text?  | (reserved)                                      |
 | `dismissed_by`       | text?  | (reserved)                                      |
-| `note_id`            | int?   | GitLab note id (push 钩子里没拿到, 见下文)      |
+| `note_id`            | text?  | GitLab discussion id (40-char SHA1 哈希, publish 时捕获, /dismiss 反查) |
 
 ### `action_events` — 用户对建议的操作
 
-目前表结构已建好, 但钩子没接入 (见 "已知缺口"):
+`/dismiss` 在讨论回复时由 webhook 钩入 (`pr_agent/servers/gitlab_webhook.py`), 通过 note_id 反查 suggestion 并写一行 action event + 更新 state:
 
 | 字段            | 类型   | 说明                                   |
 |----------------|-------|----------------------------------------|
@@ -322,14 +322,19 @@ async function getOverview() {
 4. **MR 详情页** → `/mrs/{p}/{m}/timeline` (1 个 fetch 拿全)
 5. **单条建议的下钻** → `/mrs/{p}/{m}/suggestions` (按需)
 
+## 已接入的钩子
+
+- `note_id`: `GitLabProvider.send_inline_comment` 在 publish 路径返回 GitLab discussion id, primary / fallback 两条路都回填 (`pr_agent/git_providers/gitlab_provider.py`). 写入 `suggestions.note_id`.
+- `/review`: `PRReviewer.run` 围着 `_run_id = emit_run_started()` 加了同样的 finally / 错误处理 (`pr_agent/tools/pr_reviewer.py`). `/describe` 复用同一条管道, command 字段区分.
+- `/dismiss` (inline 建议的 thread reply): webhook 调 `resolve_discussion` 成功后, 反查 `note_id` 关联的 suggestion, 写 `action_events` 一行 (`action=dismissed`), 同步 `mark_suggestion_dismissed` 更新 `state=dismissed` / `dismissed_at` / `dismissed_by` (`pr_agent/servers/gitlab_webhook.py`).
+
 ## 已知缺口 / 后续可补的钩子
 
 | 数据 | 现状 | 补法 |
 |------|------|------|
-| `applied_at` / `dismissed_at` | 字段已建但永远是 None | GitLab 推 discussion resolve / unresolve webhook 时, 在 `gitlab_webhook.py` 里调 `mark_suggestion_applied(dismissed)`. 约 30 行. |
-| `note_id` 在 suggestions 表 | 当前 None | 把 `git_provider.publish_code_suggestions` 改成返回 per-suggestion note id, 在 hook 里读返回值. 约 20 行. |
-| `action_events` 表 | 表结构已建, 钩子未接 | 同上: 在 webhook 里 `record_action`. |
-(已完成: 时间窗过滤, 按作者聚合)
+| `applied_at` / `state=applied` | 字段已建, 仅在 GitLab 端点 `Apply suggestion` 后由 GitLab 推 `discussion.unresolve` 时才会回写 (目前只接 resolve → dismissed) | 接 GitLab `merge_request_event` 推送, 在 webhook 拦 `applied` 事件 |
+| 与 GitLab Apply 同源的 event 也填 action_events | `action=applied` 没接 | 同上 |
+(已完成: 时间窗过滤, 按作者聚合, note_id, /review telemetry, /dismiss telemetry)
 
 数据模型已经预留了这些字段的列, schema 不会变, 后续只是补 hook / endpoint, 不破坏现有数据.
 

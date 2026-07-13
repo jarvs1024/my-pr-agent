@@ -353,6 +353,24 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                         ok = provider.resolve_discussion(discussion_id)
                         if ok:
                             get_logger().info(f"/dismiss resolved MR discussion {discussion_id}")
+                            # Telemetry: attribute the dismiss to the suggestion it resolved.
+                            # The discussion id is the GitLab-side suggestion id stored on the
+                            # suggestion row at publish time (see pr_code_suggestions.py).
+                            try:
+                                author = data.get("user", {}).get("username", "")
+                                mr_iid = data.get("merge_request", {}).get("iid")
+                                suggestion = telemetry_events.get_default_store().get_suggestion_by_note_id(discussion_id)
+                                if suggestion is not None:
+                                    telemetry_events.emit_action(
+                                        action="dismissed",
+                                        suggestion_id=suggestion["suggestion_id"],
+                                        mr_id=int(mr_iid or suggestion["mr_id"] or 0),
+                                        actor=author,
+                                        note=f"resolved discussion {discussion_id}",
+                                    )
+                                    telemetry_events.mark_suggestion_dismissed(suggestion["suggestion_id"], actor=author)
+                            except Exception as e:
+                                get_logger().warning(f"telemetry.on_dismiss failed: {e}")
                         else:
                             get_logger().warning(f"/dismiss failed to resolve discussion {discussion_id}")
                         return JSONResponse(status_code=status.HTTP_200_OK,

@@ -738,6 +738,7 @@ class PRCodeSuggestions:
                     one_sentence_summary=original.get("one_sentence_summary", ""),
                     rule_keys=rule_keys,
                     score=original.get("score"),
+                    note_id=cs.get("note_id"),
                 )
         except Exception as e:
             get_logger().warning(f"telemetry emit on publish_code_suggestions failed: {e}")
