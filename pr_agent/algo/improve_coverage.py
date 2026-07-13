@@ -48,13 +48,35 @@ def compute_uncovered_rules(
     return [k for k in required if k not in cited]
 
 
-def render_uncovered_details(uncovered: Iterable[str] | None) -> str:
-    """Render the checklist block; empty string when nothing to show."""
+def render_uncovered_details(
+    uncovered: Iterable[str] | None,
+    total_required: int = 0,
+) -> str:
+    """Render the checklist block; empty string when nothing to show.
+
+    When ``uncovered`` covers every required rule and the LLM produced zero
+    suggestions (``uncovered == total_required``), the diff likely doesn't
+    violate any rule — surface that as an informational note rather than a
+    warning so reviewers don't read a green MR as a fault.
+    """
     keys = list(uncovered or [])
-    if not keys:
+    if not keys or not total_required:
         return ""
 
     items = "\n".join(f"- `{k}`" for k in keys)
+    if len(keys) == total_required:
+        # LLM gave no suggestions AND no rule keys were cited → diff is clean
+        # of AGENTS.md violations. Don't make it look like a failed review.
+        return (
+            "\n\n<details>\n"
+            f"<summary>ℹ️ 规则覆盖: 本次 diff 未触发 {total_required} 条 AGENTS.md 规则中的任何一条</summary>\n\n"
+            "本仓库 AGENTS.md / .agents/rules/ 中定义的所有规则键本次都没有违规迹象, "
+            "机器人也不会给出针对性的 Apply 建议:\n\n"
+            f"{items}\n\n"
+            "如果你认为 diff 里**确实**违反了某条规则, 请人工补一条对应建议或重跑 `/improve`.\n\n"
+            "</details>\n"
+        )
+
     return (
         "\n\n<details>\n"
         f"<summary>⚠️ 规则覆盖检查: {len(keys)} 条 AGENTS.md 规则未在本次 /improve 的 Apply 建议里被引用</summary>\n\n"

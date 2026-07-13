@@ -191,7 +191,8 @@ class PRCodeSuggestions:
                     # received; relies on `agents_md_rules` already injected into `self.vars`.
                     _required_rules = self.vars.get("agents_md_rules") or []
                     _uncovered = compute_uncovered_rules(_required_rules, data.get("code_suggestions") or [])
-                    pr_body += render_uncovered_details(_uncovered)
+                    _total_required = len(self.vars.get("agents_md_rules") or [])
+                    pr_body += render_uncovered_details(_uncovered, total_required=_total_required)
 
                     # Output the relevant configurations if enabled
                     if get_settings().get('config', {}).get('output_relevant_configurations', False):
@@ -234,7 +235,11 @@ class PRCodeSuggestions:
                             self.vars.get("agents_md_rules") or [],
                             data.get("code_suggestions") or [],
                         )
-                        _inline_details = render_uncovered_details(_inline_uncovered)
+                        _inline_total = len(self.vars.get("agents_md_rules") or [])
+                        # Re-render with total so tone matches the no-suggestions branch
+                        # when the LLM produced no suggestions at all (clean diff case).
+                        if _inline_details and _inline_total and len(_inline_uncovered) == _inline_total and not (data.get("code_suggestions") or []):
+                            _inline_details = render_uncovered_details(_inline_uncovered, total_required=_inline_total)
                         if _inline_details:
                             self.git_provider.publish_comment(_inline_details)
             else:
@@ -308,7 +313,8 @@ class PRCodeSuggestions:
         # Surface AGENTS.md rule coverage gap when /improve came back empty — useful for
         # the "LLM produced no suggestions" branch which has no inline markers to inspect.
         _uncovered = compute_uncovered_rules(self.vars.get("agents_md_rules") or [], [])
-        pr_body += render_uncovered_details(_uncovered)
+        _total_required = len(self.vars.get("agents_md_rules") or [])
+        pr_body += render_uncovered_details(_uncovered, total_required=_total_required)
         if (get_settings().config.publish_output and
                 get_settings().pr_code_suggestions.get('publish_output_no_suggestions', True)):
             get_logger().warning('No code suggestions found for the PR.')
