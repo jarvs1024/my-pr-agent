@@ -29,6 +29,31 @@ secret_provider = get_secret_provider() if get_settings().get("CONFIG.SECRET_PRO
 
 
 
+def _resolve_author(data: dict, fallback_author_id=None) -> str:
+    """Build a display author in the form 'name@username'.
+
+    Falls back gracefully when the webhook payload doesn't carry
+    ``user.username`` or ``user.name``:
+      * both present        -> '贾克江@2268'
+      * only username       -> '2268'
+      * only name           -> '贾克江'
+      * neither (rare)      -> 'user:<id>' (last-resort id form)
+    """
+    user = (data or {}).get('user') or {}
+    name = (user.get('name') or '').strip()
+    username = (user.get('username') or '').strip()
+    if name and username:
+        return f'{name}@{username}'
+    if username:
+        return username
+    if name:
+        return name
+    uid = user.get('id') or fallback_author_id
+    if uid is not None and uid != '':
+        return f'user:{uid}'
+    return ''
+
+
 def _emit_mr_activity(data: dict, state: str = "opened") -> None:
     try:
         object_attributes = data.get("object_attributes", {})
@@ -39,9 +64,7 @@ def _emit_mr_activity(data: dict, state: str = "opened") -> None:
             return
         last_commit = (object_attributes.get("last_commit") or {})
         head_sha = last_commit.get("id")
-        author = ""
-        if isinstance(object_attributes.get("author_id"), int):
-            author = f"user:{object_attributes['author_id']}"
+        author = _resolve_author(data, fallback_author_id=object_attributes.get('author_id'))
         telemetry_events.emit_mr_activity(
             mr_id=int(mr_id),
             project_id=int(project_id),
@@ -71,7 +94,7 @@ def _emit_mr_merged(data: dict) -> None:
             source_branch=object_attributes.get("source_branch", ""),
             target_branch=object_attributes.get("target_branch", ""),
             title=object_attributes.get("title", ""),
-            author=f"user:{object_attributes.get('author_id', '')}",
+            author=_resolve_author(data, fallback_author_id=object_attributes.get('author_id')),
             state="merged",
             url=object_attributes.get("url"),
             head_sha=(object_attributes.get("last_commit") or {}).get("id"),
@@ -324,6 +347,17 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
             elif object_attributes.get('action') == 'merge':
                 url = object_attributes.get('url')
                 _emit_mr_merged(data)
+
+            elif object_attributes.get('action') == 'close':
+                url = object_attributes.get('url')
+                get_logger().info(f"MR closed: {url}")
+                # Reflect the new state in the telemetry store so the
+                # /api/v1/telemetry/mrs endpoint surfaces 'closed' instead
+                # of the stale 'updated' we previously captured.
+                try:
+                    _emit_mr_activity(data, state='closed')
+                except Exception as e:
+                    get_logger().warning(f"close-handler emit failed: {e}")
 
             # for draft to ready triggered merge requests
             elif object_attributes.get('action') == 'update' and is_draft_ready(data):
