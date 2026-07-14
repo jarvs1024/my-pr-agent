@@ -839,6 +839,24 @@ def _fix_key_value(key: str, value: str):
 
 def load_yaml(response_text: str, keys_fix_yaml: List[str] = [], first_key="", last_key="") -> dict:
     response_text_original = copy.deepcopy(response_text)
+    # Strip noise that pollutes the YAML stream:
+    # 1) Qwen/DeepSeek-style `` `` ``` `` `` ``` `` blocks (CoT leakage)
+    # 2) The model often emits multiple ```````yaml`````` fences — the
+    #    *first* one is its scratch work, the *last* one is the final
+    #    answer. The default regex below picks the first, which dies on
+    #    CoT noise. Recover by trying every yaml fence body in order from
+    #    last to first — the first one that parses is the answer.
+    fences = list(re.finditer(r'```(?:yaml|yml)?\s*\n([\s\S]*?)\n```\s*$', response_text_original, re.MULTILINE))
+    for idx, fence in enumerate(reversed(fences)):
+        try:
+            data = yaml.safe_load(fence.group(1))
+            if data:
+                get_logger().info(
+                    f"Successfully parsed AI prediction from yaml fence {len(fences) - idx - 1} of {len(fences)}"
+                )
+                return data
+        except Exception as e:
+            get_logger().debug(f"Failed to parse yaml fence {len(fences) - idx - 1}: {e}")
     response_text = response_text.strip('\n').removeprefix('yaml').removeprefix('```yaml').rstrip().removesuffix('```')
     try:
         data = yaml.safe_load(response_text)
