@@ -357,6 +357,9 @@ class TelemetryStore:
         sug_clause = " WHERE posted_at >= ?" if since else ""
         run_clause = " WHERE started_at >= ?" if since else ""
         params = (since,) if since else ()
+        # sug_params shares the single timestamp placeholder used by the
+        # joined suggestions sub-query (mirrors overview()).
+        sug_params = params
         with self._lock:
             mr_rows = self._db.execute(
                 f"SELECT author, COUNT(*) AS mr_count, "
