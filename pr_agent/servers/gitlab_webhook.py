@@ -120,6 +120,106 @@ def _emit_mr_merged(data: dict) -> None:
         get_logger().warning(f"_emit_mr_merged failed: {e}")
 
 
+import re as _re_apply
+
+_APPLY_COMMIT_RE = _re_apply.compile(r"Apply\s+(\d+)\s+suggestion", _re_apply.IGNORECASE)
+
+
+def _handle_apply_commit(webhook_data: dict) -> None:
+    """Detect GitLab's "Apply N suggestion(s)" commit and mark matching open
+    suggestions as ``state=applied``.
+
+    GitLab emits an ``object_kind=merge_request, action=update, oldrev=None``
+    webhook whenever a user clicks "Apply suggestion" on an MR thread (the
+    push was internal, no ref-oldrev value). The merged commit title carries
+    "Apply N suggestion(s) to N file(s)" — match that, then resolve the
+    touched file(s) and flip the matching ``open`` rows to ``applied``.
+    """
+    try:
+        object_attributes = webhook_data.get("object_attributes", {}) or {}
+        project = webhook_data.get("project", {}) or {}
+        project_id = project.get("id")
+        mr_id = object_attributes.get("iid") or object_attributes.get("id")
+        if not project_id or not mr_id:
+            return
+        last_commit = (object_attributes.get("last_commit") or {}) or {}
+        sha = last_commit.get("id")
+        msg = (last_commit.get("message") or "").strip()
+        if not (sha and _APPLY_COMMIT_RE.search(msg)):
+            return
+        get_logger().info(
+            f"telemetry.on_apply_commit: MR={mr_id} sha={sha[:10]} msg={msg[:60]!r}"
+        )
+        from pr_agent.git_providers.utils import apply_repo_settings
+        from pr_agent.git_providers import get_git_provider_with_context
+
+        pr_url = object_attributes.get("url")
+        if not pr_url:
+            return
+        try:
+            apply_repo_settings(pr_url)
+            provider = get_git_provider_with_context(pr_url)
+        except Exception as e:
+            get_logger().warning(f"telemetry.on_apply_commit provider setup: {e}")
+            return
+        try:
+            commit = provider.mr.commits.get(sha)
+        except Exception as e:
+            get_logger().warning(f"telemetry.on_apply_commit commit lookup: {e}")
+            return
+        files = []
+        try:
+            for stat in (commit.stats or []) or []:
+                attrs = getattr(stat, "attrs", None) or (stat if isinstance(stat, dict) else {})
+                new_path = (
+                    attrs.get("new_path")
+                    or attrs.get("old_path")
+                )
+                if new_path:
+                    files.append(new_path)
+        except Exception as e:
+            get_logger().warning(f"telemetry.on_apply_commit stats parse: {e}")
+        if not files:
+            # Fallback: stats API unavailable or limited. The Apply UI can only
+            # target suggestions we already pushed, so the file MUST match a
+            # still-open suggestion. Pick the most recent one.
+            try:
+                recent = telemetry_events.get_default_store().list_suggestions(
+                    mr_id=int(mr_id), project_id=int(project_id)
+                )
+                seen = set()
+                for s in sorted(recent, key=lambda x: x.get("posted_at") or "", reverse=True):
+                    if s.get("state") != "open":
+                        continue
+                    if s.get("file") in seen:
+                        continue
+                    files.append(s["file"])
+                    seen.add(s["file"])
+                    if len(files) >= 1:
+                        break
+            except Exception as e:
+                get_logger().warning(f"telemetry.on_apply_commit fallback: {e}")
+        actor = (webhook_data.get("user") or {}).get("username", "") or ""
+        for file in files:
+            try:
+                updated = telemetry_events.mark_suggestions_applied(
+                    mr_id=int(mr_id),
+                    project_id=int(project_id),
+                    file=file,
+                    actor=actor,
+                    apply_event_sha=sha,
+                )
+                if updated:
+                    get_logger().info(
+                        f"telemetry.on_apply_commit: marked {len(updated)} suggestion(s) applied on {file}: {updated[:3]}"
+                    )
+            except Exception as e:
+                get_logger().warning(f"telemetry.on_apply_commit per-file: {e}")
+    except Exception as e:
+        get_logger().warning(f"telemetry.on_apply_commit outer: {e}")
+
+
+
 async def handle_request(api_url: str, body: str, log_context: dict, sender_id: str, notify=None):
     log_context["action"] = body
     log_context["event"] = "pull_request" if body == "/review" else "comment"
@@ -338,27 +438,38 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
 
                 await _perform_commands_gitlab("pr_commands", PRAgent(), url, log_context, data)
 
-            # for push event triggered merge requests
-            elif object_attributes.get('action') == 'update' and object_attributes.get('oldrev'):
+            # action=update: covers both real pushes (oldrev is set) and
+            # Apply-suggestion commits (oldrev is None — internal push).
+            elif object_attributes.get('action') == 'update':
                 url = object_attributes.get('url')
-                get_logger().info(f"New merge request: {url}")
                 _emit_mr_activity(data, state='updated')
+                # Apply-suggestion (UI "Apply" button) commit creates a synthetic
+                # push with oldrev=None; flip matching open suggestions to applied
+                # before the early returns below.
+                if not object_attributes.get('oldrev'):
+                    try:
+                        _handle_apply_commit(data)
+                    except Exception as e:
+                        get_logger().warning(f"_handle_apply_commit outer: {e}")
                 if is_draft(data):
                     get_logger().info(f"Skipping draft MR: {url}")
                     return JSONResponse(status_code=status.HTTP_200_OK, content=jsonable_encoder({"message": "success"}))
 
-                # Apply repo settings before checking push commands or handle_push_trigger
-                apply_repo_settings(url)
+                # Real push (oldrev set) — apply repo settings before checking
+                # push commands or handle_push_trigger.
+                if object_attributes.get('oldrev'):
+                    apply_repo_settings(url)
 
-                commands_on_push = get_settings().get(f"gitlab.push_commands", {})
-                handle_push_trigger = get_settings().get(f"gitlab.handle_push_trigger", False)
-                if not commands_on_push or not handle_push_trigger:
-                    get_logger().info("Push event, but no push commands found or push trigger is disabled")
-                    return JSONResponse(status_code=status.HTTP_200_OK,
-                                        content=jsonable_encoder({"message": "success"}))
+                if object_attributes.get('oldrev'):
+                    commands_on_push = get_settings().get(f"gitlab.push_commands", {})
+                    handle_push_trigger = get_settings().get(f"gitlab.handle_push_trigger", False)
+                    if not commands_on_push or not handle_push_trigger:
+                        get_logger().info("Push event, but no push commands found or push trigger is disabled")
+                        return JSONResponse(status_code=status.HTTP_200_OK,
+                                            content=jsonable_encoder({"message": "success"}))
 
-                get_logger().debug(f'A push event has been received: {url}')
-                await _perform_commands_gitlab("push_commands", PRAgent(), url, log_context, data)
+                    get_logger().debug(f'A push event has been received: {url}')
+                    await _perform_commands_gitlab("push_commands", PRAgent(), url, log_context, data)
                 
             elif object_attributes.get('action') == 'merge':
                 url = object_attributes.get('url')

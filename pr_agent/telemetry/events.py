@@ -197,6 +197,38 @@ def emit_action(
         get_logger().warning(f"telemetry.emit_action failed: {e}")
 
 
+def mark_suggestions_applied(mr_id: int, project_id: int, file: str, *,
+                       applied_at: Optional[str] = None,
+                       actor: str = "",
+                       apply_event_sha: Optional[str] = None) -> list[str]:
+    """Mark every open suggestion matching (mr, project, file) as applied.
+
+    Returns the list of suggestion_ids that were flipped, so the caller can
+    also emit `action_events` rows.
+    """
+    store = get_default_store()
+    if applied_at is None:
+        from datetime import datetime, timezone
+        applied_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
+        updated = store.mark_file_applied(mr_id=mr_id, project_id=project_id, file=file, applied_at=applied_at)
+    except Exception as e:
+        get_logger().warning(f"telemetry.mark_suggestions_applied failed: {e}")
+        return []
+    for sid in updated:
+        try:
+            store.record_action(models.ActionEvent(
+                action="applied",
+                suggestion_id=sid,
+                mr_id=mr_id,
+                actor=actor,
+                note=(f"commit {apply_event_sha}" if apply_event_sha else ""),
+            ))
+        except Exception as e:
+            get_logger().warning(f"telemetry.action emit (applied) failed: {e}")
+    return updated
+
+
 def mark_suggestion_applied(suggestion_id: str) -> None:
     try:
         from datetime import datetime, timezone

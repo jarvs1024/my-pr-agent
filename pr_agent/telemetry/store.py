@@ -211,6 +211,33 @@ class TelemetryStore:
         elif self.backend == "jsonl":
             self._write_jsonl("action", d)
 
+    def mark_file_applied(self, mr_id: int, project_id: int, file: str, *, applied_at: str) -> list[str]:
+        """Mark every open suggestion in (mr_id, project_id, file) as applied.
+
+        Returns the suggestion_ids that were updated. Open + already-resolved rows
+        are left alone (a single push only really applies once; the second
+        confirmation is idempotent but does not flip dismissed -> applied).
+        """
+        if self.backend != "sqlite" or self._db is None:
+            return []
+        with self._lock:
+            cur = self._db.execute(
+                "SELECT suggestion_id FROM suggestions "
+                "WHERE project_id=? AND mr_id=? AND file=? AND state='open'",
+                (project_id, mr_id, file),
+            )
+            ids = [row[0] for row in cur.fetchall()]
+            if not ids:
+                return []
+            placeholders = ",".join(["?"] * len(ids))
+            self._db.execute(
+                "UPDATE suggestions SET state='applied', applied_at=? "
+                f"WHERE suggestion_id IN ({placeholders})",
+                (applied_at, *ids),
+            )
+            self._db.commit()
+        return ids
+
     def update_suggestion_state(self, suggestion_id: str, state: str, **fields) -> None:
         if self.backend != "sqlite" or self._db is None:
             return
