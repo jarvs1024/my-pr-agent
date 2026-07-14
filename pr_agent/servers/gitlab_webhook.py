@@ -125,64 +125,168 @@ import re as _re_apply
 _APPLY_COMMIT_RE = _re_apply.compile(r"Apply\s+(\d+)\s+suggestion", _re_apply.IGNORECASE)
 
 
-def _handle_apply_commit(webhook_data: dict) -> None:
-    """Detect GitLab's "Apply N suggestion(s)" commit and mark matching open
-    suggestions as ``state=applied``.
+def _resolve_apply_event(webhook_data: dict):
+    """Normalize an Apply-suggestion webhook into a uniform event payload.
 
-    GitLab emits an ``object_kind=merge_request, action=update, oldrev=None``
-    webhook whenever a user clicks "Apply suggestion" on an MR thread (the
-    push was internal, no ref-oldrev value). The merged commit title carries
-    "Apply N suggestion(s) to N file(s)" — match that, then resolve the
-    touched file(s) and flip the matching ``open`` rows to ``applied``.
+    Returns a dict with sha/msg/project_id/ref/mr_iid/actor/files_hint/pr_url
+    when the webhook is triggered by GitLab's "Apply N suggestion(s) to N
+    file(s)" commit. Returns ``None`` otherwise.
+
+    GitLab sends two webhooks for the same Apply click:
+      * ``object_kind=push`` carrying the new commit in ``commits[]`` (ref +
+        file list available, but no MR iid)
+      * ``object_kind=merge_request`` with ``action=update`` (iid + url
+        available, no file list — fetched from GitLab commit API)
+
+    The discriminator is the commit message itself: ``Apply N suggestion(s)``.
     """
-    try:
+    object_kind = webhook_data.get("object_kind")
+    project = webhook_data.get("project", {}) or {}
+    project_id = project.get("id")
+    actor = (webhook_data.get("user") or {}).get("username", "") or ""
+
+    if object_kind == "push":
+        ref = webhook_data.get("ref") or ""
+        commits = webhook_data.get("commits") or []
+        apply_commit = None
+        for c in reversed(commits):
+            if _APPLY_COMMIT_RE.search((c.get("message") or "")):
+                apply_commit = c
+                break
+        if apply_commit is None:
+            return None
+        files_hint = []
+        for key in ("added", "modified", "removed"):
+            for f in (apply_commit.get(key) or []):
+                if f and f not in files_hint:
+                    files_hint.append(f)
+        return {
+            "sha": apply_commit.get("id"),
+            "msg": (apply_commit.get("message") or "").strip(),
+            "project_id": project_id,
+            "ref": ref,
+            "mr_iid": None,
+            "actor": actor,
+            "files_hint": files_hint,
+            "pr_url": None,
+        }
+
+    if object_kind == "merge_request":
         object_attributes = webhook_data.get("object_attributes", {}) or {}
-        project = webhook_data.get("project", {}) or {}
-        project_id = project.get("id")
-        mr_id = object_attributes.get("iid") or object_attributes.get("id")
-        if not project_id or not mr_id:
-            return
+        if object_attributes.get("action") != "update":
+            return None
         last_commit = (object_attributes.get("last_commit") or {}) or {}
         sha = last_commit.get("id")
         msg = (last_commit.get("message") or "").strip()
         if not (sha and _APPLY_COMMIT_RE.search(msg)):
+            return None
+        return {
+            "sha": sha,
+            "msg": msg,
+            "project_id": project_id or object_attributes.get("target_project_id"),
+            "ref": None,
+            "mr_iid": object_attributes.get("iid") or object_attributes.get("id"),
+            "actor": actor,
+            "files_hint": [],
+            "pr_url": object_attributes.get("url") or object_attributes.get("web_url") or (f"{project.get('web_url','').rstrip('/')}/-/merge_requests/{object_attributes.get('iid')}" if object_attributes.get("iid") else None),
+        }
+
+    return None
+
+
+def _lookup_mr_for_push(project_id, ref):
+    """Resolve the MR iid + web_url for an Apply-commit pushed to ``ref``.
+
+    Uses GitLab REST directly because the push hook doesn't carry an MR id.
+    """
+    try:
+        import requests
+        gl_token = get_settings().get("GITLAB.PERSONAL_ACCESS_TOKEN")
+        base = get_settings().get("GITLAB.URL", "http://127.0.0.1:8929").rstrip("/")
+        branch = ref.split("/")[-1] if ref.startswith("refs/heads/") else ""
+        if not branch:
+            return None, None
+        resp = requests.get(
+            f"{base}/api/v4/projects/{project_id}/merge_requests",
+            params={"state": "opened", "source_branch": branch, "per_page": 5},
+            headers={"PRIVATE-TOKEN": gl_token},
+            timeout=10,
+        )
+        if resp.ok:
+            for mr in resp.json():
+                if mr.get("iid"):
+                    return mr["iid"], mr.get("web_url") or mr.get("url")
+    except Exception as e:
+        get_logger().warning(f"telemetry.on_apply_commit mr lookup: {e}")
+    return None, None
+
+
+def _handle_apply_commit(webhook_data: dict) -> None:
+    """Detect GitLab's "Apply N suggestion(s)" commit and mark matching open
+    suggestions as ``state=applied``.
+
+    GitLab sends either a ``push`` hook or a ``merge_request update`` hook
+    when a user clicks "Apply suggestion" on an MR thread. The commit title
+    carries "Apply N suggestion(s) to N file(s)" — match that, then resolve
+    the touched file(s) and flip the matching ``open`` rows to ``applied``.
+    """
+    try:
+        ev = _resolve_apply_event(webhook_data)
+        if ev is None:
+            return
+        project_id = ev["project_id"]
+        sha = ev["sha"]
+        msg = ev["msg"]
+        mr_id = ev.get("mr_iid")
+        files_hint = ev.get("files_hint") or []
+        pr_url = ev.get("pr_url")
+        if not (project_id and sha):
             return
         get_logger().info(
-            f"telemetry.on_apply_commit: MR={mr_id} sha={sha[:10]} msg={msg[:60]!r}"
+            f"telemetry.on_apply_commit: kind={webhook_data.get('object_kind')} MR={mr_id} sha={sha[:10]} msg={msg[:60]!r}"
         )
-        from pr_agent.git_providers.utils import apply_repo_settings
-        from pr_agent.git_providers import get_git_provider_with_context
-
-        pr_url = object_attributes.get("url")
-        if not pr_url:
+        if not (pr_url and mr_id):
+            mr_id, pr_url = _lookup_mr_for_push(project_id, ev.get("ref") or "")
+        if not (pr_url and mr_id):
+            get_logger().warning(
+                f"telemetry.on_apply_commit: could not resolve MR for kind={webhook_data.get('object_kind')} ref={ev.get('ref')}"
+            )
             return
+        # Build the GitLab provider directly. ``apply_repo_settings`` +
+        # ``get_git_provider_with_context`` would route via ``config.git_provider``
+        # which defaults to ``github`` and crashes for GitLab URLs, so we bypass
+        # the dispatcher and instantiate the right provider class.
         try:
-            apply_repo_settings(pr_url)
-            provider = get_git_provider_with_context(pr_url)
+            from pr_agent.git_providers.gitlab_provider import GitLabProvider
+            provider = GitLabProvider(merge_request_url=pr_url)
         except Exception as e:
             get_logger().warning(f"telemetry.on_apply_commit provider setup: {e}")
             return
-        try:
-            commit = provider.mr.commits.get(sha)
-        except Exception as e:
-            get_logger().warning(f"telemetry.on_apply_commit commit lookup: {e}")
-            return
-        files = []
-        try:
-            for stat in (commit.stats or []) or []:
-                attrs = getattr(stat, "attrs", None) or (stat if isinstance(stat, dict) else {})
-                new_path = (
-                    attrs.get("new_path")
-                    or attrs.get("old_path")
-                )
-                if new_path:
-                    files.append(new_path)
-        except Exception as e:
-            get_logger().warning(f"telemetry.on_apply_commit stats parse: {e}")
+        files = list(files_hint)
         if not files:
-            # Fallback: stats API unavailable or limited. The Apply UI can only
-            # target suggestions we already pushed, so the file MUST match a
-            # still-open suggestion. Pick the most recent one.
+            # merge_request hook has no files_hint. Pull the commit directly via
+            # GitLab REST — python-gitlab's mr.commits.get(sha) returns a
+            # generator method, not a commit object, so we bypass the SDK here.
+            try:
+                import requests
+                gl_token = get_settings().get("GITLAB.PERSONAL_ACCESS_TOKEN")
+                base = get_settings().get("GITLAB.URL", "http://127.0.0.1:8929").rstrip("/")
+                url = f"{base}/api/v4/projects/{project_id}/repository/commits/{sha}/diff"
+                resp = requests.get(
+                    url,
+                    headers={"PRIVATE-TOKEN": gl_token},
+                    params={"per_page": 50},
+                    timeout=10,
+                )
+                if resp.ok:
+                    for d in resp.json():
+                        for key in ("new_path", "old_path"):
+                            f = d.get(key)
+                            if f and f not in files:
+                                files.append(f)
+            except Exception as e:
+                get_logger().warning(f"telemetry.on_apply_commit commit lookup: {e}")
+        if not files:
             try:
                 recent = telemetry_events.get_default_store().list_suggestions(
                     mr_id=int(mr_id), project_id=int(project_id)
@@ -199,7 +303,7 @@ def _handle_apply_commit(webhook_data: dict) -> None:
                         break
             except Exception as e:
                 get_logger().warning(f"telemetry.on_apply_commit fallback: {e}")
-        actor = (webhook_data.get("user") or {}).get("username", "") or ""
+        actor = ev.get("actor") or ""
         for file in files:
             try:
                 updated = telemetry_events.mark_suggestions_applied(
@@ -217,8 +321,6 @@ def _handle_apply_commit(webhook_data: dict) -> None:
                 get_logger().warning(f"telemetry.on_apply_commit per-file: {e}")
     except Exception as e:
         get_logger().warning(f"telemetry.on_apply_commit outer: {e}")
-
-
 
 async def handle_request(api_url: str, body: str, log_context: dict, sender_id: str, notify=None):
     log_context["action"] = body
@@ -423,6 +525,17 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
             return JSONResponse(status_code=status.HTTP_200_OK, content=jsonable_encoder({"message": "success"}))
 
         log_context["sender"] = sender
+        # Detect GitLab "Apply N suggestion(s)" commits from either push or
+        # merge_request-update webhooks. Runs before the main object_kind
+        # dispatcher so it covers push hooks (which have no merge_request
+        # branch in this handler). Returns success on hit to avoid the
+        # dispatcher's normal push/MR handling running again on the same event.
+        try:
+            if _resolve_apply_event(data) is not None:
+                _handle_apply_commit(data)
+                return JSONResponse(status_code=status.HTTP_200_OK, content=jsonable_encoder({"message": "apply-handled"}))
+        except Exception as e:
+            get_logger().warning(f"_handle_apply_commit early-exit outer: {e}")
         if data.get('object_kind') == 'merge_request':
             # ignore MRs based on title, labels, source and target branches
             if not should_process_pr_logic(data):
@@ -438,19 +551,14 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
 
                 await _perform_commands_gitlab("pr_commands", PRAgent(), url, log_context, data)
 
-            # action=update: covers both real pushes (oldrev is set) and
-            # Apply-suggestion commits (oldrev is None — internal push).
+            # action=update: a push happened on the MR source branch. The
+            # Apply-suggestion path is handled by the early-exit hook above
+            # (it matches the commit message regardless of object_kind).
             elif object_attributes.get('action') == 'update':
                 url = object_attributes.get('url')
                 _emit_mr_activity(data, state='updated')
-                # Apply-suggestion (UI "Apply" button) commit creates a synthetic
-                # push with oldrev=None; flip matching open suggestions to applied
-                # before the early returns below.
-                if not object_attributes.get('oldrev'):
-                    try:
-                        _handle_apply_commit(data)
-                    except Exception as e:
-                        get_logger().warning(f"_handle_apply_commit outer: {e}")
+                # Apply-suggestion detection moved to the early-exit hook above
+                # so it also fires for object_kind=push webhooks.
                 if is_draft(data):
                     get_logger().info(f"Skipping draft MR: {url}")
                     return JSONResponse(status_code=status.HTTP_200_OK, content=jsonable_encoder({"message": "success"}))
@@ -459,15 +567,12 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                 # push commands or handle_push_trigger.
                 if object_attributes.get('oldrev'):
                     apply_repo_settings(url)
-
-                if object_attributes.get('oldrev'):
                     commands_on_push = get_settings().get(f"gitlab.push_commands", {})
                     handle_push_trigger = get_settings().get(f"gitlab.handle_push_trigger", False)
                     if not commands_on_push or not handle_push_trigger:
                         get_logger().info("Push event, but no push commands found or push trigger is disabled")
                         return JSONResponse(status_code=status.HTTP_200_OK,
                                             content=jsonable_encoder({"message": "success"}))
-
                     get_logger().debug(f'A push event has been received: {url}')
                     await _perform_commands_gitlab("push_commands", PRAgent(), url, log_context, data)
                 
