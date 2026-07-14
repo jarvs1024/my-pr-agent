@@ -607,6 +607,30 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                 comment_id = obj_attrs.get('id')
                 body = obj_attrs.get('note', '')
                 note_type = obj_attrs.get('type')
+                # Upsert the MR row into telemetry so /api/v1/telemetry/mrs
+                # surfaces comment-triggered runs. _emit_mr_activity reads
+                # `data['object_attributes']['iid']` and `data['project']['id']`,
+                # so we re-shape the comment payload before delegating.
+                try:
+                    mr_id = mr.get('iid') or mr.get('id')
+                    project_id = data.get('project', {}).get('id')
+                    if mr_id and project_id:
+                        _emit_mr_activity({
+                            "object_attributes": {
+                                "iid": mr_id,
+                                "id": mr_id,
+                                "source_branch": mr.get('source_branch', ''),
+                                "target_branch": mr.get('target_branch', ''),
+                                "title": mr.get('title', ''),
+                                "url": url,
+                                "last_commit": mr.get('last_commit') or {},
+                                "author_id": mr.get('author_id'),
+                            },
+                            "project": {"id": project_id},
+                            "user": data.get("user", {}),
+                        }, state=mr.get('state') or 'updated')
+                except Exception as _emit_err:
+                    get_logger().warning(f"comment-path _emit_mr_activity failed: {_emit_err}")
 
                 # /dismiss on a reply to an inline suggestion → resolve that MR discussion.
                 # GitLab marks inline comments as DiffNote whether they start a new thread
