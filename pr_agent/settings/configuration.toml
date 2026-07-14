@@ -4,8 +4,8 @@
 
 [config]
 # models
-model="gpt-5.5-2026-04-23"
-fallback_models=["gpt-5.4-mini"]
+model="openai/glm-5.1"
+fallback_models=["openai/glm-4.5"]
 #model_reasoning="gpt-5.4-mini" # dedicated reasoning model for self-reflection
 #model_weak="gpt-5.4-nano" # optional, a weaker model to use for some easier tasks
 # CLI

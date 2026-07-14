@@ -8,7 +8,8 @@ import openai
 import requests
 from litellm import acompletion
 from tenacity import (retry, retry_if_exception_type,
-                      retry_if_not_exception_type, stop_after_attempt)
+                      retry_if_not_exception_type, stop_after_attempt,
+                      wait_fixed)
 
 from pr_agent.algo import (CLAUDE_EXTENDED_THINKING_MODELS,
                            NO_SUPPORT_TEMPERATURE_MODELS,
@@ -424,6 +425,7 @@ class LiteLLMAIHandler(BaseAiHandler):
     @retry(
         retry=retry_if_exception_type(openai.APIError) & retry_if_not_exception_type(openai.RateLimitError),
         stop=stop_after_attempt(MODEL_RETRIES),
+        wait=wait_fixed(30),  # 30s wait between attempts — matches BigModel 10-30s rate-limit window
     )
     async def chat_completion(self, model: str, system: str, user: str, temperature: float = 0.2, img_path: str = None):
         # Serialize env-var mutation + Bedrock call for IMDS mode to prevent concurrent

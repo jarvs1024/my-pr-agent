@@ -32,26 +32,42 @@ secret_provider = get_secret_provider() if get_settings().get("CONFIG.SECRET_PRO
 def _resolve_author(data: dict, fallback_author_id=None) -> str:
     """Build a display author in the form 'name@username'.
 
-    Falls back gracefully when the webhook payload doesn't carry
-    ``user.username`` or ``user.name``:
-      * both present        -> '贾克江@2268'
-      * only username       -> '2268'
-      * only name           -> '贾克江'
-      * neither (rare)      -> 'user:<id>' (last-resort id form)
+    The MR creator is the right identity for the telemetry store, NOT
+    whoever triggered the most recent webhook. We prefer the nested
+    ``data['object_attributes']['author']`` dict (always populated on
+    MR open/merge/close). The top-level ``data['user']`` is the webhook
+    actor (last pusher, commenter, etc.) and only used as a secondary
+    fallback.
+
+      * both name + username present  -> '贾克江@2268'
+      * only username                 -> '2268'
+      * only name                     -> '贾克江'
+      * neither, only id              -> 'user:<id>'
+      * no useful data                -> ''
     """
-    user = (data or {}).get('user') or {}
-    name = (user.get('name') or '').strip()
-    username = (user.get('username') or '').strip()
+    oa = (data or {}).get('object_attributes') or {}
+    author_obj = oa.get('author') or {}
+    # Primary: nested author dict (the MR's creator).
+    name = (author_obj.get('name') or '').strip()
+    username = (author_obj.get('username') or '').strip()
+    # Fallback: top-level user (webhook trigger actor).
+    if not (name and username):
+        user = (data or {}).get('user') or {}
+        if not name:
+            name = (user.get('name') or '').strip()
+        if not username:
+            username = (user.get('username') or '').strip()
     if name and username:
-        return f'{name}@{username}'
+        return f"{name}@{username}"
     if username:
         return username
     if name:
         return name
-    uid = user.get('id') or fallback_author_id
+    uid = author_obj.get('id') or fallback_author_id
     if uid is not None and uid != '':
-        return f'user:{uid}'
+        return f"user:{uid}"
     return ''
+
 
 
 def _emit_mr_activity(data: dict, state: str = "opened") -> None:
