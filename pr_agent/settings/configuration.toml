@@ -520,3 +520,33 @@ jsonl_path = "/tmp/pr-agent-telemetry.jsonl"
 # Empty/unset means open access (intended for local dev only). Set via
 # REVIEW_TELEMETRY_HTTP_TOKEN env var on the pr-agent container.
 http_token = ""
+
+# ----------------------------------------------------------------------
+# Severity bucketing for /api/v1/telemetry/metrics/severity
+# ----------------------------------------------------------------------
+[telemetry.severity]
+# LLM importance numeric thresholds (used when no rule-key match is found).
+# importance >= critical_min -> critical
+# importance >= high_min     -> high
+# importance >= medium_min   -> medium
+# else                       -> low
+critical_min = 8
+high_min = 6
+medium_min = 4
+
+# Rule-key pattern fallback (substring match, case-sensitive).
+# Used when a rule_key is not explicitly listed in any project rule file
+# (e.g. .agents/rules/*.md) and we still need to assign a severity.
+# Patterns are checked in order; first hit wins.
+critical_rule_patterns = [
+    "NO-LOG-EXC",      # silent-except / log-and-swallow
+    "FORBIDDEN",       # forbidden-comment / forbidden-marker
+    "SECURITY",        # security concerns
+    "INJECTION",       # injection (SQL / command / etc.)
+    "AUTH",            # authentication / authorisation
+]
+high_rule_patterns = [
+    "DOCSTRING",       # missing docstring
+    "TYPEHINT",        # missing type hints
+    "BARE-PRINT",      # print() in production path
+]

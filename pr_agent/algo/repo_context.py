@@ -302,3 +302,100 @@ def extract_rule_keys(repo_context_text: str) -> list[str]:
             seen.append(key)
     return seen
 
+# Severity labels accepted in rule files / config / API responses.
+SEVERITY_LEVELS = ("critical", "high", "medium", "low", "unknown")
+
+# Regex for ``RULE_KEY: severity`` lines in rule files. The key allows
+# alphanumerics, ``_``, ``-`` and ``.`` and may contain ``:`` (e.g.
+# ``ZLG-RULE-NO-LOG-EXC``). Optional markdown list markers are accepted.
+# Group 1 captures the rule key, group 2 the severity.
+_SEVERITY_LINE_RE = re.compile(
+    r"^[\s>*\-]*([A-Za-z0-9_.:-]+)\s*[:=]\s*(critical|high|medium|low)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Regex for severity-first bullets: ``- [critical] ZLG-RULE-...``
+_SEVERITY_BULLET_RE = re.compile(
+    r"^[\s>*\-]*\[(critical|high|medium|low)\]\s*([A-Za-z0-9_.:-]+)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def parse_rule_files(contents: list[str]) -> dict[str, str]:
+    """Parse a list of rule-file contents into a ``{rule_key: severity}`` map.
+
+    Two line styles are accepted:
+      * ``ZLG-RULE-NO-LOG-EXC: critical``  (key first, severity after colon)
+      * ``- [critical] ZLG-RULE-NO-LOG-EXC``  (markdown bullet, severity first)
+
+    Later entries override earlier ones so projects can layer a base rules
+    file and a project-specific override. Unknown severities are ignored.
+    Empty / non-string inputs are skipped without raising.
+    """
+    out: dict[str, str] = {}
+    for body in contents:
+        if not body or not isinstance(body, str):
+            continue
+        for m in _SEVERITY_LINE_RE.finditer(body):
+            key = m.group(1).strip()
+            sev = m.group(2).lower()
+            out[key] = sev
+        for m in _SEVERITY_BULLET_RE.finditer(body):
+            sev = m.group(1).lower()
+            key = m.group(2).strip()
+            out[key] = sev
+    return out
+
+
+def resolve_severity(
+    rule_keys: list[str] | None,
+    importance: int | None,
+    *,
+    rule_severity_map: dict[str, str] | None = None,
+    critical_patterns: list[str] | None = None,
+    high_patterns: list[str] | None = None,
+    critical_min: int = 8,
+    high_min: int = 6,
+    medium_min: int = 4,
+) -> tuple[str, str]:
+    """Resolve a single suggestion's severity using the three-layer fallback.
+
+    Returns ``(severity, source)``:
+      * severity: one of ``critical / high / medium / low / unknown``
+      * source: short tag identifying which layer decided
+        (``rule:ZLG-RULE-NO-LOG-EXC`` / ``pattern:NO-LOG-EXC`` / ``llm:7`` /
+        ``unknown``).
+
+    Layers are tried in order:
+      1. ``rule_severity_map`` (project's rule file / AGENTS.md severity block)
+      2. config-level pattern lists (``critical_patterns`` / ``high_patterns``)
+      3. LLM ``importance`` numeric thresholds
+    """
+    keys = [k for k in (rule_keys or []) if k]
+    # Layer 1: explicit rule severity map
+    if rule_severity_map and keys:
+        for k in keys:
+            if k in rule_severity_map:
+                sev = rule_severity_map[k].lower()
+                if sev in SEVERITY_LEVELS:
+                    return sev, f"rule:{k}"
+    # Layer 2: config-level rule-key pattern matching
+    if keys:
+        for k in keys:
+            for pat in (critical_patterns or []):
+                if pat and pat in k:
+                    return "critical", f"pattern:{pat}"
+        for k in keys:
+            for pat in (high_patterns or []):
+                if pat and pat in k:
+                    return "high", f"pattern:{pat}"
+    # Layer 3: LLM importance numeric fallback
+    if importance is None:
+        return "unknown", "unknown"
+    if importance >= critical_min:
+        return "critical", f"llm:{importance}"
+    if importance >= high_min:
+        return "high", f"llm:{importance}"
+    if importance >= medium_min:
+        return "medium", f"llm:{importance}"
+    return "low", f"llm:{importance}"

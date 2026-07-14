@@ -58,6 +58,18 @@ def metrics_authors(since: Optional[str] = None) -> list[dict]:
     return get_default_store().per_author_stats(since=since)
 
 
+@router.get("/metrics/severity")
+def metrics_severity(since: Optional[str] = None, pr_url: Optional[str] = None) -> list[dict]:
+    """Suggestion counts grouped by derived severity (critical/high/medium/low/unknown).
+
+    The ``pr_url`` parameter lets the resolver pull per-project rule files
+    (e.g. ``.agents/rules/*.md``) for the matching MR. When omitted, only
+    the config-level pattern fallback and LLM importance numeric thresholds
+    are used.
+    """
+    return get_default_store().severity_breakdown(since=since, pr_url=pr_url)
+
+
 @router.get("/mrs")
 def list_mrs(limit: int = 50, project_id: Optional[int] = None, state: Optional[str] = None, since: Optional[str] = None) -> list[dict]:
     return get_default_store().list_mrs(limit=limit, project_id=project_id, state=state, since=since)
@@ -72,8 +84,9 @@ def get_mr(project_id: int, mr_id: int) -> dict:
 
 
 @router.get("/mrs/{project_id}/{mr_id}/suggestions")
-def list_suggestions(project_id: int, mr_id: int) -> list[dict]:
-    return get_default_store().list_suggestions(mr_id=mr_id, project_id=project_id)
+def list_suggestions(project_id: int, mr_id: int, pr_url: Optional[str] = None) -> list[dict]:
+    pr = pr_url or f"http://placeholder.local/-/merge_requests/{mr_id}"
+    return get_default_store().list_suggestions(mr_id=mr_id, project_id=project_id, pr_url=pr)
 
 
 @router.get("/mrs/{project_id}/{mr_id}/runs")
@@ -101,12 +114,17 @@ def mr_stats(project_id: int, mr_id: int) -> dict:
     for s in suggestions:
         counts[s.get("state", "open")] = counts.get(s.get("state", "open"), 0) + 1
     rule_keys = sorted({k for s in suggestions for k in s.get("rule_keys", [])})
+    severity_counts: dict[str, int] = {}
+    for s in suggestions:
+        sev = s.get("severity", "unknown")
+        severity_counts[sev] = severity_counts.get(sev, 0) + 1
     return {
         "mr_id": mr_id,
         "project_id": project_id,
         "suggestion_counts": counts,
         "adoption_rate": (counts["applied"] / counts["total"]) if counts["total"] else 0.0,
         "distinct_rules": rule_keys,
+        "severity_counts": severity_counts,
         "runs": runs,
     }
 

@@ -18,6 +18,81 @@ from typing import Any, Optional
 
 from pr_agent.log import get_logger
 from pr_agent.telemetry import models
+from pr_agent.algo.repo_context import resolve_severity, SEVERITY_LEVELS
+
+
+def _severity_config() -> dict:
+    """Read the [telemetry.severity] config block, with sane defaults."""
+    from pr_agent.config_loader import get_settings
+    cfg = get_settings().get("telemetry.severity", {}) or {}
+    patterns = cfg.get("critical_rule_patterns", []) or []
+    high_pats = cfg.get("high_rule_patterns", []) or []
+    return {
+        "critical_min": int(cfg.get("critical_min", 8)),
+        "high_min": int(cfg.get("high_min", 6)),
+        "medium_min": int(cfg.get("medium_min", 4)),
+        "critical_rule_patterns": list(patterns),
+        "high_rule_patterns": list(high_pats),
+        "rule_files": list(cfg.get("rule_files", []) or []),
+    }
+
+
+def _rule_severity_map_for_pr(pr_url: Optional[str] = None) -> dict[str, str]:
+    """Load the project's rule-severity map from .agents/rules/*.md files.
+
+    The PR's git provider is resolved from ``pr_url`` (or the most recent MR
+    if omitted) and the configured rule files are read via its ``get_pr_file_content``
+    helper. Missing / unreadable files are silently skipped — severity
+    resolution is a soft signal and must never break the API.
+    """
+    cfg = _severity_config()
+    paths = cfg.get("rule_files") or []
+    if not paths:
+        return {}
+    try:
+        from pr_agent.git_providers import get_git_provider_with_context
+        if pr_url:
+            provider = get_git_provider_with_context(pr_url)
+        else:
+            return {}
+    except Exception:
+        return {}
+    contents = []
+    for p in paths:
+        try:
+            # Honour branch from the PR if available
+            branch = None
+            try:
+                branch = provider.get_pr_branch()
+            except Exception:
+                branch = None
+            if branch:
+                c = provider.get_pr_file_content(p, branch)
+            else:
+                c = provider.get_pr_file_content(p, provider.get_pr_branch() or "main")
+            if c:
+                contents.append(c)
+        except Exception:
+            continue
+    if not contents:
+        return {}
+    from pr_agent.algo.repo_context import parse_rule_files
+    return parse_rule_files(contents)
+
+
+def _resolve_severity_for_suggestion(rule_keys, importance, *, rule_severity_map=None):
+    cfg = _severity_config()
+    sev, src = resolve_severity(
+        rule_keys or [],
+        importance,
+        rule_severity_map=rule_severity_map or {},
+        critical_patterns=cfg["critical_rule_patterns"],
+        high_patterns=cfg["high_rule_patterns"],
+        critical_min=cfg["critical_min"],
+        high_min=cfg["high_min"],
+        medium_min=cfg["medium_min"],
+    )
+    return sev, src
 
 
 _SQLITE_SCHEMA = """
@@ -289,7 +364,7 @@ class TelemetryStore:
             row = cur.fetchone()
         return _row_to_mr(row) if row else None
 
-    def list_suggestions(self, mr_id: int, project_id: Optional[int] = None):
+    def list_suggestions(self, mr_id: int, project_id: Optional[int] = None, *, attach_severity: bool = True, pr_url: Optional[str] = None):
         if self.backend != "sqlite" or self._db is None:
             return []
         with self._lock:
@@ -298,7 +373,16 @@ class TelemetryStore:
             else:
                 cur = self._db.execute("SELECT * FROM suggestions WHERE mr_id=? ORDER BY posted_at", (mr_id,))
             rows = cur.fetchall()
-        return [_row_to_suggestion(r) for r in rows]
+        out = [_row_to_suggestion(r) for r in rows]
+        if attach_severity:
+            rule_map = _rule_severity_map_for_pr(pr_url) if pr_url else {}
+            for s in out:
+                sev, src = _resolve_severity_for_suggestion(
+                    s.get("rule_keys") or [], s.get("importance"), rule_severity_map=rule_map
+                )
+                s["severity"] = sev
+                s["severity_source"] = src
+        return out
 
     def list_runs(self, mr_id: int, limit: int = 20):
         if self.backend != "sqlite" or self._db is None:
@@ -347,6 +431,7 @@ class TelemetryStore:
                 "dismissal_rate": (sug_dismissed / sug_total) if sug_total else 0.0,
             },
             "runs": {"total": run_total, "failed": run_failed, "success_rate": ((run_total - run_failed) / run_total) if run_total else 0.0},
+            "severity_breakdown": self.severity_breakdown(since=since),
         }
 
     def per_author_stats(self, since: Optional[str] = None):
@@ -453,6 +538,60 @@ class TelemetryStore:
                 "open": stats.get("open", 0),
                 "superseded": stats.get("superseded", 0),
                 "adoption_rate": (applied / total) if total else 0.0,
+            })
+        return out
+
+    def severity_breakdown(self, since: Optional[str] = None, *, pr_url: Optional[str] = None) -> list[dict]:
+        """Group suggestions by derived severity bucket.
+
+        Severity is computed per-suggestion via ``resolve_severity`` using the
+        three-layer fallback:
+          1. project rule file (e.g. ``.agents/rules/*.md``) explicit map
+          2. config-level pattern fallback
+          3. LLM importance numeric thresholds
+        The result is one row per severity bucket with the usual applied /
+        dismissed / open / superseded / total / adoption_rate fields.
+        """
+        if self.backend != "sqlite" or self._db is None:
+            return []
+        clause = " WHERE posted_at >= ?" if since else ""
+        params = (since,) if since else ()
+        with self._lock:
+            cur = self._db.execute(
+                f"SELECT rule_keys, importance, state FROM suggestions{clause}",
+                params,
+            )
+            rows = cur.fetchall()
+        rule_map = _rule_severity_map_for_pr(pr_url)
+        from collections import defaultdict
+        agg: dict[str, dict[str, int]] = defaultdict(
+            lambda: {"applied": 0, "dismissed": 0, "open": 0, "superseded": 0, "total": 0}
+        )
+        for rule_keys_json, importance, state in rows:
+            try:
+                keys = json.loads(rule_keys_json or "[]")
+            except Exception:
+                keys = []
+            sev, _src = _resolve_severity_for_suggestion(keys, importance, rule_severity_map=rule_map)
+            agg[sev][state] = agg[sev].get(state, 0) + 1
+            agg[sev]["total"] += 1
+        out = []
+        for sev in ("critical", "high", "medium", "low", "unknown"):
+            stats = agg.get(sev)
+            if not stats or stats.get("total", 0) == 0:
+                continue
+            total = stats["total"]
+            applied = stats.get("applied", 0)
+            dismissed = stats.get("dismissed", 0)
+            out.append({
+                "severity": sev,
+                "total": total,
+                "applied": applied,
+                "dismissed": dismissed,
+                "open": stats.get("open", 0),
+                "superseded": stats.get("superseded", 0),
+                "adoption_rate": (applied / total) if total else 0.0,
+                "dismissal_rate": (dismissed / total) if total else 0.0,
             })
         return out
 
