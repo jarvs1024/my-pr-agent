@@ -35,14 +35,17 @@ def _resolve_author(data: dict, fallback_author_id=None) -> str:
     The MR creator is the right identity for the telemetry store, NOT
     whoever triggered the most recent webhook. We prefer the nested
     ``data['object_attributes']['author']`` dict (always populated on
-    MR open/merge/close). The top-level ``data['user']`` is the webhook
-    actor (last pusher, commenter, etc.) and only used as a secondary
-    fallback.
+    MR open/merge/close). When that's missing (note events where
+    ``object_attributes`` only has ``author_id`` pointing at the note
+    author, not the MR creator), we fall back to that ``author_id``
+    (or the caller-supplied ``fallback_author_id``) FIRST, and only
+    then to the top-level ``data['user']`` (the webhook trigger actor,
+    often a bot such as ``codebot``).
 
       * both name + username present  -> '贾克江@2268'
       * only username                 -> '2268'
       * only name                     -> '贾克江'
-      * neither, only id              -> 'user:<id>'
+      * neither, only id              -> 'user:<id>'  (prefer MR-creator id)
       * no useful data                -> ''
     """
     oa = (data or {}).get('object_attributes') or {}
@@ -50,20 +53,26 @@ def _resolve_author(data: dict, fallback_author_id=None) -> str:
     # Primary: nested author dict (the MR's creator).
     name = (author_obj.get('name') or '').strip()
     username = (author_obj.get('username') or '').strip()
-    # Fallback: top-level user (webhook trigger actor).
-    if not (name and username):
-        user = (data or {}).get('user') or {}
-        if not name:
-            name = (user.get('name') or '').strip()
-        if not username:
-            username = (user.get('username') or '').strip()
+    # Secondary: object_attributes.author_id or fallback_author_id
+    # (the MR creator's id, used when author dict is absent).
+    primary_uid = author_obj.get('id') or fallback_author_id
+    # Tertiary: top-level user (the webhook trigger actor).
+    user = (data or {}).get('user') or {}
+    user_uid = user.get('id')
+    if not name:
+        name = (user.get('name') or '').strip()
+    if not username:
+        username = (user.get('username') or '').strip()
     if name and username:
         return f"{name}@{username}"
     if username:
         return username
     if name:
         return name
-    uid = author_obj.get('id') or fallback_author_id
+    # Last resort: prefer the MR-creator id (primary_uid) over the
+    # webhook-actor id (user_uid). The actor is often a bot and not
+    # the right identity for telemetry.
+    uid = primary_uid if (primary_uid is not None and primary_uid != '') else user_uid
     if uid is not None and uid != '':
         return f"user:{uid}"
     return ''
@@ -627,7 +636,11 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                                 "author_id": mr.get('author_id'),
                             },
                             "project": {"id": project_id},
-                            "user": data.get("user", {}),
+                            # NOTE: deliberately NOT forwarding data["user"] here.
+                            # The webhook actor (data["user"]) is usually the note
+                            # commenter (often a bot like "codebot"), NOT the MR
+                            # creator. We want the MR creator, so _resolve_author
+                            # will fall back to object_attributes.author_id above.
                         }, state=mr.get('state') or 'updated')
                 except Exception as _emit_err:
                     get_logger().warning(f"comment-path _emit_mr_activity failed: {_emit_err}")
