@@ -92,8 +92,9 @@ Webhook 处理 MR 事件时 upsert (以 `project_id + mr_id` 为 PK):
 | `posted_at`          | text   | ISO 8601                                        |
 | `state`              | text   | `open` / `applied` / `dismissed` / `superseded` |
 | `applied_at`         | text?  | (reserved, 见 "已知缺口")                       |
-| `dismissed_at`       | text?  | (reserved)                                      |
-| `dismissed_by`       | text?  | (reserved)                                      |
+| `dismissed_at`       | text?  | ISO 8601, /dismiss 命中时写入                  |
+| `dismissed_by`       | text?  | dismiss 操作者的 username / user id            |
+| `dismissed_reason`   | text?  | 用户提供的忽略原因 (见 "Dismiss reason 捕获")    |
 | `note_id`            | text?  | GitLab discussion id (40-char SHA1 哈希, publish 时捕获, /dismiss 反查) |
 
 ### `action_events` — 用户对建议的操作
@@ -224,6 +225,8 @@ Base path: `/api/v1/telemetry`. 所有 endpoint 返回 JSON. 默认端口是 pr-
 | GET    | `/mrs/{project_id}/{mr_id}/runs`                    | 该 MR 的所有 runs (limit 默认 20)                              |
 | GET    | `/mrs/{project_id}/{mr_id}/timeline`                | MR + suggestions + runs + actions 一次性返回                  |
 | GET    | `/mrs/{project_id}/{mr_id}/stats`                   | suggestion_counts (各状态数) + adoption_rate + distinct_rules  |
+| GET    | `/dismissals?since=...&project_id=...&rule_key=...&mr_id=...&limit=50` | 被 dismiss 的建议列表 (含 `dismissed_reason`), 用于规则改进分析 |
+| GET    | `/dismissals/by-rule?since=...&project_id=...`       | 按 `rule_keys` 聚合 dismiss 计数 + reason 分布 (定位反复被误报的规则) |
 
 ### 鉴权
 
@@ -299,6 +302,98 @@ Base path: `/api/v1/telemetry`. 所有 endpoint 返回 JSON. 默认端口是 pr-
 - `severity_source` (哪一层给的等级, 例 `rule:ZLG-RULE-NO-LOG-EXC` / `pattern:NO-LOG-EXC` / `llm:7` / `unknown`)
 
 `GET /api/v1/telemetry/mrs/{p}/{m}/stats` 多一个 `severity_counts` 字段 (各等级 suggestion 数).
+
+## Dismiss reason 捕获
+
+用户在代码建议 thread 里回复 `/dismiss` 时可以附上忽略原因. pr-agent 把原因存到 `suggestions.dismissed_reason`, 暴露给前端用于规则改进反馈.
+
+### 触发方式
+
+代码建议的尾部提示 (见 `pr_agent/tools/pr_code_suggestions.py`) 会引导用户:
+
+```
+👎 不采纳？在下方回复 `/dismiss 忽略原因` 让 pr-agent 关闭本条建议
+示例：`/dismiss 误报：测试代码`
+```
+
+支持三种写法, 都有效:
+
+| 输入 | reason 字段 |
+|------|-------------|
+| `/dismiss` | `NULL` (老用法, 仅关闭) |
+| `/dismiss 误报：测试代码` | `误报：测试代码` (首行 inline) |
+| `/dismiss\n第一行说明\n第二行说明` | `第一行说明\n第二行说明` (下行 multi-line) |
+
+解析逻辑在 `pr_agent/servers/gitlab_webhook.py`, 取首行匹配 `/dismiss` 或 `/dismiss ` 前缀:
+
+- 匹配 `/dismiss` + 至少一个空格 → 空格后到行尾作为 inline reason
+- 匹配纯 `/dismiss` → 用首行之后所有内容 (strip) 作为 reason
+- reason 为空字符串 → 写 `NULL`, 与老行为一致
+
+### 存储
+
+`suggestions` 表新增 `dismissed_reason TEXT` 列 (idempotent migration, 旧库自动 `ALTER TABLE` 加上).
+`Suggestion` dataclass (`pr_agent/telemetry/models.py`) 同步加字段. `mark_suggestion_dismissed(suggestion_id, actor, reason)` 接受 `reason` 参数.
+
+### API
+
+`GET /api/v1/telemetry/dismissals` — 被 dismiss 的建议明细 (含 `dismissed_reason`):
+
+```json
+[
+  {
+    "suggestion_id": "sug-...",
+    "mr_id": 977, "project_id": 7,
+    "file": "...", "line": 45, "label": "general",
+    "importance": 3, "score": 3,
+    "rule_keys": ["ZLG-RULE-NO-LOG-EXC"],
+    "state": "dismissed",
+    "posted_at": "2026-07-14T11:39:33+00:00",
+    "dismissed_at": "2026-07-14T12:14:19+00:00",
+    "dismissed_by": "2202",
+    "dismissed_reason": "误报: 测试代码",
+    "note_id": "b335f6b3812af680c80a118c2892beeb0ef58bf0"
+  }
+]
+```
+
+Query 参数:
+
+- `since` (可选): 只返回 `dismissed_at >= since` 的记录 (ISO 8601)
+- `project_id` (可选): 限定项目
+- `mr_id` (可选): 限定 MR
+- `rule_key` (可选): 在 `rule_keys` JSON 数组里命中任一元素
+- `limit` (默认 50): 返回条数
+
+`GET /api/v1/telemetry/dismissals/by-rule` — 按 `rule_keys` 聚合 + reason 分布, 用于"哪些规则被反复误报"分析:
+
+```json
+[
+  {
+    "rule_key": "ZLG-RULE-NO-LOG-EXC",
+    "dismissal_count": 3,
+    "reasons": [
+      {"reason": "误报: 测试代码", "count": 2},
+      {"reason": "项目不要求",     "count": 1}
+    ]
+  },
+  {
+    "rule_key": "ZLG-RULE-FORBIDDEN-COMMENT",
+    "dismissal_count": 1,
+    "reasons": [
+      {"reason": "(no reason given)", "count": 1}
+    ]
+  }
+]
+```
+
+按 `dismissal_count` 倒序; 空 reason 统一归到 `"(no reason given)"`. Reason 取 `strip()` 后的精确字符串, 用于统计 raw 文本分布 (不归一化, 让 reviewer 直接看到用户原话).
+
+### 用途
+
+- **规则作者**: 看到某条规则 dismiss 计数高 + reason 集中在 "误报", 说明规则描述或示例不准, 可调整 AGENTS.md
+- **评审 owner**: 看到 "项目不要求" / "脚本工具" 这类 reason, 决定是否把规则从 critical 降级
+- **dashboard**: 顶部加一张 "近期 dismiss Top-N" 卡片, 点进去下钻到 reasons 列表
 
 ## 配置
 
@@ -462,7 +557,7 @@ async function getOverview() {
 
 - `note_id`: `GitLabProvider.send_inline_comment` 在 publish 路径返回 GitLab discussion id, primary / fallback 两条路都回填 (`pr_agent/git_providers/gitlab_provider.py`). 写入 `suggestions.note_id`.
 - `/review`: `PRReviewer.run` 围着 `_run_id = emit_run_started()` 加了同样的 finally / 错误处理 (`pr_agent/tools/pr_reviewer.py`). `/describe` 复用同一条管道, command 字段区分.
-- `/dismiss` (inline 建议的 thread reply): webhook 调 `resolve_discussion` 成功后, 反查 `note_id` 关联的 suggestion, 写 `action_events` 一行 (`action=dismissed`), 同步 `mark_suggestion_dismissed` 更新 `state=dismissed` / `dismissed_at` / `dismissed_by` (`pr_agent/servers/gitlab_webhook.py`).
+- `/dismiss` (inline 建议的 thread reply): webhook 调 `resolve_discussion` 成功后, 反查 `note_id` 关联的 suggestion, 写 `action_events` 一行 (`action=dismissed`), 同步 `mark_suggestion_dismissed` 更新 `state=dismissed` / `dismissed_at` / `dismissed_by` / `dismissed_reason` (`pr_agent/servers/gitlab_webhook.py`). 支持 inline reason (`/dismiss 误报: ...`) 和下行 multi-line reason (`/dismiss\n说明`); 解析后存到 `suggestions.dismissed_reason`. 见 [Dismiss reason 捕获](#dismiss-reason-捕获).
 - **Severity 分级**: 每条 suggestion 写入时通过 `pr_agent.algo.repo_context.resolve_severity` 计算 severity (三层 fallback: 规则文件 → config pattern → LLM importance). API 返回时附在 `severity` + `severity_source` 字段. 详见 [Severity 分级](#severity-分级).
 
 ## 已知缺口 / 后续可补的钩子
@@ -471,7 +566,7 @@ async function getOverview() {
 |------|------|------|
 | `applied_at` / `state=applied` | 字段已建, 仅在 GitLab 端点 `Apply suggestion` 后由 GitLab 推 `discussion.unresolve` 时才会回写 (目前只接 resolve → dismissed) | 接 GitLab `merge_request_event` 推送, 在 webhook 拦 `applied` 事件 |
 | 与 GitLab Apply 同源的 event 也填 action_events | `action=applied` 没接 | 同上 |
-(已完成: 时间窗过滤, 按作者聚合, note_id, /review telemetry, /dismiss telemetry, **severity 三层 fallback + /metrics/severity 端点**)
+(已完成: 时间窗过滤, 按作者聚合, note_id, /review telemetry, /dismiss telemetry, **/dismiss reason 捕获 + /dismissals + /dismissals/by-rule 端点**, **severity 三层 fallback + /metrics/severity 端点**)
 
 数据模型已经预留了这些字段的列, schema 不会变, 后续只是补 hook / endpoint, 不破坏现有数据.
 
