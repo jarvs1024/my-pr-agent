@@ -129,6 +129,50 @@ def mr_stats(project_id: int, mr_id: int) -> dict:
     }
 
 
+@router.get("/dismissals")
+def list_dismissals(
+    since: Optional[str] = None,
+    project_id: Optional[int] = None,
+    rule_key: Optional[str] = None,
+    mr_id: Optional[int] = None,
+    limit: int = 200,
+) -> list[dict]:
+    """Dismissed suggestions, optionally filtered by project / rule_key / mr_id / time.
+
+    Each row includes the user-supplied reason text in ``dismissed_reason``.
+    Intended to feed the frontend "why are suggestions being dismissed?" view
+    and to surface signals for tuning AGENTS.md rule keys.
+    """
+    return get_default_store().list_dismissals(
+        since=since,
+        project_id=project_id,
+        rule_key=rule_key,
+        mr_id=mr_id,
+        limit=limit,
+    )
+
+
+@router.get("/dismissals/by-rule")
+def dismissals_by_rule(
+    since: Optional[str] = None,
+    project_id: Optional[int] = None,
+) -> list[dict]:
+    """Dismissal counts grouped by rule_key with reason text distribution.
+
+    Output rows: ``[{rule_key, dismissal_count, reasons: [{reason, count}]}]``,
+    ordered by ``dismissal_count`` desc. ``(no reason given)`` buckets rows
+    where the user dismissed without supplying a reason.
+
+    This is the primary signal the frontend uses to suggest AGENTS.md rule
+    refinements: rules with high dismissal counts and concentrated reasons
+    ("误报", "重复", "项目不需要") are candidates for adjustment.
+    """
+    return get_default_store().list_dismissals_by_rule(
+        since=since,
+        project_id=project_id,
+    )
+
+
 def install_routes(app) -> None:
     """Mount telemetry routes on a FastAPI app (idempotent)."""
     if any(getattr(r, "path", "").startswith("/api/v1/telemetry") for r in app.router.routes):

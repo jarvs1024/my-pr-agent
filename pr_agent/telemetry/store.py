@@ -145,6 +145,7 @@ CREATE TABLE IF NOT EXISTS suggestions (
     applied_at TEXT,
     dismissed_at TEXT,
     dismissed_by TEXT,
+    dismissed_reason TEXT,
     note_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sug_mr ON suggestions(mr_id);
@@ -199,6 +200,17 @@ class TelemetryStore:
                             "telemetry: migrated suggestions.note_id -> TEXT")
             except Exception as e:
                 get_logger().warning(f"telemetry note_id migration skipped: {e}")
+            try:
+                cur_cols = [r[1] for r in self._db.execute(
+                    "PRAGMA table_info(suggestions)").fetchall()]
+                if "dismissed_reason" not in cur_cols:
+                    self._db.execute(
+                        "ALTER TABLE suggestions ADD COLUMN dismissed_reason TEXT")
+                    self._db.commit()
+                    get_logger().info(
+                        "telemetry: added suggestions.dismissed_reason")
+            except Exception as e:
+                get_logger().warning(f"telemetry dismissed_reason migration skipped: {e}")
             self._db.commit()
         elif backend == "jsonl":
             _jsonl_env = os.environ.get("REVIEW_TELEMETRY_JSONL_PATH")
@@ -222,6 +234,25 @@ class TelemetryStore:
         d = mr.to_dict()
         if self.backend == "sqlite":
             with self._lock:
+                # Sticky first-seen author.
+                #
+                # GitLab merge / close events drop the
+                # `object_attributes.author` dict and keep only `author_id`,
+                # so `_resolve_author` falls back to `data["user"]` (the
+                # actor who clicked merge / close). Without this guard, the
+                # merger / closer would silently overwrite the MR creator.
+                # We preserve the first non-empty author we ever saw.
+                cur = self._db.execute(
+                    "SELECT author FROM mr_activity WHERE project_id=? AND mr_id=?",
+                    (d["project_id"], d["mr_id"]),
+                )
+                existing = cur.fetchone()
+                if existing and existing[0] and not d.get("author"):
+                    d["author"] = existing[0]
+                elif existing and existing[0]:
+                    # Existing non-empty author always wins over a new value
+                    # (which may be the merge-actor due to GitLab payload quirks).
+                    d["author"] = existing[0]
                 self._db.execute(
                     "INSERT OR REPLACE INTO mr_activity (mr_id, project_id, source_branch, target_branch, title, author, state, opened_at, last_seen_at, merged_at, url, head_sha) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                     (d["mr_id"], d["project_id"], d["source_branch"], d["target_branch"], d["title"], d["author"], d["state"], d["opened_at"], d["last_seen_at"], d["merged_at"], d["url"], d["head_sha"]),
@@ -267,8 +298,8 @@ class TelemetryStore:
         if self.backend == "sqlite":
             with self._lock:
                 self._db.execute(
-                    "INSERT OR REPLACE INTO suggestions (suggestion_id, mr_id, project_id, file, line, label, importance, one_sentence_summary, rule_keys, score, posted_at, state, applied_at, dismissed_at, dismissed_by, note_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (d["suggestion_id"], d["mr_id"], d["project_id"], d["file"], d["line"], d["label"], d["importance"], d["one_sentence_summary"], json.dumps(d["rule_keys"], ensure_ascii=False), d["score"], d["posted_at"], d["state"], d["applied_at"], d["dismissed_at"], d["dismissed_by"], d["note_id"]),
+                    "INSERT OR REPLACE INTO suggestions (suggestion_id, mr_id, project_id, file, line, label, importance, one_sentence_summary, rule_keys, score, posted_at, state, applied_at, dismissed_at, dismissed_by, dismissed_reason, note_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (d["suggestion_id"], d["mr_id"], d["project_id"], d["file"], d["line"], d["label"], d["importance"], d["one_sentence_summary"], json.dumps(d["rule_keys"], ensure_ascii=False), d["score"], d["posted_at"], d["state"], d["applied_at"], d["dismissed_at"], d["dismissed_by"], d.get("dismissed_reason"), d["note_id"]),
                 )
                 self._db.commit()
         elif self.backend == "jsonl":
@@ -316,8 +347,8 @@ class TelemetryStore:
     def update_suggestion_state(self, suggestion_id: str, state: str, **fields) -> None:
         if self.backend != "sqlite" or self._db is None:
             return
-        sets = ["state=?", "applied_at=?", "dismissed_at=?", "dismissed_by=?"]
-        params = [state, fields.get("applied_at"), fields.get("dismissed_at"), fields.get("dismissed_by")]
+        sets = ["state=?", "applied_at=?", "dismissed_at=?", "dismissed_by=?", "dismissed_reason=?"]
+        params = [state, fields.get("applied_at"), fields.get("dismissed_at"), fields.get("dismissed_by"), fields.get("dismissed_reason")]
         with self._lock:
             self._db.execute(
                 f"UPDATE suggestions SET {', '.join(sets)} WHERE suggestion_id=?",
@@ -332,6 +363,98 @@ class TelemetryStore:
             cur = self._db.execute("SELECT * FROM suggestions WHERE note_id=? ORDER BY posted_at DESC LIMIT 1", (note_id,))
             row = cur.fetchone()
         return _row_to_suggestion(row) if row else None
+
+    def list_dismissals(
+        self,
+        since: Optional[str] = None,
+        project_id: Optional[int] = None,
+        rule_key: Optional[str] = None,
+        mr_id: Optional[int] = None,
+        limit: int = 200,
+    ):
+        """Return dismissed suggestions, optionally filtered by project / rule / mr / time.
+
+        Used by the telemetry API to surface dismissal reasons so the frontend
+        can show "why each rule got dismissed" and feed this back into
+        rule-tuning.
+        """
+        if self.backend != "sqlite" or self._db is None:
+            return []
+        clauses = ["state='dismissed'"]
+        params: list = []
+        if since is not None:
+            clauses.append("dismissed_at >= ?")
+            params.append(since)
+        if project_id is not None:
+            clauses.append("project_id=?")
+            params.append(project_id)
+        if mr_id is not None:
+            clauses.append("mr_id=?")
+            params.append(mr_id)
+        if rule_key is not None:
+            # rule_keys is a JSON-encoded list; LIKE match on the literal key is
+            # good enough for the volume we expect (per-MR rule key cardinality
+            # is small). Using LIKE avoids pulling in sqlite JSON1 extension.
+            clauses.append("rule_keys LIKE ?")
+            params.append(f'%"{rule_key}"%')
+        where = " WHERE " + " AND ".join(clauses)
+        params.append(limit)
+        with self._lock:
+            cur = self._db.execute(
+                f"SELECT * FROM suggestions{where} ORDER BY dismissed_at DESC LIMIT ?",
+                params,
+            )
+            rows = cur.fetchall()
+        return [_row_to_suggestion(r) for r in rows]
+
+    def list_dismissals_by_rule(
+        self,
+        since: Optional[str] = None,
+        project_id: Optional[int] = None,
+    ) -> list[dict]:
+        """Aggregate dismissals by rule_key with reason text distribution.
+
+        Returns: [{"rule_key": str, "dismissal_count": int, "reasons": [
+            {"reason": str, "count": int}
+        ]}]
+        """
+        if self.backend != "sqlite" or self._db is None:
+            return []
+        clauses = ["state='dismissed'"]
+        params: list = []
+        if since is not None:
+            clauses.append("dismissed_at >= ?")
+            params.append(since)
+        if project_id is not None:
+            clauses.append("project_id=?")
+            params.append(project_id)
+        where = " WHERE " + " AND ".join(clauses)
+        with self._lock:
+            cur = self._db.execute(
+                f"SELECT rule_keys, dismissed_reason FROM suggestions{where}",
+                params,
+            )
+            rows = cur.fetchall()
+        from collections import defaultdict, Counter
+        per_rule: dict = defaultdict(lambda: {"dismissal_count": 0, "reasons": Counter()})
+        for rk_json, reason in rows:
+            try:
+                keys = json.loads(rk_json or "[]")
+            except Exception:
+                keys = []
+            reason_norm = (reason or "").strip() or "(no reason given)"
+            for k in keys or ["(no rule key)"]:
+                per_rule[k]["dismissal_count"] += 1
+                per_rule[k]["reasons"][reason_norm] += 1
+        out = []
+        for k, v in per_rule.items():
+            out.append({
+                "rule_key": k,
+                "dismissal_count": v["dismissal_count"],
+                "reasons": [{"reason": r, "count": c} for r, c in v["reasons"].most_common()],
+            })
+        out.sort(key=lambda x: -x["dismissal_count"])
+        return out
 
     # ---------- reads ----------
 
@@ -632,7 +755,7 @@ def _row_to_mr(row):
 
 
 def _row_to_suggestion(row):
-    cols = ["suggestion_id", "mr_id", "project_id", "file", "line", "label", "importance", "one_sentence_summary", "rule_keys", "score", "posted_at", "state", "applied_at", "dismissed_at", "dismissed_by", "note_id"]
+    cols = ["suggestion_id", "mr_id", "project_id", "file", "line", "label", "importance", "one_sentence_summary", "rule_keys", "score", "posted_at", "state", "applied_at", "dismissed_at", "dismissed_by", "dismissed_reason", "note_id"]
     d = dict(zip(cols, row))
     try:
         d["rule_keys"] = json.loads(d["rule_keys"] or "[]")

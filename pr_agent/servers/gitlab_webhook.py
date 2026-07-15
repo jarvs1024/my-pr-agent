@@ -636,35 +636,60 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                 # GitLab marks inline comments as DiffNote whether they start a new thread
                 # or reply to an existing one; the discriminator is that a reply carries a
                 # discussion_id pointing at the parent thread.
-                if note_type == 'DiffNote' and body.strip() == '/dismiss':
+                # Accept either the bare command ("/dismiss") or one with an optional
+                # trailing reason ("/dismiss 误报, 这里不需要异常处理"). Multi-line comments
+                # are supported: text after the first newline is treated as the reason
+                # body when the first line is exactly the bare command.
+                _body_stripped = body.strip()
+                _first_line, _sep, _rest = _body_stripped.partition('\n')
+                _cmd = _first_line.strip()
+                # Match the bare command, or the command followed by a space and a reason.
+                # The space guard keeps '/dismissed' (a different word) from matching.
+                if note_type == 'DiffNote' and (_cmd == '/dismiss' or _cmd.startswith('/dismiss ')):
+                    # Reason = the rest of the comment after the command (if any).
+                    # Both inline ("/dismiss foo") and newline-following ("/dismiss\nfoo") forms work.
+                    _inline = _first_line[len('/dismiss'):].strip()
+                    _reason = _inline or _rest.strip()
                     discussion_id = obj_attrs.get('discussion_id')
                     if discussion_id:
                         provider = get_git_provider_with_context(pr_url=url)
                         ok = provider.resolve_discussion(discussion_id)
                         if ok:
-                            get_logger().info(f"/dismiss resolved MR discussion {discussion_id}")
+                            get_logger().info(
+                                f"/dismiss resolved MR discussion {discussion_id}"
+                                + (f" (reason={_reason!r})" if _reason else ""))
                             # Telemetry: attribute the dismiss to the suggestion it resolved.
                             # The discussion id is the GitLab-side suggestion id stored on the
                             # suggestion row at publish time (see pr_code_suggestions.py).
+                            # The user-supplied reason is persisted on the suggestion row
+                            # (dismissed_reason) and surfaced via the dismissals API for
+                            # downstream rule-tuning.
                             try:
                                 author = data.get("user", {}).get("username", "")
                                 mr_iid = data.get("merge_request", {}).get("iid")
                                 suggestion = telemetry_events.get_default_store().get_suggestion_by_note_id(discussion_id)
                                 if suggestion is not None:
+                                    _action_note = f"resolved discussion {discussion_id}"
+                                    if _reason:
+                                        _action_note = f"{_action_note}; reason: {_reason}"
                                     telemetry_events.emit_action(
                                         action="dismissed",
                                         suggestion_id=suggestion["suggestion_id"],
                                         mr_id=int(mr_iid or suggestion["mr_id"] or 0),
                                         actor=author,
-                                        note=f"resolved discussion {discussion_id}",
+                                        note=_action_note,
                                     )
-                                    telemetry_events.mark_suggestion_dismissed(suggestion["suggestion_id"], actor=author)
+                                    telemetry_events.mark_suggestion_dismissed(
+                                        suggestion["suggestion_id"],
+                                        actor=author,
+                                        reason=_reason,
+                                    )
                             except Exception as e:
                                 get_logger().warning(f"telemetry.on_dismiss failed: {e}")
                         else:
                             get_logger().warning(f"/dismiss failed to resolve discussion {discussion_id}")
                         return JSONResponse(status_code=status.HTTP_200_OK,
-                                            content=jsonable_encoder({"message": "dismissed" if ok else "dismiss failed"}))
+                                            content=jsonable_encoder({"message": "dismissed" if ok else "dismiss fail"}))
                     # top-level /dismiss on a new inline note — fall through to normal handling
 
                 provider = get_git_provider_with_context(pr_url=url)

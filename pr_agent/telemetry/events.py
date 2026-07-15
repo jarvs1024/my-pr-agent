@@ -241,7 +241,7 @@ def mark_suggestion_applied(suggestion_id: str) -> None:
         get_logger().warning(f"telemetry.mark_suggestion_applied failed: {e}")
 
 
-def mark_suggestion_dismissed(suggestion_id: str, actor: str = "") -> None:
+def mark_suggestion_dismissed(suggestion_id: str, actor: str = "", reason: str = "") -> None:
     try:
         from datetime import datetime, timezone
         get_default_store().update_suggestion_state(
@@ -249,6 +249,7 @@ def mark_suggestion_dismissed(suggestion_id: str, actor: str = "") -> None:
             "dismissed",
             dismissed_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
             dismissed_by=actor,
+            dismissed_reason=reason or None,
         )
     except Exception as e:
         get_logger().warning(f"telemetry.mark_suggestion_dismissed failed: {e}")

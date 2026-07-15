@@ -81,6 +81,7 @@ class Suggestion:
     applied_at: Optional[str] = None
     dismissed_at: Optional[str] = None
     dismissed_by: Optional[str] = None
+    dismissed_reason: Optional[str] = None  # user-supplied reason text from the dismiss command
     note_id: Optional[str] = None  # GitLab discussion id (hash str)
 
     def to_dict(self) -> dict[str, Any]:
