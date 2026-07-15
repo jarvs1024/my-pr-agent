@@ -207,12 +207,17 @@ def _lookup_mr_for_push(project_id, ref):
     """Resolve the MR iid + web_url for an Apply-commit pushed to ``ref``.
 
     Uses GitLab REST directly because the push hook doesn't carry an MR id.
+
+    GitLab branch names can contain ``/`` (e.g. ``codex/fullflow-2026-07-15``),
+    so strip only the ``refs/heads/`` prefix instead of taking the last
+    ``/``-separated segment, which would drop everything before the final
+    ``/`` and fail to match the MR's ``source_branch`` in the API.
     """
     try:
         import requests
         gl_token = get_settings().get("GITLAB.PERSONAL_ACCESS_TOKEN")
         base = get_settings().get("GITLAB.URL", "http://127.0.0.1:8929").rstrip("/")
-        branch = ref.split("/")[-1] if ref.startswith("refs/heads/") else ""
+        branch = ref[len("refs/heads/"):] if isinstance(ref, str) and ref.startswith("refs/heads/") else ""
         if not branch:
             return None, None
         resp = requests.get(
@@ -225,8 +230,13 @@ def _lookup_mr_for_push(project_id, ref):
             for mr in resp.json():
                 if mr.get("iid"):
                     return mr["iid"], mr.get("web_url") or mr.get("url")
+        else:
+            get_logger().warning(
+                f"_lookup_mr_for_push: non-200 from GitLab "
+                f"(status={resp.status_code} project={project_id} branch={branch!r})"
+            )
     except Exception as e:
-        get_logger().warning(f"telemetry.on_apply_commit mr lookup: {e}")
+        get_logger().warning(f"_lookup_mr_for_push exception: {type(e).__name__}: {e}")
     return None, None
 
 
