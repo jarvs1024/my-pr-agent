@@ -755,7 +755,14 @@ def _row_to_mr(row):
 
 
 def _row_to_suggestion(row):
-    cols = ["suggestion_id", "mr_id", "project_id", "file", "line", "label", "importance", "one_sentence_summary", "rule_keys", "score", "posted_at", "state", "applied_at", "dismissed_at", "dismissed_by", "dismissed_reason", "note_id"]
+    # Column order MUST match the live SQLite schema (PRAGMA table_info):
+    #   ... dismissed_by(14), note_id(15), dismissed_reason(16).
+    # The CREATE TABLE in this file lists them in the opposite order, but the
+    # deployed DB was built when ``note_id`` already existed (added in an
+    # earlier version as INTEGER, then migrated to TEXT, then ``dismissed_reason``
+    # was ADDed later). A mismatched SELECT * column order would silently swap
+    # the two fields' values in the JSON response (note_id ↔ dismissed_reason).
+    cols = ["suggestion_id", "mr_id", "project_id", "file", "line", "label", "importance", "one_sentence_summary", "rule_keys", "score", "posted_at", "state", "applied_at", "dismissed_at", "dismissed_by", "note_id", "dismissed_reason"]
     d = dict(zip(cols, row))
     try:
         d["rule_keys"] = json.loads(d["rule_keys"] or "[]")
