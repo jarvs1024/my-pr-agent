@@ -1,259 +1,246 @@
-
-
 <br />
 
 <div align="center">
-
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://codium.ai/images/pr_agent/logo-dark.png" width="330">
   <source media="(prefers-color-scheme: light)" srcset="https://codium.ai/images/pr_agent/logo-light.png" width="330">
   <img src="https://codium.ai/images/pr_agent/logo-light.png" alt="logo" width="330">
-
 </picture>
+
 <br>
-The Original Open-Source PR Reviewer
-<br><br>
-<a href="https://github.com/the-pr-agent/pr-agent/commits/main">
-<img alt="GitHub" src="https://img.shields.io/github/last-commit/the-pr-agent/pr-agent/main?style=for-the-badge" height="20">
-</a>
+
+# my-pr-agent — GitLab 中文评审 fork
+
+`codiumai/pr-agent` 的维护分支，针对 GitLab webhook + 中文评审场景定制，
+并加了面向前端的 telemetry API。
+
 </div>
 
 ---
 
- This repository contains the open-source PR Agent Project. 
- It is not the Qodo free tier.
- 
-PR-Agent is an open-source, AI-powered code review agent and a community-maintained legacy project of Qodo. It is distinct from Qodo’s primary AI code review offering, which provides a feature-rich, context-aware experience. Qodo now offers a free tier that integrates seamlessly with GitHub, GitLab, Bitbucket, and Azure DevOps for high-quality automated reviews.
+## 这是什么
 
+一个跑在 Docker 里的 AI 代码评审 webhook 服务：
 
-## Sponsors
+```
+GitLab MR event ──▶ pr-agent (Docker, :5050) ──┬──▶ GitLab MR note (中文 /describe /review /improve)
+                                                │
+                                                └──▶ SQLite telemetry.db
+                                                       └──▶ FastAPI :5050 ──▶ 你的前端 dashboard
+```
 
-PR-Agent is a community-maintained open-source project, with its ongoing development supported by our sponsors. If you'd like to support the project, consider [becoming a sponsor](https://github.com/sponsors/naorpeled).
+**默认部署覆盖**：
 
-<p align="center">
-  <h3 align="center">🥇 Gold Sponsor</h3>
-</p>
+| 能力 | 命令 | 触发方式 | 说明 |
+|---|---|---|---|
+| MR 描述自动生成 | `/describe` | MR open / reopen 自动跑 | 中文 PR 描述（`publish_labels=false`，不输出 PR 类型/标签） |
+| 评审 + 安全检查 | `/review` | MR open 自动跑 | "Estimated effort" / "Security concerns" / "Recommended focus areas" 中文输出 |
+| 行内建议 + Apply 按钮 | `/improve` | MR open 自动跑 | GitLab DiffNote + `\`\`\`suggestion` 块，GitLab UI 可一键应用 |
+| 忽略某条建议 | `/dismiss [原因]` | 在 suggestion DiffNote thread 回复 | 标记 `state=dismissed`，存原因到 telemetry |
+| 应用某条建议 | GitLab UI Apply 按钮 | 用户点 Apply | 触发 commit，telemetry 自动检测 `Apply N suggestion(s)` 消息 |
+| 评审数据 | telemetry API | 持续 | 给前端 dashboard 用 |
 
-<p align="center">
-  <a target="_blank" href="https://www.qodo.ai/">
-    <img alt="Qodo — Gold sponsor" src="https://www.qodo.ai/wp-content/uploads/2025/03/qodo-logo.svg" width="300">
-  </a>
-</p>
+---
 
-<p align="center">
-  <a target="_blank" href="https://www.qodo.ai/get-started/">Try the free version of Qodo</a>
-</p>
+## 快速启动（GitLab webhook）
 
+> 完整部署步骤：`docs/docs/installation/local_deploy.md`。
 
-## Table of Contents
+**1. 准备 `.env`**（`/Users/jarvs/gitlab-stack/.env`）：
 
-- [Getting Started](#getting-started)
-- [Why Use PR-Agent?](#why-use-pr-agent)
-- [Features](#features)
-- [See It in Action](#see-it-in-action)
-- [How It Works](#how-it-works)
-- [Data Privacy](#data-privacy)
-- [Contributing](#contributing)
+```bash
+# LLM (OpenAI-compatible, 这里用 MiniMax)
+MINIMAX_API_KEY=sk-cp-...
 
-## Getting Started
+# GitLab
+GITLAB_PERSONAL_ACCESS_TOKEN=glpat-...
+GITLAB_WEBHOOK_SECRET=...
 
-> [!NOTE]
-> **Docker Hub namespace migration.** Releases `0.34.2` and later are published under [`pragent/pr-agent`](https://hub.docker.com/r/pragent/pr-agent). Older releases (up to and including `v0.31`) remain available at the legacy [`codiumai/pr-agent`](https://hub.docker.com/r/codiumai/pr-agent) namespace as a frozen archive — no new images are pushed there. Update any pinned `image:` / `docker pull` / `uses: docker://` references when upgrading to `0.34.2+`.
+# telemetry API 鉴权 (前端调 :5050 时带)
+REVIEW_TELEMETRY_HTTP_TOKEN=$(openssl rand -hex 16)
+```
 
-### 🚀 Quick Start for PR-Agent
-
-#### 1. GitHub Action (Recommended)
-
-Add automated PR reviews to your repository with a simple workflow file:
+**2. `docker-compose.yml`**：
 
 ```yaml
-# .github/workflows/pr-agent.yml
-name: PR Agent
-on:
-  pull_request:
-    types: [opened, synchronize]
-jobs:
-  pr_agent_job:
-    runs-on: ubuntu-latest
-    steps:
-    - name: PR Agent action step
-      uses: the-pr-agent/pr-agent@main
-      env:
-        OPENAI_KEY: ${{ secrets.OPENAI_KEY }}
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+services:
+  pr-agent:
+    image: my-pr-agent:zh        # 本地构建
+    container_name: pr-agent
+    restart: unless-stopped
+    volumes:
+      - pr-agent-data:/var/lib/pr-agent   # 持久化 telemetry.db + suggestion state
+    ports:
+      - "5050:3000"
+    environment:
+      CONFIG__LOG_LEVEL: INFO
+      CONFIG__MODEL: openai/MiniMax-M3
+      CONFIG__MODEL_URL: https://api.minimaxi.com/v1
+      CONFIG__MODEL_API_KEY: ${MINIMAX_API_KEY}
+      CONFIG__RESPONSE_LANGUAGE: zh-CN
+      CONFIG__ALLOWED_BOT_USERNAMES: review-bot
+      REVIEW_TELEMETRY_DB_PATH: /var/lib/pr-agent/telemetry.db
+      REVIEW_TELEMETRY_HTTP_TOKEN: ${REVIEW_TELEMETRY_HTTP_TOKEN:-}
+volumes:
+  pr-agent-data:
 ```
-[Full GitHub Action setup guide](https://docs.pr-agent.ai/installation/github/#run-as-a-github-action)
 
-#### 2. CLI Usage (Local Development)
+**3. 构建 + 启动**：
 
-Run PR-Agent locally on your repository:
 ```bash
-pip install pr-agent
-export OPENAI_KEY=your_key_here
-pr-agent --pr_url https://github.com/owner/repo/pull/123 review
+docker build -t my-pr-agent:zh -f Dockerfile .
+docker compose up -d pr-agent
+curl http://127.0.0.1:5050/api/v1/telemetry/health
+# {"status":"ok","backend":"sqlite"}
 ```
-[Complete CLI setup guide](https://docs.pr-agent.ai/usage-guide/automations_and_usage/#local-repo-cli)
 
-#### 3. Other Platforms
+**4. GitLab 项目 → Settings → Webhooks**：
 
-- [GitLab webhook setup](https://docs.pr-agent.ai/installation/gitlab/)
-- [BitBucket app installation](https://docs.pr-agent.ai/installation/bitbucket/)
-- [Azure DevOps setup](https://docs.pr-agent.ai/installation/azure/)
+- URL: `http://host.docker.internal:5050/webhook`
+- Secret token: `.env` 里的 `GITLAB_WEBHOOK_SECRET`
+- Trigger: ☑️ Merge request events
 
-[//]: # (## News and Updates)
+---
 
-[//]: # ()
-[//]: # (## Aug 8, 2025)
+## AGENTS.md 项目自定义规则
 
-[//]: # ()
-[//]: # ()
-[//]: # ()
-[//]: # (## Jul 1, 2025)
+把规则定义放仓库根 `AGENTS.md`（或者拆到 `.agents/rules/*.md`），格式：
 
-[//]: # (You can now receive automatic feedback from Qodo Merge in your local IDE after each commit. Read more about it [here]&#40;https://github.com/qodo-ai/agents/tree/main/agents/qodo-merge-post-commit&#41;.)
+```markdown
+# Project Review Rules (<PREFIX>-*)
 
-[//]: # ()
-[//]: # ()
-[//]: # (## Jun 21, 2025)
+- `<PREFIX>-RULE-NO-LOG-EXC`         — replace `except Exception: pass` with `logging.exception(...)` + re-raise
+- `<PREFIX>-RULE-DOCSTRING-REQUIRED` — every new `def` must have a single-line docstring
+- `<PREFIX>-RULE-NO-BARE-PRINT`      — no `print(...)` in production code
+- `<PREFIX>-RULE-TYPEHINTS`          — every new function must have type annotations
+- `<PREFIX>-RULE-FORBIDDEN-COMMENT`  — commits must not contain `<PREFIX>-VIOLATION-MARKER` comments
+```
 
-[//]: # ()
-[//]: # (v0.30 was [released]&#40;https://github.com/the-pr-agent/pr-agent/releases&#41;)
+`<PREFIX>` 默认是 `ZLG`。**项目方可以在 `pr_agent/settings/configuration.toml` 改**：
 
-[//]: # ()
-[//]: # ()
-[//]: # (## Apr 30, 2025)
+```toml
+[config]
+rule_key_prefix = "SSD"  # 或 MYAPP / YOURTEAM / ...
+```
 
-[//]: # ()
-[//]: # (A new feature is now available in the `/improve` tool for Qodo Merge 💎 - Chat on code suggestions.)
+规则键前缀改了之后，正则抽取、telemetry rule_keys 索引、severity 规则文件匹配全部跟着改，不需要动 pr-agent 代码。
 
-[//]: # ()
-[//]: # (<img width="512" alt="image" src="https://codium.ai/images/pr_agent/improve_chat_on_code_suggestions_ask.png" />)
+---
 
-[//]: # ()
-[//]: # (Read more about it [here]&#40;https://docs.pr-agent.ai/tools/improve/#chat-on-code-suggestions&#41;.)
+## telemetry API（前端 dashboard 用）
 
-[//]: # ()
-[//]: # ()
+所有接口都在 `http://pr-agent:5050/api/v1/telemetry/*`，需要 `Authorization: Bearer ${REVIEW_TELEMETRY_HTTP_TOKEN}`。
 
-## Why Use PR-Agent?
+| Method | Path | 返回 |
+|---|---|---|
+| GET | `/health` | `{status, backend}` |
+| GET | `/metrics/overview` | 汇总：total / applied / dismissed / adoption_rate / severity_breakdown |
+| GET | `/metrics/rules` | 按 `rule_key` 聚合 |
+| GET | `/metrics/authors` | 按作者聚合 |
+| GET | `/metrics/severity` | 按 `severity` 桶聚合 |
+| GET | `/mrs?limit=50` | MR 列表 |
+| GET | `/mrs/{project_id}/{mr_id}` | 单个 MR 详情 |
+| GET | `/mrs/{project_id}/{mr_id}/suggestions` | 该 MR 的所有 suggestion |
+| GET | `/mrs/{project_id}/{mr_id}/runs` | /describe /review /improve 运行记录 |
+| GET | `/mrs/{project_id}/{mr_id}/timeline` | 事件流 |
+| GET | `/mrs/{project_id}/{mr_id}/stats` | 单 MR 统计 |
+| GET | `/dismissals?since=...&rule_key=...` | 被 dismiss 的建议 + 原因 |
+| GET | `/dismissals/by-rule` | 按 rule_key 聚合 dismiss 原因分布 |
 
-### 🎯 Built for Real Development Teams
+示例：
 
-**Fast & Affordable**: Each tool (`/review`, `/improve`, `/ask`) uses a single LLM call (~30 seconds, low cost)
+```bash
+TOKEN=db2f763001d72ab103680f0b92aaff4a
 
-**Handles Any PR Size**: Our [PR Compression strategy](https://docs.pr-agent.ai/core-abilities/#pr-compression-strategy) effectively processes both small and large PRs
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:5050/api/v1/telemetry/metrics/overview" | python3 -m json.tool
 
-**Highly Customizable**: JSON-based prompting allows easy customization of review categories and behavior via [configuration files](pr_agent/settings/configuration.toml)
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:5050/api/v1/telemetry/mrs/34/52/suggestions" | python3 -m json.tool
+```
 
-**Platform Agnostic**: 
-- **Git Providers**: GitHub, GitLab, BitBucket, Azure DevOps, Gitea
-- **Deployment**: CLI, GitHub Actions, Docker, self-hosted, webhooks
-- **AI Models**: OpenAI GPT, Claude, Deepseek, and more
+完整字段定义、DB schema、severity 三层 fallback：`pr_agent/telemetry/README.md`。
 
-**Open Source Benefits**:
-- Full control over your data and infrastructure
-- Customize prompts and behavior for your team's needs
-- No vendor lock-in
-- Community-driven development
+---
 
-## Features
+## 数据持久化
 
-<div style="text-align:left;">
+`/var/lib/pr-agent` 在容器里挂命名卷，存：
 
-PR-Agent offers comprehensive pull request functionalities integrated with various git providers:
+- `telemetry.db` — SQLite，suggestion / run / action_event / dismissal
+- `suggestions/<project>-mr-<iid>.json` — suggestion state 文件（block-merge 用）
+- `.secrets.toml` cache — 不写到这里（运行时从 env 读）
 
-|                                                         |                                                                                        | GitHub | GitLab | Bitbucket | Azure DevOps | Gitea |
-|---------------------------------------------------------|----------------------------------------------------------------------------------------|:------:|:------:|:---------:|:------------:|:-----:|
-| [TOOLS](https://docs.pr-agent.ai/tools/)         | [Describe](https://docs.pr-agent.ai/tools/describe/)                            |   ✅   |   ✅   |    ✅     |      ✅      |  ✅   |
-|                                                         | [Review](https://docs.pr-agent.ai/tools/review/)                                |   ✅   |   ✅   |    ✅     |      ✅      |  ✅   |
-|                                                         | [Improve](https://docs.pr-agent.ai/tools/improve/)                              |   ✅   |   ✅   |    ✅     |      ✅      |  ✅   |
-|                                                         | [Ask](https://docs.pr-agent.ai/tools/ask/)                                      |   ✅   |   ✅   |    ✅     |      ✅      |       |
-|                                                         | ⮑ [Ask on code lines](https://docs.pr-agent.ai/tools/ask/#ask-lines)            |   ✅   |   ✅   |           |              |       |
-|                                                         | [Help Docs](https://docs.pr-agent.ai/tools/help_docs/?h=auto#auto-approval)     |   ✅   |   ✅   |    ✅     |              |       |
-|                                                         | [Update CHANGELOG](https://docs.pr-agent.ai/tools/update_changelog/)            |   ✅   |   ✅   |    ✅     |      ✅      |       |
-|                                                         |                                                                                                                     |        |        |           |              |       |
-| [USAGE](https://docs.pr-agent.ai/usage-guide/)   | [CLI](https://docs.pr-agent.ai/usage-guide/automations_and_usage/#local-repo-cli)                            |   ✅   |   ✅   |    ✅     |      ✅      |  ✅   |
-|                                                         | [App / webhook](https://docs.pr-agent.ai/usage-guide/automations_and_usage/#github-app)                      |   ✅   |   ✅   |    ✅     |      ✅      |  ✅   |
-|                                                         | [Tagging bot](https://github.com/the-pr-agent/pr-agent#try-it-now)                                                     |   ✅   |        |           |              |       |
-|                                                         | [Actions](https://docs.pr-agent.ai/installation/github/#run-as-a-github-action)                              |   ✅   |   ✅   |    ✅     |      ✅      |       |
-|                                                         |                                                                                                                     |        |        |           |              |       |
-| [CORE](https://docs.pr-agent.ai/core-abilities/) | [Adaptive and token-aware file patch fitting](https://docs.pr-agent.ai/core-abilities/compression_strategy/) |   ✅   |   ✅   |    ✅     |      ✅      |       |
-|                                                         | [Dynamic context](https://docs.pr-agent.ai/core-abilities/dynamic_context/)                                  |   ✅   |   ✅   |    ✅     |      ✅      |       |
-|                                                         | [Fetching ticket context](https://docs.pr-agent.ai/core-abilities/fetching_ticket_context/)                  |   ✅    |  ✅    |     ✅     |              |       |
-|                                                         | [Interactivity](https://docs.pr-agent.ai/core-abilities/interactivity/)                                      |   ✅   |  ✅   |           |              |       |
-|                                                         | [Local and global metadata](https://docs.pr-agent.ai/core-abilities/metadata/)                               |   ✅   |   ✅   |    ✅     |      ✅      |       |
-|                                                         | [Multiple models support](https://docs.pr-agent.ai/usage-guide/changing_a_model/)                            |   ✅   |   ✅   |    ✅     |      ✅      |       |
-|                                                         | [PR compression](https://docs.pr-agent.ai/core-abilities/compression_strategy/)                              |   ✅   |   ✅   |    ✅     |      ✅      |       |
-|                                                         | [Self reflection](https://docs.pr-agent.ai/core-abilities/self_reflection/)                                  |   ✅   |   ✅   |    ✅     |      ✅      |       |
+容器 `docker compose up -d --force-recreate` 不会丢数据；想清干净就 `docker compose down -v`。
 
-[//]: # (- Support for additional git providers is described in [here]&#40;./docs/Full_environments.md&#41;)
-___
+---
 
-## See It in Action
+## 工程结构
 
-</div>
-<h4><a href="https://github.com/the-pr-agent/pr-agent/pull/530">/describe</a></h4>
-<div align="center">
-<p float="center">
-<img src="https://www.codium.ai/images/pr_agent/describe_new_short_main.png" width="512">
-</p>
-</div>
-<hr>
+```
+pr_agent/
+├── algo/
+│   ├── i18n.py                  # 中文 locale (response_language=zh-CN)
+│   ├── repo_context.py          # AGENTS.md 渲染 + 规则键抽取
+│   ├── improve_coverage.py      # 规则覆盖率检查
+│   └── utils.py                 # get_model 守卫
+├── tools/
+│   ├── pr_description.py        # /describe
+│   ├── pr_reviewer.py           # /review
+│   ├── pr_code_suggestions.py   # /improve
+│   └── pr_add_docs.py           # /add_docs
+├── servers/
+│   └── gitlab_webhook.py        # GitLab webhook 入口 + Apply detection + /dismiss
+├── git_providers/
+│   └── gitlab_provider.py       # GitLab REST + python-gitlab
+├── telemetry/                   # telemetry API + SQLite + FastAPI
+│   ├── api.py
+│   ├── store.py
+│   ├── events.py
+│   ├── models.py
+│   └── README.md                # 详细文档
+└── settings/
+    └── configuration.toml       # 默认配置 (响应 language, AGENTS.md 规则, severity map)
 
-<h4><a href="https://github.com/the-pr-agent/pr-agent/pull/732#issuecomment-1975099151">/review</a></h4>
-<div align="center">
-<p float="center">
-<kbd>
-<img src="https://www.codium.ai/images/pr_agent/review_new_short_main.png" width="512">
-</kbd>
-</p>
-</div>
-<hr>
+docs/docs/installation/
+├── gitlab.md                    # GitLab 部署 (上游文档)
+└── local_deploy.md              # 当前 fork 的部署步骤 (推荐)
 
-<h4><a href="https://github.com/the-pr-agent/pr-agent/pull/732#issuecomment-1975099159">/improve</a></h4>
-<div align="center">
-<p float="center">
-<kbd>
-<img src="https://www.codium.ai/images/pr_agent/improve_new_short_main.png" width="512">
-</kbd>
-</p>
-</div>
+tests/
+├── unittest/                    # pytest 单测
+└── health_test/                 # /describe + /review + /improve 烟雾测试
+```
 
-<hr>
+---
 
-## How It Works
+## 上游
 
-The following diagram illustrates PR-Agent tools and their flow:
+fork 自 [`codiumai/pr-agent`](https://github.com/the-pr-agent/pr-agent)。
+本分支合并的 fork 改动：
 
-![PR-Agent Tools](https://www.qodo.ai/images/pr_agent/diagram-v0.9.png)
+- 中文 locale + i18n (`pr_agent/algo/i18n.py`, `response_language=zh-CN`)
+- `/dismiss` slash 命令（在 suggestion DiffNote thread 回复 `/dismiss [原因]`，自动 resolve discussion + 存原因到 telemetry）
+- telemetry FastAPI + SQLite + 命名卷持久化（`/var/lib/pr-agent`）
+- AGENTS.md 规则键前缀可配置 (`config.rule_key_prefix` 默认 `ZLG`，可改 `SSD` / `MYAPP` 等)
+- `severity` 三层 fallback（rule / pattern / llm numeric） + severity_bucket API
+- Apply-suggestion 自动检测（push hook + merge_request hook + 含 `/` 分支名 MR 查找修复）
+- litellm temperature 强转等 LLM 兼容垫片（适配 MiniMax 等 OpenAI-compatible 接口）
 
-## Data Privacy
+完整 commit history：`git log --oneline main ^upstream/main`。
 
-### Self-hosted PR-Agent
+---
 
-- If you host PR-Agent with your OpenAI API key, it is between you and OpenAI. You can read their API data privacy policy here:
-https://openai.com/enterprise-privacy
+## 已知约束
 
-## Contributing
+- **只测过 GitLab**。GitHub / Bitbucket / Azure 链路在 fork 里没改也没验证。
+- **LLM 走 OpenAI-compatible 协议**。默认配 MiniMax (api.minimaxi.com/v1)，切换到 OpenAI / Anthropic / DeepSeek 只要改 `CONFIG__MODEL_URL` 和 `CONFIG__MODEL_KEY`。
+- **arm64 macOS 上跑 amd64 image** 会有 platform mismatch warning，CI 没优化。
+- **分含 `/` 的分支名**（如 `codex/fullflow-2026-07-15`）push Apply 走 telemetry 的修复在 `170386b` 之后才生效，更早版本会漏记 apply。
+- **代码评审 / 中文 / telemetry 是当前唯一在用的能力**，其他上游工具（CLI / GitHub Action / Azure DevOps app 等）都没在本 fork 验证。
 
-To contribute to the project, get started by reading our [Contributing Guide](https://github.com/the-pr-agent/pr-agent/blob/b09eec265ef7d36c232063f76553efb6b53979ff/CONTRIBUTING.md).
+---
 
+## License
 
-## Big News for PR-Agent
-
-PR-Agent has a new home!
-
-After years of building this tool alongside the community, Qodo has donated PR-Agent to the open-source community - and we couldn't be more excited about what comes next.
-
-The project now lives in the PR-Agent org on GitHub, is fully community-owned, and is open for contributions and additional maintainers.
-
-What else changed: 
-- Docs moved to - www.pr-agent.ai
-- Qodo Merge (Qodo 1.0), the hosted URL, which was the enterprise version of PR-Agent, has been rebranded and evolved into Qodo (Qodo 2.0), a full AI code review platform.
-
-## ❤️ Community
-
-This open-source release remains here as a community contribution from Qodo — the origin of modern AI-powered code collaboration. We’re proud to share it and inspire developers worldwide.
-
-The project now has its first external maintainer, Naor ([@naorpeled](https://github.com/naorpeled)), and is currently in the process of being donated to an open-source foundation.
+继承上游 [Apache 2.0](LICENSE)。
