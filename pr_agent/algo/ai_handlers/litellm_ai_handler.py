@@ -51,10 +51,21 @@ class LiteLLMAIHandler(BaseAiHandler):
 
         if get_settings().get("LITELLM.DISABLE_AIOHTTP", False):
             litellm.disable_aiohttp_transport = True
-        if get_settings().get("OPENAI.KEY", None):
-            openai.api_key = get_settings().openai.key
-            litellm.openai_key = get_settings().openai.key
-        elif 'OPENAI_API_KEY' not in os.environ:
+        openai_key = (get_settings().get("OPENAI.KEY")
+                      or get_settings().get("openai.key")
+                      or os.environ.get("OPENAI_API_KEY"))
+        if openai_key:
+            openai.api_key = openai_key
+            # Set both attributes: chat_completion() passes litellm.api_key
+            # as the explicit api_key kwarg when it is set and not the
+            # dummy placeholder. Other code paths read litellm.openai_key.
+            litellm.openai_key = openai_key
+            litellm.api_key = openai_key
+            # Pick up an OpenAI-compatible api_base from [openai].api_base in
+            # settings/configuration.toml so MiniMax / DeepSeek / Ollama / vLLM
+            # style endpoints work without setting OPENAI_API_BASE in the env.
+            self.api_base = get_settings().openai.get("api_base") or self.api_base
+        else:
             litellm.api_key = DUMMY_LITELLM_API_KEY
         if os.environ.get("AWS_USE_IMDS", "").strip().lower() in ("1", "true", "yes"):
             import boto3

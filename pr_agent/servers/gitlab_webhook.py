@@ -379,20 +379,29 @@ def is_bot_user(data) -> bool:
         # logic to ignore bot users (unlike Github, no direct flag for bot users in gitlab)
         sender_name = (data.get("user", {}).get("name") or "unknown").lower()
         sender_username = (data.get("user", {}).get("username") or "").lower()
-        # Bot-username exemptions: a CI job that posts on behalf of a service
-        # account (e.g. ``review-bot``) is a legitimate trigger source, not
-        # self-echo. Operators list those usernames in
-        # ``config.allowed_bot_usernames`` so the agent runs the requested
-        # command instead of silently dropping the webhook.
-        allowed = get_settings().get("config.allowed_bot_usernames", []) or []
-        if isinstance(allowed, str):
-            allowed = [a for a in allowed.split(",") if a.strip()]
-        allowed = {a.lower() for a in allowed}
+        # Resolve allowed_bot_usernames from any of the Dynaconf lookup forms
+        # used in this repo: ``config.allowed_bot_usernames`` (dotted path),
+        # ``config -> allowed_bot_usernames`` (nested), or a comma-separated
+        # string from an env var override. ``get_settings().get(...)`` returns
+        # ``None`` for missing keys and an empty ``BoxList`` for an explicitly
+        # empty list, so coerce both to ``[]`` before iterating.
+        allowed_raw = (
+            get_settings().get("config.allowed_bot_usernames")
+            or get_settings().get("config", {}).get("allowed_bot_usernames")
+            or []
+        )
+        if isinstance(allowed_raw, str):
+            allowed_raw = [a for a in allowed_raw.split(",") if a.strip()]
+        allowed = {a.lower() for a in allowed_raw}
+        # Whitelist check first: a CI job / service account whose username is
+        # explicitly allowed must run regardless of bot-like naming, so the
+        # agent never drops a legitimate trigger.
         if sender_username and sender_username in allowed:
             return False
+        # Generic bot detection runs after the whitelist so an allowed
+        # username like ``review-bot`` is never matched by the trailing
+        # ``-bot`` rule.
         bot_indicators = ['codium', 'bot_', 'bot-', '_bot', '-bot']
-        # also match username with trailing -bot (e.g. "review-bot") to avoid
-        # the agent re-processing its own comment as a new command
         if any(indicator in sender_name for indicator in bot_indicators):
             get_logger().info(f"Skipping GitLab bot user: {sender_name}")
             return True
