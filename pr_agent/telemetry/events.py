@@ -15,14 +15,34 @@ from pr_agent.telemetry import models
 from pr_agent.telemetry.store import get_default_store
 
 
-_RULE_KEY_RE = re.compile(r"(?<![\w])(ZLG-RULE-[A-Z0-9-]+)(?![\w])")
+_RULE_KEY_RE_CACHE: dict[str, "re.Pattern[str]"] = {}
+
+
+def _rule_key_re():
+    """Build the rule-key regex from ``config.rule_key_prefix``.
+
+    Lazy-imports ``get_settings`` so this module stays importable in tests
+    that do not boot the full settings stack. Pattern is cached per prefix
+    to keep the per-suggestion cost negligible.
+    """
+    from pr_agent.config_loader import get_settings
+    try:
+        prefix = get_settings().config.get("rule_key_prefix", "ZLG") or "ZLG"
+    except Exception:
+        # Tests / first-import before settings are wired fall back to ZLG.
+        prefix = "ZLG"
+    pat = _RULE_KEY_RE_CACHE.get(prefix)
+    if pat is None:
+        pat = re.compile(rf"(?<![\w])({re.escape(prefix)}-RULE-[A-Z0-9-]+)(?![\w])")
+        _RULE_KEY_RE_CACHE[prefix] = pat
+    return pat
 
 
 def extract_rule_keys_from_text(text: str) -> list[str]:
     if not text:
         return []
     seen: list[str] = []
-    for m in _RULE_KEY_RE.finditer(text):
+    for m in _rule_key_re().finditer(text):
         key = m.group(1)
         if key not in seen:
             seen.append(key)

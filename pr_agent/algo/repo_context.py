@@ -282,21 +282,37 @@ def build_repo_context(git_provider) -> str:
     return repo_context
 
 
-RULE_KEY_PATTERN = re.compile(r"(?<![\w])(ZLG-RULE-[A-Z0-9-]+)(?![\w])")
+def _rule_key_pattern():
+    """Build the regex that extracts ``<PREFIX>-RULE-<KEY>`` rule keys.
+
+    The prefix is read from ``config.rule_key_prefix`` at call time so a project
+    that names its rules ``SSD-RULE-*`` / ``MYAPP-RULE-*`` does not need to
+    change any code; it only overrides ``rule_key_prefix`` in configuration.
+    Defaults to ``"ZLG"`` for backward compatibility.
+    """
+    prefix = get_settings().config.get("rule_key_prefix", "ZLG") or "ZLG"
+    pat = _RULE_KEY_PATTERN_CACHE.get(prefix)
+    if pat is None:
+        pat = re.compile(rf"(?<![\w])({re.escape(prefix)}-RULE-[A-Z0-9-]+)(?![\w])")
+        _RULE_KEY_PATTERN_CACHE[prefix] = pat
+    return pat
+
+_RULE_KEY_PATTERN_CACHE: dict[str, "re.Pattern[str]"] = {}
 
 
 def extract_rule_keys(repo_context_text: str) -> list[str]:
-    """Pull rule keys (e.g. ``ZLG-RULE-NO-LOG-EXC``) out of rendered repo context.
+    """Pull rule keys (e.g. ``<PREFIX>-RULE-NO-LOG-EXC``) out of rendered repo context.
 
-    The pattern matches both backtick-wrapped (`` `ZLG-RULE-...` ``) and bare
+    The pattern matches both backtick-wrapped (`` `<PREFIX>-RULE-...` ``) and bare
     occurrences while skipping alphanumeric continuations on either side, so
     generic glob patterns like ``*.py`` are never picked up. Order is preserved
-    and duplicates are removed.
+    and duplicates are removed. The prefix is configurable via
+    ``config.rule_key_prefix`` (default ``"ZLG"``).
     """
     if not repo_context_text:
         return []
     seen: list[str] = []
-    for match in RULE_KEY_PATTERN.finditer(repo_context_text):
+    for match in _rule_key_pattern().finditer(repo_context_text):
         key = match.group(1)
         if key not in seen:
             seen.append(key)
@@ -305,16 +321,16 @@ def extract_rule_keys(repo_context_text: str) -> list[str]:
 # Severity labels accepted in rule files / config / API responses.
 SEVERITY_LEVELS = ("critical", "high", "medium", "low", "unknown")
 
-# Regex for ``RULE_KEY: severity`` lines in rule files. The key allows
+# Regex for ``<RULE_KEY>: severity`` lines in rule files. The key allows
 # alphanumerics, ``_``, ``-`` and ``.`` and may contain ``:`` (e.g.
-# ``ZLG-RULE-NO-LOG-EXC``). Optional markdown list markers are accepted.
+# ``<PREFIX>-RULE-NO-LOG-EXC``). Optional markdown list markers are accepted.
 # Group 1 captures the rule key, group 2 the severity.
 _SEVERITY_LINE_RE = re.compile(
     r"^[\s>*\-]*([A-Za-z0-9_.:-]+)\s*[:=]\s*(critical|high|medium|low)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 
-# Regex for severity-first bullets: ``- [critical] ZLG-RULE-...``
+# Regex for severity-first bullets: ``- [critical] <PREFIX>-RULE-...``
 _SEVERITY_BULLET_RE = re.compile(
     r"^[\s>*\-]*\[(critical|high|medium|low)\]\s*([A-Za-z0-9_.:-]+)\s*$",
     re.IGNORECASE | re.MULTILINE,
@@ -325,8 +341,8 @@ def parse_rule_files(contents: list[str]) -> dict[str, str]:
     """Parse a list of rule-file contents into a ``{rule_key: severity}`` map.
 
     Two line styles are accepted:
-      * ``ZLG-RULE-NO-LOG-EXC: critical``  (key first, severity after colon)
-      * ``- [critical] ZLG-RULE-NO-LOG-EXC``  (markdown bullet, severity first)
+      * ``<PREFIX>-RULE-NO-LOG-EXC: critical``  (key first, severity after colon)
+      * ``- [critical] <PREFIX>-RULE-NO-LOG-EXC``  (markdown bullet, severity first)
 
     Later entries override earlier ones so projects can layer a base rules
     file and a project-specific override. Unknown severities are ignored.
@@ -363,7 +379,7 @@ def resolve_severity(
     Returns ``(severity, source)``:
       * severity: one of ``critical / high / medium / low / unknown``
       * source: short tag identifying which layer decided
-        (``rule:ZLG-RULE-NO-LOG-EXC`` / ``pattern:NO-LOG-EXC`` / ``llm:7`` /
+        (``rule:<PREFIX>-RULE-NO-LOG-EXC`` / ``pattern:NO-LOG-EXC`` / ``llm:7`` /
         ``unknown``).
 
     Layers are tried in order:

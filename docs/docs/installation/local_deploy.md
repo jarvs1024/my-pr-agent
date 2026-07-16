@@ -107,20 +107,20 @@ docker compose up -d pr-agent
 
 ## 步骤 6 — 在项目根放 AGENTS.md（可选但推荐）
 
-pr-agent 会读项目根的 `AGENTS.md` 当评审规约来源。如果你想让评审机器人检查某些规则就放这个文件。
+pr-agent 会读项目根的 `AGENTS.md` 当评审规约来源。规则键格式是 ``<PREFIX>-RULE-<KEY>``; 默认前缀 ``ZLG`` 可在 ``[config].rule_key_prefix`` 里改 (例如改成 ``SSD`` / ``MYAPP``)。
 
 最小例子：
 
 ```bash
 cd /path/to/your/test-project
 cat > AGENTS.md <<'MD'
-# Project Review Rules (ZLG-*)
+# Project Review Rules (<PREFIX>-*)
 
-- `ZLG-RULE-NO-LOG-EXC`         — replace `except Exception: pass` with `logging.exception(...)` + re-raise
-- `ZLG-RULE-DOCSTRING-REQUIRED` — every new `def` must have a single-line docstring
-- `ZLG-RULE-NO-BARE-PRINT`      — no `print(...)` in production code
-- `ZLG-RULE-TYPEHINTS`          — every new function must have type annotations
-- `ZLG-RULE-FORBIDDEN-COMMENT`  — commits must not contain `ZLG-VIOLATION-MARKER` comments
+- `<PREFIX>-RULE-NO-LOG-EXC`         — replace `except Exception: pass` with `logging.exception(...)` + re-raise
+- `<PREFIX>-RULE-DOCSTRING-REQUIRED` — every new `def` must have a single-line docstring
+- `<PREFIX>-RULE-NO-BARE-PRINT`      — no `print(...)` in production code
+- `<PREFIX>-RULE-TYPEHINTS`          — every new function must have type annotations
+- `<PREFIX>-RULE-FORBIDDEN-COMMENT`  — commits must not contain `<PREFIX>-VIOLATION-MARKER` comments
 MD
 git add AGENTS.md
 git commit -m "docs: add AGENTS.md rule keys"

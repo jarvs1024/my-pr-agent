@@ -58,10 +58,13 @@ echo
 echo "--- NO-LOG-EXC must land in critical (pattern fallback) ---"
 out=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/telemetry/mrs/34/48/suggestions")
 # Find a NO-LOG-EXC tagged suggestion and check its severity
+# Rule-key prefix is configurable via config.rule_key_prefix; the smoke test
+# matches by suffix only ("-RULE-NO-LOG-EXC") so it works for ZLG / SSD /
+# any other prefix without further changes.
 result=$(echo "$out" | python3 -c "
 import sys, json
 items = json.load(sys.stdin)
-hits = [s for s in items if 'ZLG-RULE-NO-LOG-EXC' in s.get('rule_keys', [])]
+hits = [s for s in items if any(k.endswith('-RULE-NO-LOG-EXC') for k in s.get('rule_keys', []))]
 if not hits:
     print('NO_HIT')
 else:

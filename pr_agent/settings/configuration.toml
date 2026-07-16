@@ -28,6 +28,11 @@ ai_timeout=120 # 2 minutes
 skip_keys = []
 custom_reasoning_model = false # when true, disables system messages and temperature controls for models that don't support chat-style inputs
 response_language="zh-CN" # Language locales code for PR responses in ISO 3166 and ISO 639 format (e.g., "en-US", "it-IT", "zh-CN", ...)
+# Project-specific rule-key prefix. The repo defines project rules in AGENTS.md as
+# ``<PREFIX>-RULE-<KEY>`` (e.g. ZLG-RULE-NO-LOG-EXC, SSD-RULE-NO-BARE-PRINT). The
+# regex that pulls these keys out of AGENTS.md text is built from this prefix, so
+# projects with a different naming convention only need to override it here.
+rule_key_prefix = "ZLG"
 repo_context_files = ["AGENTS.md"] # Repository-relative files (e.g. AGENTS.md, CLAUDE.md) to include as AI prompt context; set to [] to disable
 repo_context_from_default_branch = true # Read repo context files from the repository default branch (trusts only default-branch content). Set to false to read from the PR target branch instead.
 repo_context_max_lines = 500 # Maximum total rendered lines for repo context, including wrapper tags
@@ -102,7 +107,7 @@ persistent_comment=true
 extra_instructions = """
 全部用中文 (zh-CN) 输出, 包括各列表面板 ("Estimated effort to review" / "No relevant tests" / "Security concerns" / "Recommended focus areas for review" / "No major issues detected")、推荐建议正文和 Markdown 标题都不要英文。
 
-"Security concerns" 这一栏如果命中违规 (即使 PR 声称 "No."), 必须在结论之后立即列出一个 ```` ```python ```` 代码片段, 引用 PR diff 中的 ``existing_code`` 行, 并附上文件路径和行号 (用 `<file:///path/to/file.py#Lstart-Lend>` 或 GitLab blob 链接); 这段代码片段必须涵盖违规所在的最小可重复单元 (至少 5~10 行业务上下文), 不能只给一行甚至一个空行示例。命中 AGENTS.md 的规则 (例如 ZLG-RULE-*) 时也要在 "Recommended focus areas for review" 里逐条 cite, 且每一条 cite 同样附 ```` ```python ```` 片段的 minimum reproducible snippet。
+"Security concerns" 这一栏如果命中违规 (即使 PR 声称 "No."), 必须在结论之后立即列出一个 ```` ```python ```` 代码片段, 引用 PR diff 中的 ``existing_code`` 行, 并附上文件路径和行号 (用 `<file:///path/to/file.py#Lstart-Lend>` 或 GitLab blob 链接); 这段代码片段必须涵盖违规所在的最小可重复单元 (至少 5~10 行业务上下文), 不能只给一行甚至一个空行示例。命中 AGENTS.md 的规则 (例如 `<PREFIX>-RULE-*`, 前缀取决于项目 AGENTS.md) 时也要在 "Recommended focus areas for review" 里逐条 cite, 且每一条 cite 同样附 ```` ```python ```` 片段的 minimum reproducible snippet。
 """
 num_max_findings = 3
 final_update_message = true
@@ -190,28 +195,28 @@ extra_instructions = """
 ``suggestion_content``、``label`` 等文字字段必须用中文 (zh-CN) 输出, 包括 importance 评分标签后的描述。
 
 如果本次评审的上下文里注入了 ``AGENTS.md`` / ``CLAUDE.md`` (见 ``[config].repo_context_files``), 把它当作本仓库的最高优先规约来源:
-- 先扫描注入文本, 抽取出项目自定义的规则键 (形如 ``<PREFIX>-RULE-KEY`` 或类似约定, 例如 ``ZLG-RULE-NO-LOG-EXC``). 不要假设规则键的前缀, 直接看实际出现的字面量.
-- 对每一条被本次 diff 违反的规则, 在 ``suggestion_content`` 里逐条 cite (例如 "违反 `ZLG-RULE-NO-LOG-EXC`"); ``improved_code`` 必须落实该规则的具体修复方式, 不能只是泛泛改写.
+- 先扫描注入文本, 抽取出项目自定义的规则键 (形如 ``<PREFIX>-RULE-KEY`` 或类似约定, 例如 ``<PREFIX>-RULE-NO-LOG-EXC``). 不要假设规则键的前缀, 直接看实际出现的字面量.
+- 对每一条被本次 diff 违反的规则, 在 ``suggestion_content`` 里逐条 cite (例如 "违反 `<PREFIX>-RULE-NO-LOG-EXC`"); ``improved_code`` 必须落实该规则的具体修复方式, 不能只是泛泛改写.
 - 同一规则在多个 chunk 里被违反时, 每个 chunk 都要 cite 一次; 但不要为同一条规则生成重复的修复建议.
 - 如果 AGENTS.md 写了非规则性的规约 (例如 "commit 规范 / 分支命名"), 也按字面遵循.
 - 如果本次 prompt 没有注入 AGENTS.md (即 ``repo_context_files`` 没配置或文件缺失), 跳过规则键 cite, 只输出常规改进建议.
 
 # AGENTS.md 触发的修复必须以可应用 suggestion 形式输出 (覆盖上游 prompt 的 "Don't suggest ..." 约束)
-- 当一条 ``ZLG-RULE-*`` (或任何 AGENTS.md 里声明的规则键) 在 PR diff 中被违反时, **必须**在 YAML 的 ``code_suggestions`` 列表里输出一条对应的 suggestion, **不能**只在 ``# PR Code Suggestions`` 的主 review 折叠里写纯文本描述. Apply 按钮是这次评审要交付的核心 UX, 缺失 = 任务未完成.
-- 违反此约束的常见情况是 AGENTS.md 要求"删除某行" (例如 ZLG-RULE-FORBIDDEN-COMMENT 要求删除含 ``ZLG-VIOLATION-MARKER`` 字面量的注释行): 这种情况下:
+- 当一条 ``<PREFIX>-RULE-*`` (或任何 AGENTS.md 里声明的规则键) 在 PR diff 中被违反时, **必须**在 YAML 的 ``code_suggestions`` 列表里输出一条对应的 suggestion, **不能**只在 ``# PR Code Suggestions`` 的主 review 折叠里写纯文本描述. Apply 按钮是这次评审要交付的核心 UX, 缺失 = 任务未完成.
+- 违反此约束的常见情况是 AGENTS.md 要求"删除某行" (例如 `<PREFIX>-RULE-FORBIDDEN-COMMENT` 要求删除含 ``<PREFIX>-VIOLATION-MARKER`` 字面量的注释行): 这种情况下:
     - ``existing_code`` = 那一行 marker 注释 (含前导空格, 与 diff 中原样)
     - ``improved_code`` = 空字符串 (或下一个相邻非空行, 但**不要**插入空白行)
-    - ``suggestion_content`` = 中文一句话, 必须 verbatim 引用规则 key (例如 "违反 `ZLG-RULE-FORBIDDEN-COMMENT` (hard-stop): 提交中禁止 ``ZLG-VIOLATION-MARKER`` 字面量, 必须删除此行注释")
+    - ``suggestion_content`` = 中文一句话, 必须 verbatim 引用规则 key (例如 "违反 `<PREFIX>-RULE-FORBIDDEN-COMMENT` (hard-stop): 提交中禁止 ``<PREFIX>-VIOLATION-MARKER`` 字面量, 必须删除此行注释")
     - ``label`` = "security" 或 "critical bug", ``one_sentence_summary`` 用中文
 - 这条豁免适用于 AGENTS.md / CLAUDE.md 中**显式列出**的规则键, 且覆盖范围包括:
-    * 删除违规注释行 (例如 ZLG-RULE-FORBIDDEN-COMMENT)
-    * 添加 docstring (ZLG-RULE-DOCSTRING-REQUIRED)
-    * 添加类型注解 (ZLG-RULE-TYPEHINTS)
-    * 用 ``logging.exception(...)`` 替换 ``except Exception: pass`` (ZLG-RULE-NO-LOG-EXC)
-    * 用 ``logging.info(...)`` 替换生产路径的 ``print(...)`` (ZLG-RULE-NO-BARE-PRINT)
+    * 删除违规注释行 (例如 `<PREFIX>-RULE-FORBIDDEN-COMMENT`)
+    * 添加 docstring (例如 `<PREFIX>-RULE-DOCSTRING-REQUIRED`)
+    * 添加类型注解 (例如 `<PREFIX>-RULE-TYPEHINTS`)
+    * 用 ``logging.exception(...)`` 替换 ``except Exception: pass`` (例如 `<PREFIX>-RULE-NO-LOG-EXC`)
+    * 用 ``logging.info(...)`` 替换生产路径的 ``print(...)`` (例如 `<PREFIX>-RULE-NO-BARE-PRINT`)
   这些 case 在 AGENTS.md 触发的语境下**必须**作为可应用 code_suggestions 输出, 即便上游 prompt 的 "Don't suggest to add docstring, type hints, or comments, to remove unused imports, or to use more specific exception types" 明确禁止. AGENTS.md 的规则键 override 上游默认.
   其它 (无 AGENTS.md 规则键依据的) 衍生的 "加 docstring / type hints / 删除 unused import" 建议仍遵循上游 prompt 约束, 不输出 code_suggestions 条目.
-- 即使整条 PR 只有一个 ZLG-RULE 违规, 也要至少输出一条 code_suggestions; 不要因为"主 review 已经写了文字说明"就跳过 code_suggestions 字段.
+- 即使整条 PR 只有一个 `<PREFIX>-RULE-*` 违规, 也要至少输出一条 code_suggestions; 不要因为"主 review 已经写了文字说明"就跳过 code_suggestions 字段.
 """
 
 # dual_publishing_score_threshold keeps the summarized-table UX for the

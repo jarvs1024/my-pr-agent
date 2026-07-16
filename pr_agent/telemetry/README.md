@@ -144,8 +144,8 @@ Layer 3: 按 LLM importance 数字分桶
 LLM 的 `importance` 数字不稳定:
 
 - 同一段代码两次跑 importance 可能差 ±3
-- 截图实例: LLM 给 `ZLG-RULE-NO-LOG-EXC` (静默吞异常) 打了 7, 但业务上这是 **致命规则** (破坏线上故障定位)
-- 项目方在规则文件里写 `ZLG-RULE-NO-LOG-EXC: critical`, dashboard 立刻按 critical 桶算, 不会因为 LLM 给 7 被划到 high 桶
+- 截图实例: LLM 给 `<PREFIX>-RULE-NO-LOG-EXC` (静默吞异常) 打了 7, 但业务上这是 **致命规则** (破坏线上故障定位)
+- 项目方在规则文件里写 `<PREFIX>-RULE-NO-LOG-EXC: critical`, dashboard 立刻按 critical 桶算, 不会因为 LLM 给 7 被划到 high 桶
 
 ### 规则文件格式
 
@@ -154,19 +154,19 @@ LLM 的 `importance` 数字不稳定:
 ```markdown
 # .agents/rules/severity.md
 
-ZLG-RULE-NO-LOG-EXC: critical
-ZLG-RULE-FORBIDDEN-COMMENT: critical
-ZLG-RULE-DOCSTRING-REQUIRED: low
-ZLG-RULE-TYPEHINTS: low
-ZLG-RULE-NO-BARE-PRINT: low
+<PREFIX>-RULE-NO-LOG-EXC: critical
+<PREFIX>-RULE-FORBIDDEN-COMMENT: critical
+<PREFIX>-RULE-DOCSTRING-REQUIRED: low
+<PREFIX>-RULE-TYPEHINTS: low
+<PREFIX>-RULE-NO-BARE-PRINT: low
 ```
 
 或 markdown bullet 形式:
 
 ```markdown
-- [critical] ZLG-RULE-NO-LOG-EXC
-- [critical] ZLG-RULE-FORBIDDEN-COMMENT
-- [low] ZLG-RULE-DOCSTRING-REQUIRED
+- [critical] <PREFIX>-RULE-NO-LOG-EXC
+- [critical] <PREFIX>-RULE-FORBIDDEN-COMMENT
+- [low] <PREFIX>-RULE-DOCSTRING-REQUIRED
 ```
 
 **配置入口** (`pr_agent/settings/configuration.toml`):
@@ -187,7 +187,7 @@ rule_files = [
 
 | 取值 | 含义 |
 |------|------|
-| `rule:ZLG-RULE-NO-LOG-EXC` | 命中规则文件 |
+| `rule:<PREFIX>-RULE-NO-LOG-EXC` | 命中规则文件 |
 | `pattern:NO-LOG-EXC` | 命中 config pattern |
 | `llm:7` | LLM importance 数字 |
 | `unknown` | 都没命中 |
@@ -199,14 +199,14 @@ rule_files = [
 ```
 $ curl /api/v1/telemetry/mrs/34/48/suggestions | head
 [
-  {"importance": 4, "severity": "critical", "severity_source": "pattern:NO-LOG-EXC",  "rule_keys": ["ZLG-RULE-NO-LOG-EXC", ...]},
-  {"importance": 8, "severity": "critical", "severity_source": "pattern:FORBIDDEN",   "rule_keys": ["ZLG-RULE-FORBIDDEN-COMMENT"]},
-  {"importance": 7, "severity": "critical", "severity_source": "pattern:NO-LOG-EXC",  "rule_keys": ["ZLG-RULE-NO-LOG-EXC"]},
+  {"importance": 4, "severity": "critical", "severity_source": "pattern:NO-LOG-EXC",  "rule_keys": ["<PREFIX>-RULE-NO-LOG-EXC", ...]},
+  {"importance": 8, "severity": "critical", "severity_source": "pattern:FORBIDDEN",   "rule_keys": ["<PREFIX>-RULE-FORBIDDEN-COMMENT"]},
+  {"importance": 7, "severity": "critical", "severity_source": "pattern:NO-LOG-EXC",  "rule_keys": ["<PREFIX>-RULE-NO-LOG-EXC"]},
   ...
 ]
 ```
 
-截图里的 `importance: 7` 配合 `ZLG-RULE-NO-LOG-EXC` 自动归到 critical, 不再被 LLM 错划到 high.
+截图里的 `importance: 7` 配合 `<PREFIX>-RULE-NO-LOG-EXC` 自动归到 critical, 不再被 LLM 错划到 high.
 
 ## HTTP API
 
@@ -253,8 +253,8 @@ Base path: `/api/v1/telemetry`. 所有 endpoint 返回 JSON. 默认端口是 pr-
 
 ```json
 [
-  {"rule_key": "ZLG-RULE-NO-LOG-EXC", "total": 3, "applied": 2, "dismissed": 0, "open": 1, "superseded": 0, "adoption_rate": 0.667},
-  {"rule_key": "ZLG-RULE-TYPEHINTS", "total": 1, "applied": 0, "dismissed": 0, "open": 1, "superseded": 0, "adoption_rate": 0.0}
+  {"rule_key": "<PREFIX>-RULE-NO-LOG-EXC", "total": 3, "applied": 2, "dismissed": 0, "open": 1, "superseded": 0, "adoption_rate": 0.667},
+  {"rule_key": "<PREFIX>-RULE-TYPEHINTS", "total": 1, "applied": 0, "dismissed": 0, "open": 1, "superseded": 0, "adoption_rate": 0.0}
 ]
 ```
 
@@ -299,7 +299,7 @@ Base path: `/api/v1/telemetry`. 所有 endpoint 返回 JSON. 默认端口是 pr-
 
 `GET /api/v1/telemetry/mrs/{p}/{m}/suggestions` 每条 suggestion 多两个字段:
 - `severity` (`critical` / `high` / `medium` / `low` / `unknown`)
-- `severity_source` (哪一层给的等级, 例 `rule:ZLG-RULE-NO-LOG-EXC` / `pattern:NO-LOG-EXC` / `llm:7` / `unknown`)
+- `severity_source` (哪一层给的等级, 例 `rule:<PREFIX>-RULE-NO-LOG-EXC` / `pattern:NO-LOG-EXC` / `llm:7` / `unknown`)
 
 `GET /api/v1/telemetry/mrs/{p}/{m}/stats` 多一个 `severity_counts` 字段 (各等级 suggestion 数).
 
@@ -346,7 +346,7 @@ Base path: `/api/v1/telemetry`. 所有 endpoint 返回 JSON. 默认端口是 pr-
     "mr_id": 977, "project_id": 7,
     "file": "...", "line": 45, "label": "general",
     "importance": 3, "score": 3,
-    "rule_keys": ["ZLG-RULE-NO-LOG-EXC"],
+    "rule_keys": ["<PREFIX>-RULE-NO-LOG-EXC"],
     "state": "dismissed",
     "posted_at": "2026-07-14T11:39:33+00:00",
     "dismissed_at": "2026-07-14T12:14:19+00:00",
@@ -370,7 +370,7 @@ Query 参数:
 ```json
 [
   {
-    "rule_key": "ZLG-RULE-NO-LOG-EXC",
+    "rule_key": "<PREFIX>-RULE-NO-LOG-EXC",
     "dismissal_count": 3,
     "reasons": [
       {"reason": "误报: 测试代码", "count": 2},
@@ -378,7 +378,7 @@ Query 参数:
     ]
   },
   {
-    "rule_key": "ZLG-RULE-FORBIDDEN-COMMENT",
+    "rule_key": "<PREFIX>-RULE-FORBIDDEN-COMMENT",
     "dismissal_count": 1,
     "reasons": [
       {"reason": "(no reason given)", "count": 1}
@@ -589,7 +589,7 @@ events.emit_suggestion(
     mr_id=1, project_id=34, file="x.py", line=10,
     label="possible issue", importance=5,
     one_sentence_summary="missing type hint",
-    rule_keys=["ZLG-RULE-TYPEHINTS"],
+    rule_keys=["<PREFIX>-RULE-TYPEHINTS"],
 )
 
 store = get_default_store()
@@ -601,11 +601,11 @@ print(store.severity_breakdown())
 from pr_agent.algo.repo_context import resolve_severity
 
 # Layer 1: 规则文件命中
-sev, src = resolve_severity(["ZLG-RULE-NO-LOG-EXC"], 7, rule_severity_map={"ZLG-RULE-NO-LOG-EXC": "critical"})
-print(sev, src)  # critical rule:ZLG-RULE-NO-LOG-EXC
+sev, src = resolve_severity(["<PREFIX>-RULE-NO-LOG-EXC"], 7, rule_severity_map={"<PREFIX>-RULE-NO-LOG-EXC": "critical"})
+print(sev, src)  # critical rule:<PREFIX>-RULE-NO-LOG-EXC
 
 # Layer 2: config pattern
-sev, src = resolve_severity(["ZLG-RULE-FOO-BAR"], 7, critical_patterns=["FOO-BAR"])
+sev, src = resolve_severity(["<PREFIX>-RULE-FOO-BAR"], 7, critical_patterns=["FOO-BAR"])
 print(sev, src)  # critical pattern:FOO-BAR
 
 # Layer 3: LLM 数字

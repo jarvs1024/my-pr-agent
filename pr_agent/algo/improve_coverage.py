@@ -12,14 +12,18 @@ from __future__ import annotations
 
 from typing import Iterable, Mapping
 
-from pr_agent.algo.repo_context import RULE_KEY_PATTERN
+from pr_agent.algo.repo_context import _rule_key_pattern
 
 
 def _scan_text(text: str) -> set[str]:
-    """Return every rule key found in ``text`` (de-duplicated)."""
+    """Return every rule key found in ``text`` (de-duplicated).
+
+    Uses the configurable prefix from ``config.rule_key_prefix`` so projects
+    with non-ZLG prefixes (e.g. ``SSD-RULE-*``) get correct coverage checks.
+    """
     if not text:
         return set()
-    return {m.group(1) for m in RULE_KEY_PATTERN.finditer(text)}
+    return {m.group(1) for m in _rule_key_pattern().finditer(text)}
 
 
 def _collect_cited_keys(suggestions: Iterable[Mapping] | None) -> set[str]:
