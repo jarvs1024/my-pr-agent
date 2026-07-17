@@ -668,20 +668,32 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                 # GitLab marks inline comments as DiffNote whether they start a new thread
                 # or reply to an existing one; the discriminator is that a reply carries a
                 # discussion_id pointing at the parent thread.
-                # Accept either the bare command ("/dismiss") or one with an optional
-                # trailing reason ("/dismiss 误报, 这里不需要异常处理"). Multi-line comments
-                # are supported: text after the first newline is treated as the reason
-                # body when the first line is exactly the bare command.
-                _body_stripped = body.strip()
-                _first_line, _sep, _rest = _body_stripped.partition('\n')
-                _cmd = _first_line.strip()
-                # Match the bare command, or the command followed by a space and a reason.
-                # The space guard keeps '/dismissed' (a different word) from matching.
-                if note_type == 'DiffNote' and (_cmd == '/dismiss' or _cmd.startswith('/dismiss ')):
-                    # Reason = the rest of the comment after the command (if any).
-                    # Both inline ("/dismiss foo") and newline-following ("/dismiss\nfoo") forms work.
-                    _inline = _first_line[len('/dismiss'):].strip()
-                    _reason = _inline or _rest.strip()
+                #
+                # Matching is intentionally permissive so the user can write any of:
+                #   /dismiss 误报
+                #   /dismiss 忽略原因测试
+                #   dismiss 忽略
+                #   ?dismiss 忽略
+                #   '/dismiss 忽略原因测试'   (note wrapped in curly/straight quotes by the UI)
+                #   dismiss忽略               (no separator)
+                # The rule: any DiffNote whose body contains the word `dismiss` (case-
+                # insensitive) is treated as a dismiss command. The reason is whatever
+                # non-empty text remains after stripping the trigger keyword and trivial
+                # wrappers around it (leading/trailing `/`, `?`, quotes, whitespace,
+                # and common CJK / ASCII punctuation).
+                _dismiss_match = re.search(r'(?<![A-Za-z0-9])dismiss(?![A-Za-z0-9])', body, flags=re.IGNORECASE)
+                if note_type == 'DiffNote' and _dismiss_match:
+                    # Split on the matched keyword and strip wrappers on both halves so
+                    # `/dismiss 忽略原因测试` → `忽略原因测试` and `dismiss忽略` → `忽略`.
+                    _dismiss_word = _dismiss_match.group(0)
+                    _before, _sep, _after = body.partition(_dismiss_word)
+                    _reason = (_before + _after).strip()
+                    _wrapper_strip = re.compile(
+                        r'^[\s/\\?"\'\u2018\u2019\u201c\u201d,;:。,;:!\-—_()]+'
+                        r'|'
+                        r'[\s/\\?"\'\u2018\u2019\u201c\u201d,;:。,;:!\-—_()]+$'
+                    )
+                    _reason = _wrapper_strip.sub('', _reason).strip()
                     discussion_id = obj_attrs.get('discussion_id')
                     if discussion_id:
                         provider = get_git_provider_with_context(pr_url=url)
