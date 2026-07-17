@@ -12,7 +12,7 @@ from pr_agent.algo.git_patch_processing import (
 from pr_agent.algo.language_handler import sort_files_by_main_languages
 from pr_agent.algo.token_handler import TokenHandler
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
-from pr_agent.algo.utils import ModelType, clip_tokens, get_max_tokens, get_model
+from pr_agent.algo.utils import ModelType, clip_tokens, get_max_tokens, get_model, format_exception_chain
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.git_provider import GitProvider
 from pr_agent.log import get_logger
@@ -335,7 +335,18 @@ async def retry_with_fallback_models(f: Callable, model_type: ModelType = ModelT
                 artifact={"error": e},
             )
             if i == len(all_models) - 1:  # If it's the last iteration
-                raise Exception(f"Failed to generate prediction with any model of {all_models}") from e
+                # Surface the full exception chain (root cause + every ``raise X from Y``)
+                # so telemetry / logs tell operators *why* the LLM call actually failed,
+                # not just "tried model A, B and gave up". The wrapper's message is kept
+                # so callers that match on its text still work; the cause text is appended
+                # after a newline.
+                import traceback as _tb
+                _chain = "".join(_tb.format_exception(type(e), e, e.__traceback__)).rstrip()
+                raise Exception(
+                    f"Failed to generate prediction with any model of {all_models}\n"
+                    f"Last error: {type(e).__name__}: {e}\n"
+                    f"Traceback:\n{_chain}"
+                ) from e
 
 
 def _get_all_models(model_type: ModelType = ModelType.REGULAR) -> List[str]:

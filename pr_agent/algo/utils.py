@@ -1615,3 +1615,36 @@ def format_todo_items(value: list[TodoItem] | TodoItem, git_provider, gfm_suppor
         else:
             markdown_text += f"- {format_todo_item(value, git_provider, gfm_supported)}\n"
     return markdown_text
+
+
+def format_exception_chain(exc: BaseException) -> str:
+    """Render a Python exception plus its full ``__cause__`` / ``__context__``
+    chain into a single human-readable string.
+
+    Plain ``f"{e}"`` only shows the *outer* message — when upstream code does
+    ``raise WrapperError("X") from inner_error``, the user / operator only sees
+    "X" and has to dig through the traceback to discover that the *real* cause
+    was, say, ``RateLimitError``. This helper joins every link in the chain so
+    logs and telemetry rows carry the full failure context:
+
+        RateLimitError: 您的账户已达到速率限制，请您控制请求频率
+          -> Exception: Failed to generate prediction with any model of ['openai/glm-4.7']
+
+    Output format: ``"Type1: msg1 -> Type2: msg2 -> ..."``
+    """
+    chain: list[str] = [f"{type(exc).__name__}: {exc}"]
+    current = exc
+    seen: set[int] = {id(exc)}
+    # ``__cause__`` is set by ``raise X from Y`` (explicit chaining).
+    # ``__context__`` is set automatically when an exception is raised while
+    # handling another (implicit chaining). We follow __cause__ first because
+    # that's the documented ``from e`` chain operators care about; fall back
+    # to __context__ if the explicit chain is missing.
+    while True:
+        nxt = current.__cause__ or current.__context__
+        if nxt is None or id(nxt) in seen:
+            break
+        seen.add(id(nxt))
+        chain.append(f"{type(nxt).__name__}: {nxt}")
+        current = nxt
+    return " -> ".join(chain)

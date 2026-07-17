@@ -22,7 +22,7 @@ from pr_agent.algo.pr_processing import (add_ai_metadata_to_diff_files,
                                          retry_with_fallback_models)
 from pr_agent.algo.token_handler import TokenHandler
 from pr_agent.algo.i18n import t
-from pr_agent.algo.utils import (ModelType, load_yaml, replace_code_tags,
+from pr_agent.algo.utils import (ModelType, load_yaml, replace_code_tags, format_exception_chain,
                                  show_relevant_configurations, get_max_tokens, clip_tokens, get_model)
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import (AzureDevopsProvider, GithubProvider,
@@ -247,19 +247,38 @@ class PRCodeSuggestions:
                 get_settings().data = {"artifact": pr_body}
                 return
         except Exception as e:
-            get_logger().error(f"Failed to generate code suggestions for PR, error: {e}",
+            get_logger().error("Failed to generate code suggestions for PR, error: %s", format_exception_chain(e),
                                artifact={"traceback": traceback.format_exc()})
             _run_status["name"] = "failed"
-            _run_status["error"] = str(e)
+            # Use the shared ``format_exception_chain`` helper so the captured
+            # error text in telemetry shows the *root* cause (rate limit, auth,
+            # timeout) and not just the outer wrapper like
+            # ``Failed to generate prediction with any model of [...]``.
+            _run_status["error"] = format_exception_chain(e)
             if get_settings().config.publish_output:
                 if self.progress_response:
                     self.git_provider.remove_comment(self.progress_response)
                 else:
                     try:
                         self.git_provider.remove_initial_comment()
-                        self.git_provider.publish_comment(t("pr_code_suggestions.failed", "Failed to generate code suggestions for PR"))
+                        _err_detail = _run_status.get("error") or ""
+                        # Keep the user-visible message short; if we have a captured
+                        # chain, render it in a collapsible <details> block so the
+                        # MR thread stays clean while the operator can still dig in.
+                        if _err_detail:
+                            _err_md = (
+                                t("pr_code_suggestions.failed",
+                                  "Failed to generate code suggestions for PR")
+                                + "\n\n<details><summary>错误详情</summary>\n\n```\n"
+                                + _err_detail[:1500]
+                                + "\n```\n\n</details>"
+                            )
+                        else:
+                            _err_md = t("pr_code_suggestions.failed",
+                                        "Failed to generate code suggestions for PR")
+                        self.git_provider.publish_comment(_err_md)
                     except Exception as e:
-                        get_logger().exception(f"Failed to update persistent review, error: {e}")
+                        get_logger().exception("Failed to update persistent review, error: %s", format_exception_chain(e))
         finally:
             if _run_id:
                 try:
@@ -347,7 +366,7 @@ class PRCodeSuggestions:
                     str(cs.get("suggestion_content") or "") + " " + str(cs.get("one_sentence_summary") or "")
                 )})
         except Exception as e:
-            get_logger().error(f"Failed to publish dual publishing suggestions, error: {e}")
+            get_logger().error("Failed to publish dual publishing suggestions, error: %s", format_exception_chain(e))
 
     @staticmethod
     def publish_persistent_comment_with_history(git_provider: GitProvider,
@@ -451,7 +470,17 @@ class PRCodeSuggestions:
                             git_provider.edit_comment(comment, pr_comment_updated)
                         return comment
             except Exception as e:
-                get_logger().exception(f"Failed to update persistent review, error: {e}")
+                # Surface the full __cause__ chain so the log shows whether the
+                # failure is a network timeout, GitLab 5xx, auth, etc. — the bare
+                # "Failed to update persistent review" message is too generic.
+                _err = e
+                _chain = [f"{type(_err).__name__}: {_err}"]
+                while _err.__cause__ is not None:
+                    _err = _err.__cause__
+                    _chain.append(f"{type(_err).__name__}: {_err}")
+                get_logger().exception(
+                    f"Failed to update persistent review, error: {' -> '.join(_chain)}"
+                )
                 pass
 
         # if we are here, we did not find a previous comment to update
@@ -559,7 +588,7 @@ class PRCodeSuggestions:
                             get_logger().info(f"PR-Agent suggestions statistics",
                                               statistics=suggestion_statistics_dict, analytics=True)
                     except Exception as e:
-                        get_logger().error(f"Failed to log suggestion statistics, error: {e}")
+                        get_logger().error("Failed to log suggestion statistics, error: %s", format_exception_chain(e))
                         pass
 
                 except Exception as e:  #
@@ -581,7 +610,7 @@ class PRCodeSuggestions:
                         else:
                             suggestion['existing_code'] = ""
                 except Exception as e:
-                    get_logger().error(f"Error processing suggestion {i + 1}, error: {e}")
+                    get_logger().error("Error processing suggestion {i + 1}, error: %s", format_exception_chain(e))
 
     @staticmethod
     def _truncate_if_needed(suggestion):
@@ -651,7 +680,7 @@ class PRCodeSuggestions:
                     get_logger().info(
                         f"Skipping suggestion {i + 1}, because it does not contain 'existing_code' or 'improved_code': {suggestion}")
             except Exception as e:
-                get_logger().error(f"Error processing suggestion {i + 1}: {suggestion}, error: {e}")
+                get_logger().error("Error processing suggestion {i + 1}: {suggestion}, error: %s", format_exception_chain(e))
         data['code_suggestions'] = suggestion_list
 
         return data
@@ -741,7 +770,7 @@ class PRCodeSuggestions:
                     note_id=cs.get("note_id"),
                 )
         except Exception as e:
-            get_logger().warning(f"telemetry emit on publish_code_suggestions failed: {e}")
+            get_logger().warning("telemetry emit on publish_code_suggestions failed: %s", format_exception_chain(e))
         if not is_successful:
             get_logger().info("Failed to publish code suggestions, trying to publish each suggestion separately")
             for code_suggestion in code_suggestions:
@@ -783,7 +812,7 @@ class PRCodeSuggestions:
                     indent_char = '\t' if original_initial_line.startswith('\t') else ' '
                     new_code_snippet = textwrap.indent(new_code_snippet, delta_spaces * indent_char).rstrip('\n')
         except Exception as e:
-            get_logger().error(f"Error when dedenting code snippet for file {relevant_file}, error: {e}")
+            get_logger().error("Error when dedenting code snippet for file {relevant_file}, error: %s", format_exception_chain(e))
 
         return new_code_snippet
 
@@ -833,7 +862,7 @@ class PRCodeSuggestions:
                 self.patches_diff_list_no_line_numbers.append('\n'.join(patches_diff_lines))
             return self.patches_diff_list_no_line_numbers
         except Exception as e:
-            get_logger().error(f"Error removing line numbers from patches_diff_list, error: {e}")
+            get_logger().error("Error removing line numbers from patches_diff_list, error: %s", format_exception_chain(e))
             return patches_diff_list
 
     async def prepare_prediction_main(self, model: str) -> dict:
@@ -894,7 +923,7 @@ class PRCodeSuggestions:
                                     f"Removing suggestions {i} from call {j}, because score is {score}, and score_threshold is {score_threshold}",
                                     artifact=prediction)
                         except Exception as e:
-                            get_logger().error(f"Error getting PR diff for suggestion {i} in call {j}, error: {e}",
+                            get_logger().error("Error getting PR diff for suggestion {i} in call {j}, error: %s", format_exception_chain(e),
                                                artifact={"prediction": prediction})
             self.data = data
         else:
@@ -1055,7 +1084,7 @@ class PRCodeSuggestions:
             pr_body += """</tr></tbody></table>"""
             return pr_body
         except Exception as e:
-            get_logger().info(f"Failed to publish summarized code suggestions, error: {e}")
+            get_logger().info("Failed to publish summarized code suggestions, error: %s", format_exception_chain(e))
             return ""
 
     def get_score_str(self, score: int) -> str:
@@ -1108,6 +1137,6 @@ class PRCodeSuggestions:
                                                                                                 temperature=get_settings().config.temperature,
                                                                                                 user=user_prompt_reflect)
         except Exception as e:
-            get_logger().info(f"Could not reflect on suggestions, error: {e}")
+            get_logger().info("Could not reflect on suggestions, error: %s", format_exception_chain(e))
             return ""
         return response_reflect
