@@ -261,22 +261,14 @@ class PRCodeSuggestions:
                 else:
                     try:
                         self.git_provider.remove_initial_comment()
-                        _err_detail = _run_status.get("error") or ""
-                        # Keep the user-visible message short; if we have a captured
-                        # chain, render it in a collapsible <details> block so the
-                        # MR thread stays clean while the operator can still dig in.
-                        if _err_detail:
-                            _err_md = (
-                                t("pr_code_suggestions.failed",
-                                  "Failed to generate code suggestions for PR")
-                                + "\n\n<details><summary>错误详情</summary>\n\n```\n"
-                                + _err_detail[:1500]
-                                + "\n```\n\n</details>"
-                            )
-                        else:
-                            _err_md = t("pr_code_suggestions.failed",
-                                        "Failed to generate code suggestions for PR")
-                        self.git_provider.publish_comment(_err_md)
+                        # Flat notification only — the full error chain is persisted
+                        # to telemetry.review_runs.error (data collection) and shown
+                        # in the dashboard. MR comments stay short so the thread isn't
+                        # polluted with internal stack traces.
+                        self.git_provider.publish_comment(
+                            t("pr_code_suggestions.failed",
+                              "Failed to generate code suggestions for PR")
+                        )
                     except Exception as e:
                         get_logger().exception("Failed to update persistent review, error: %s", format_exception_chain(e))
         finally:
