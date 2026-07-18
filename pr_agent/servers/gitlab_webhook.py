@@ -323,6 +323,8 @@ def _handle_apply_commit(webhook_data: dict) -> None:
             except Exception as e:
                 get_logger().warning(f"telemetry.on_apply_commit fallback: {e}")
         actor = ev.get("actor") or ""
+        _applied_total = 0
+        _applied_files: set[str] = set()
         for file in files:
             try:
                 updated = telemetry_events.mark_suggestions_applied(
@@ -336,8 +338,64 @@ def _handle_apply_commit(webhook_data: dict) -> None:
                     get_logger().info(
                         f"telemetry.on_apply_commit: marked {len(updated)} suggestion(s) applied on {file}: {updated[:3]}"
                     )
+                    _applied_total += len(updated)
+                    _applied_files.add(file)
             except Exception as e:
                 get_logger().warning(f"telemetry.on_apply_commit per-file: {e}")
+
+        # Post-apply user feedback: previously the bot stayed silent after
+        # marking telemetry rows, so users couldn't tell whether their click
+        # was recognized, whether the suggestion moved to ``applied``, or
+        # whether /improve would re-fire on its own. We now publish a short
+        # status note that closes the loop and explicitly states we did NOT
+        # re-run /improve. Operators that want a re-review can either wire
+        # ``gitlab.push_commands`` (auto re-run) or type ``/improve`` in the
+        # MR thread.
+        if _applied_total:
+            try:
+                _files_sorted = ", ".join(sorted(_applied_files)) or "(unknown)"
+                # Distinguish three end-states so the user does not have to
+                # guess whether more suggestions are still pending:
+                #   * still open  -> tell them how many are pending
+                #   * all closed  -> state explicitly that no new suggestions remain
+                _remaining_open = 0
+                try:
+                    _store = telemetry_events.get_default_store()
+                    _all_for_mr = _store.list_suggestions(
+                        mr_id=int(mr_id), project_id=int(project_id)
+                    )
+                    _remaining_open = sum(
+                        1 for s in _all_for_mr if (s.get("state") or "") == "open"
+                    )
+                except Exception as _e:
+                    get_logger().debug(f"apply-commit remaining-open lookup failed: {_e}")
+                if _remaining_open:
+                    _extra = (
+                        f"\n\n📋 仍剩 **{_remaining_open}** 条建议处于 open 状态, "
+                        "等待你 Apply 或 `/dismiss` 关闭."
+                    )
+                else:
+                    _extra = (
+                        "\n\n✅ 现存所有 review-bot 建议已全部 closed, **当前无可补充建议**. "
+                        "如需重新检视最新 diff, 请手动输入 `/improve`."
+                    )
+                _status = (
+                    "✅ 已自动记录 {n} 条建议为 applied (commit {sha}).\n\n"
+                    "本次 commit 是 GitLab 的「Apply suggestion」操作, "
+                    "机器人**不会**自动重跑 `/improve` — 当前 diff 与 review-bot 的提示已同步."
+                ).format(n=_applied_total, sha=sha[:10])
+                _status += f"\n\n涉及文件: {_files_sorted}"
+                _status += _extra
+                try:
+                    provider.publish_comment(_status)
+                    get_logger().info(
+                        f"apply-commit status comment posted: {sha[:10]} count={_applied_total}"
+                        f" remaining_open={_remaining_open}"
+                    )
+                except Exception as e:
+                    get_logger().warning(f"apply-commit status publish failed: {e}")
+            except Exception as e:
+                get_logger().warning(f"apply-commit status build failed: {e}")
     except Exception as e:
         get_logger().warning(f"telemetry.on_apply_commit outer: {e}")
 
