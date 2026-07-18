@@ -34,6 +34,261 @@ from pr_agent.servers.help import HelpMessage
 from pr_agent.tools.pr_description import insert_br_after_x_chars
 
 
+
+# ---------------------------------------------------------------------------
+# AGENTS.md / project-rule enforcement (post-LLM coverage)
+# ---------------------------------------------------------------------------
+#
+# The LLM is asked (via extra_instructions) to emit one code_suggestions
+# entry per AGENTS.md rule violation it detects in the diff. In practice the
+# LLM often under-reports: it picks a single representative function for
+# a missing-docstring sweep and skips the other 20.
+#
+# To guarantee coverage without coupling the detector to any specific rule
+# key (e.g. SSD-RULE-DOCSTRING-REQUIRED or ZLG-RULE-TYPEHINTS), the
+# enforcement layer works in two strictly-separated layers:
+#
+#   1. Detection (this file) emits language-level findings:
+#         {"kind": "missing_docstring" | "missing_typehint", ...}
+#      These findings are entirely independent of how the project names
+#      its rules. The detector does not know what <PREFIX>-RULE-XXX means.
+#
+#   2. Citation happens later, in the LLM self-reflection step. The LLM
+#      has the full AGENTS.md text as repo_context, so it can map
+#      missing_docstring -> the project own rule key. If no rule key
+#      applies, the LLM falls back to a generic description.
+#
+# This two-layer design means a project can rename SSD-RULE-DOCSTRING-* to
+# XYZ-RULE-DOC-*, or add a new rule like FROBOZZ-NO-LOG: enforcement
+# still emits the right improved_code skeleton, and the LLM picks up the
+# new rule key from AGENTS.md without code changes.
+# ---------------------------------------------------------------------------
+
+_RULE_KEY_PLACEHOLDER = "<AGENTS_MD_RULE_KEY>"
+
+
+def _enforce_scan_diff_for_missing_def_attrs(diff_text):
+    """Parse a unified diff and emit findings for def lines that lack
+    a docstring or type hints. Pure language-level detection.
+    """
+    findings = []
+    current_file = None
+    plus_line_offset = None
+
+    for line in diff_text.split("\n"):
+        m_file = re.match(r"^\+\+\+ b/(.+)$", line)
+        if m_file:
+            current_file = m_file.group(1)
+            continue
+        m_hunk = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+        if m_hunk:
+            plus_line_offset = int(m_hunk.group(1))
+            continue
+        if current_file is None or plus_line_offset is None:
+            continue
+        if not line.startswith("+"):
+            continue
+        raw = line[1:]
+        m_def = re.match(
+            r"^(\s*)(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*(->\s*[^:]+)?\s*:",
+            raw,
+        )
+        if m_def:
+            params = m_def.group(3)
+            ret = m_def.group(4)
+            param_missing = False
+            for p in [x.strip() for x in params.split(",") if x.strip()]:
+                if p in ("self", "cls"):
+                    continue
+                if p.startswith("**"):
+                    p = p[2:]
+                elif p.startswith("*"):
+                    p = p[1:]
+                if "=" in p:
+                    p = p.split("=", 1)[0].strip()
+                if ":" not in p:
+                    param_missing = True
+                    break
+            findings.append({
+                "file": current_file,
+                "line": plus_line_offset,
+                "def": m_def.group(2),
+                "missing_docstring": True,
+                "missing_typehint": param_missing or (ret is None),
+            })
+        plus_line_offset += 1
+    return findings
+
+
+def _enforce_enrich_docstring_findings(diff_text, findings):
+    """For each finding whose missing_docstring is still True, look at
+    the very next added line in the same file. If it begins with triple
+    quotes, the function has a docstring; mark as covered.
+    """
+    lines = diff_text.split("\n")
+    plus_line_offset = None
+    by_line = {(f['file'], f['line']): f for f in findings}
+
+    for idx, line in enumerate(lines):
+        m_hunk = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+        if m_hunk:
+            plus_line_offset = int(m_hunk.group(1))
+            continue
+        if plus_line_offset is None:
+            continue
+        if not line.startswith("+"):
+            continue
+        raw = line[1:]
+        current_file = _enforce_current_file(lines, idx)
+        if current_file is None:
+            plus_line_offset += 1
+            continue
+        if re.match(r"^\s*(?:async\s+)?def\s+", raw):
+            target = by_line.get((current_file, plus_line_offset))
+            if target is not None:
+                for next_line in lines[idx + 1: idx + 6]:
+                    if not next_line.startswith("+"):
+                        continue
+                    nr = next_line[1:]
+                    if nr.strip() == "":
+                        continue
+                    stripped = nr.lstrip()
+                    if stripped.startswith('"""') or stripped.startswith("'''"):
+                        target['missing_docstring'] = False
+                    break
+        plus_line_offset += 1
+    return findings
+
+
+def _enforce_current_file(lines, idx):
+    """Walk backwards from idx to find the most recent ``+++ b/...`` header."""
+    for j in range(idx, -1, -1):
+        m = re.match(r"^\+\+\+ b/(.+)$", lines[j])
+        if m:
+            return m.group(1)
+    return None
+
+
+def _enforce_skeleton_for_kind(kind):
+    if kind == "missing_docstring":
+        existing = "def example(x):\n    return x"
+        improved = "def example(x):\n    \"\"\"TODO: describe the function.\"\"\"\n    return x"
+        summary = "添加 docstring"
+        return existing, improved, summary
+    if kind == "missing_typehint":
+        existing = "def example(x):\n    return x"
+        improved = "def example(x: int) -> int:\n    return x"
+        summary = "添加参数与返回值类型注解"
+        return existing, improved, summary
+    return '', '', ''
+
+
+def _enforce_make_skeleton_suggestion(finding, kind):
+    """Build a skeleton suggestion for a specific violation kind.
+
+    ``kind`` must be one of ``"missing_docstring"`` or ``"missing_typehint"``.
+    Callers pre-decide which kind to emit (one skeleton per kind per finding).
+    """
+    if kind not in ("missing_docstring", "missing_typehint"):
+        return None
+    existing, improved, summary = _enforce_skeleton_for_kind(kind)
+    file_path = finding["file"]
+    line_no = finding["line"]
+    def_name = finding["def"]
+    content_map = {
+        "missing_docstring": (
+            f'建议为函数 `{def_name}` 添加 docstring. '
+            f'违反规则键 {_RULE_KEY_PLACEHOLDER} (从 AGENTS.md 引用). '
+            '若 AGENTS.md 没有对应规则键, 删除占位符即可.'
+        ),
+        "missing_typehint": (
+            f'建议为函数 `{def_name}` 添加参数与返回值类型注解. '
+            f'违反规则键 {_RULE_KEY_PLACEHOLDER} (从 AGENTS.md 引用). '
+            '若 AGENTS.md 没有对应规则键, 删除占位符即可.'
+        ),
+    }
+    # content_map values are 3-tuples of str fragments — join them into one
+    # string so callers can .lower() / .rstrip() the suggestion_content.
+    content_map = {k: "".join(v) for k, v in content_map.items()}
+    return {
+        "relevant_file": file_path,
+        "relevant_lines_start": line_no,
+        "relevant_lines_end": line_no,
+        "existing_code": existing,
+        "improved_code": improved,
+        "suggestion_content": content_map[kind],
+        "one_sentence_summary": summary,
+        "label": "possible issue",
+        "score": 7,
+        "score_why": "",
+        "_enforce_kind": kind,
+        "_enforce_target": {"file": file_path, "line": line_no, "def": finding["def"]},
+    }
+
+
+def _enforce_augment_suggestions(data, diff_text, rule_keys):
+    # Always stamp the rule_keys list onto data so the self-reflection step can
+    # see them, even when there is no diff to scan.
+    data["_repo_rule_keys"] = rule_keys or []
+    if not diff_text:
+        return data
+    findings = _enforce_scan_diff_for_missing_def_attrs(diff_text)
+    findings = _enforce_enrich_docstring_findings(diff_text, findings)
+    existing = data.get("code_suggestions") or []
+    covered = set()
+    for s in existing:
+        file_path = s.get("relevant_file") or ""
+        line = s.get("relevant_lines_start")
+        content = (s.get("suggestion_content") or "").lower()
+        if file_path and line:
+            if "docstring" in content:
+                covered.add((file_path, line, "missing_docstring"))
+            if any(k in content for k in ("type hint", "typehint", "类型注解", "类型注释")):
+                covered.add((file_path, line, "missing_typehint"))
+    for finding in findings:
+        for kind in ("missing_docstring", "missing_typehint"):
+            if not finding.get(kind):
+                continue
+            key = (finding["file"], finding["line"], kind)
+            if key in covered:
+                continue
+            skel = _enforce_make_skeleton_suggestion(finding, kind)
+            if skel is not None:
+                existing.append(skel)
+                covered.add(key)
+    data["code_suggestions"] = existing
+    # Upgrade LLM-emitted entries that already cover a kind but forgot to cite
+    # a rule key. This is what fills in the <AGENTS_MD_RULE_KEY> placeholder
+    # without touching their existing_code / improved_code.
+    _enforce_inject_placeholders_into_existing(data)
+    return data
+
+
+def _enforce_inject_placeholders_into_existing(data):
+    existing = data.get("code_suggestions") or []
+    seen_kind_file = set()
+    for s in existing:
+        if s.get("_enforce_kind"):
+            continue
+        content = s.get("suggestion_content") or ""
+        file_path = s.get("relevant_file") or ""
+        for kind, marker in (
+            ("missing_docstring", "docstring"),
+            ("missing_typehint", "类型注解"),
+        ):
+            if marker.lower() in content.lower() and _RULE_KEY_PLACEHOLDER not in content:
+                key = (kind, file_path)
+                if key in seen_kind_file:
+                    continue
+                seen_kind_file.add(key)
+                suffix = (
+                    f' 违反规则键 {_RULE_KEY_PLACEHOLDER} (从 AGENTS.md 引用). '
+                    '若 AGENTS.md 没有对应规则键, 删除占位符即可.'
+                )
+                s["suggestion_content"] = content.rstrip() + suffix
+                s["_enforce_kind"] = kind
+                break
+    return data
 class PRCodeSuggestions:
     def __init__(self, pr_url: str, cli_mode=False, args: list = None,
                  ai_handler: partial[BaseAiHandler,] = LiteLLMAIHandler):
@@ -530,7 +785,27 @@ class PRCodeSuggestions:
         # load suggestions from the AI response
         data = self._prepare_pr_code_suggestions(response)
 
-        # self-reflect on suggestions (mandatory, since line numbers are generated now here)
+        # AGENTS.md / project-rule enforcement: append skeleton suggestions for
+        # language-level violations (missing docstring, missing type hints) that
+        # the LLM did not cover. The skeleton carries a <AGENTS_MD_RULE_KEY>
+        # placeholder; enforcement emits it WITHOUT going through the
+        # self-reflection step (which would otherwise give it score 0 because
+        # the upstream reflect prompt explicitly says "assign 0 to suggestions
+        # adding docstring / type hints"). We split the list, reflect only on
+        # LLM-emitted items, then re-merge.
+        try:
+            rule_keys = self._get_agents_md_rule_keys()
+            _enforce_augment_suggestions(data, patches_diff, rule_keys)
+        except Exception as _enforce_err:
+            get_logger().warning(f"enforce coverage step failed: {format_exception_chain(_enforce_err)}")
+
+        # Separate LLM suggestions (which need reflect-scoring) from enforce
+        # skeletons (which are pure language-level fixes and would be wrongly
+        # zeroed by the reflect prompt). Both are kept in the final list.
+        llm_suggestions = [s for s in data["code_suggestions"] if not s.get("_enforce_kind")]
+        enforce_suggestions = [s for s in data["code_suggestions"] if s.get("_enforce_kind")]
+
+        # self-reflect on LLM suggestions only (mandatory, since line numbers are generated now here)
         model_reflect_with_reasoning = get_model('model_reasoning')
         fallbacks = get_settings().config.fallback_models
         if model_reflect_with_reasoning == get_settings().config.model and model != get_settings().config.model and fallbacks and model == \
@@ -538,16 +813,32 @@ class PRCodeSuggestions:
             # we are using a fallback model (should not happen on regular conditions)
             get_logger().warning(f"Using the same model for self-reflection as the one used for suggestions")
             model_reflect_with_reasoning = model
-        response_reflect = await self.self_reflect_on_suggestions(data["code_suggestions"],
+        response_reflect = await self.self_reflect_on_suggestions(llm_suggestions,
                                                                   patches_diff, model=model_reflect_with_reasoning)
+        # Wrap reflect analysis around a temporary dict that contains only the
+        # LLM suggestions, then merge back with enforce skeletons.
+        tmp_data = {"code_suggestions": llm_suggestions}
         if response_reflect:
-            await self.analyze_self_reflection_response(data, response_reflect)
+            await self.analyze_self_reflection_response(tmp_data, response_reflect)
         else:
             # get_logger().error(f"Could not self-reflect on suggestions. using default score 7")
-            for i, suggestion in enumerate(data["code_suggestions"]):
+            for i, suggestion in enumerate(llm_suggestions):
                 suggestion["score"] = 7
                 suggestion["score_why"] = ""
 
+        # Strip internal enforce metadata before publishing. _enforce_kind and
+        # _enforce_target are scaffold-only and should never leak to GitLab
+        # comments or telemetry.
+        for s in enforce_suggestions:
+            s.pop("_enforce_kind", None)
+            s.pop("_enforce_target", None)
+            # Enforce skeletons get a fixed mid-range score so they survive the
+            # score_threshold filter in the publishing step without crowding out
+            # the higher-impact LLM suggestions.
+            s.setdefault("score", 6)
+            s.setdefault("score_why", "enforced by language-level coverage check")
+
+        data["code_suggestions"] = llm_suggestions + enforce_suggestions
         return data
 
     async def analyze_self_reflection_response(self, data, response_reflect):
@@ -615,6 +906,28 @@ class PRCodeSuggestions:
                 suggestion['improved_code'] = suggestion['improved_code'][:max_code_suggestion_length]
                 suggestion['improved_code'] += f"\n{suggestion_truncation_message}"
         return suggestion
+
+    def _get_agents_md_rule_keys(self) -> list:
+        """Return the list of AGENTS.md rule keys extracted from the most
+        recent ``repo_context`` build for this MR.
+
+        Returns an empty list when AGENTS.md is not configured, when fetching
+        failed, or when no rule keys could be extracted — the caller treats
+        an empty list as "no enforcement hint available" and the enforcement
+        step still produces language-level skeletons, just without the rule
+        citation upgrade downstream.
+        """
+        try:
+            ctx = build_repo_context(self.git_provider) or ""
+        except Exception as e:
+            get_logger().debug(f"repo_context fetch failed during enforce: {e}")
+            ctx = ""
+        try:
+            keys = extract_rule_keys(ctx)
+            return list(keys or [])
+        except Exception as e:
+            get_logger().debug(f"rule-key extraction failed: {e}")
+            return []
 
     def _prepare_pr_code_suggestions(self, predictions: Optional[str]) -> Dict:
         if not predictions:
