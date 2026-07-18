@@ -676,12 +676,26 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                 #   ?dismiss 忽略
                 #   '/dismiss 忽略原因测试'   (note wrapped in curly/straight quotes by the UI)
                 #   dismiss忽略               (no separator)
-                # The rule: any DiffNote whose body contains the word `dismiss` (case-
-                # insensitive) is treated as a dismiss command. The reason is whatever
-                # non-empty text remains after stripping the trigger keyword and trivial
-                # wrappers around it (leading/trailing `/`, `?`, quotes, whitespace,
-                # and common CJK / ASCII punctuation).
-                _dismiss_match = re.search(r'(?<![A-Za-z0-9])dismiss(?![A-Za-z0-9])', body, flags=re.IGNORECASE)
+                #
+                # IMPORTANT: the keyword MUST be at the start of the body (after
+                # stripping trivial wrappers). Earlier this only checked whether the
+                # substring appeared anywhere in the body, which caused review-bot's
+                # own suggestion bodies to be matched — they contain the literal
+                # ``/dismiss 忽略原因`` instruction inside the help footer. GitLab
+                # pushes a webhook event for the bot's own note, so the bot ended
+                # up resolving its own suggestion right after publishing it. The
+                # first-line anchor below stops that self-tripping loop while still
+                # accepting every command form listed above.
+                _body_stripped = body.strip()
+                _wrapper_strip_re = re.compile(
+                    r"^[\\\s/\?" + "‘’“”" + r"\'\",;:。,;:!\-—_()]+"
+                )
+                _first_line = _wrapper_strip_re.sub('', _body_stripped)
+                _dismiss_match = re.match(
+                    r'(?<![A-Za-z0-9])dismiss(?![A-Za-z0-9])',
+                    _first_line,
+                    flags=re.IGNORECASE,
+                )
                 if note_type == 'DiffNote' and _dismiss_match:
                     # Split on the matched keyword and strip wrappers on both halves so
                     # `/dismiss 忽略原因测试` → `忽略原因测试` and `dismiss忽略` → `忽略`.
