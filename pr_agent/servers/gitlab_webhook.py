@@ -592,7 +592,6 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
         try:
             if _resolve_apply_event(data) is not None:
                 _handle_apply_commit(data)
-                get_logger().info("DEBUG: entered apply-pipeline path")
                 # Also keep the MR activity row in telemetry consistent
                 # with the ``updated`` state the dispatcher would have
                 # emitted had we let control fall through.
