@@ -389,6 +389,33 @@ def _enforce_augment_suggestions(data, diff_text, rule_keys):
     return data
 
 
+def _diff_for_coverage_evidence(self) -> str:
+    """Return a unified diff text suitable for the AGENTS.md coverage scanner.
+
+    Prefers ``self.patches_diff`` (already produced by ``_prepare_prediction``
+    with line numbers preserved). Falls back to concatenating
+    ``FilePatchInfo.patch`` from the active git provider so the
+    post-LLM / no-suggestions paths still have evidence to surface.
+    """
+    diff = getattr(self, "patches_diff", None)
+    if isinstance(diff, str) and diff.strip():
+        return diff
+    try:
+        gp = getattr(self, "git_provider", None)
+        if gp is None:
+            return ""
+        diff_files = getattr(gp, "diff_files", None) or gp.get_diff_files()
+    except Exception:
+        return ""
+    pieces: list[str] = []
+    for f in diff_files or []:
+        patch = getattr(f, "patch", None)
+        if patch:
+            pieces.append(patch)
+    return "\n".join(pieces)
+
+
+
 def _enforce_inject_placeholders_into_existing(data):
     existing = data.get("code_suggestions") or []
     seen_kind_file = set()
@@ -572,7 +599,10 @@ class PRCodeSuggestions:
                     _required_rules = self.vars.get("agents_md_rules") or []
                     _uncovered = compute_uncovered_rules(_required_rules, data.get("code_suggestions") or [])
                     _total_required = len(self.vars.get("agents_md_rules") or [])
-                    pr_body += render_uncovered_details(_uncovered, total_required=_total_required)
+                    pr_body += render_uncovered_details(
+                        _uncovered, total_required=_total_required,
+                        diff_text=_diff_for_coverage_evidence(self),
+                    )
 
                     # Output the relevant configurations if enabled
                     if get_settings().get('config', {}).get('output_relevant_configurations', False):
@@ -618,6 +648,7 @@ class PRCodeSuggestions:
                         _inline_total = len(self.vars.get("agents_md_rules") or [])
                         _inline_details = render_uncovered_details(
                             _inline_uncovered, total_required=_inline_total,
+                            diff_text=_diff_for_coverage_evidence(self),
                         )
                         if _inline_details:
                             self.git_provider.publish_comment(_inline_details)
@@ -704,7 +735,10 @@ class PRCodeSuggestions:
         # the "LLM produced no suggestions" branch which has no inline markers to inspect.
         _uncovered = compute_uncovered_rules(self.vars.get("agents_md_rules") or [], [])
         _total_required = len(self.vars.get("agents_md_rules") or [])
-        pr_body += render_uncovered_details(_uncovered, total_required=_total_required)
+        pr_body += render_uncovered_details(
+            _uncovered, total_required=_total_required,
+            diff_text=_diff_for_coverage_evidence(self),
+        )
         if (get_settings().config.publish_output and
                 get_settings().pr_code_suggestions.get('publish_output_no_suggestions', True)):
             get_logger().warning('No code suggestions found for the PR.')
