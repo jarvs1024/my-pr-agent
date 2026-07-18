@@ -67,6 +67,47 @@ from pr_agent.tools.pr_description import insert_br_after_x_chars
 _RULE_KEY_PLACEHOLDER = "<AGENTS_MD_RULE_KEY>"
 
 
+def _recover_lines_start_end_from_existing_code(d, git_provider):
+    """Best-effort line-number recovery for a suggestion that the LLM emitted
+    without ``relevant_lines_start`` / ``relevant_lines_end`` keys.
+
+    GitLab's DiffNote requires an absolute file line number to anchor the
+    inline comment. When the LLM drops those keys, fall back to:
+      1. Match the suggestion's ``existing_code`` against ``diff_files[i].head_file``
+         line-by-line; pick the first hit.
+      2. If that fails (e.g. suggestion is for a function added in this MR and
+         the file didn't exist before), use the ``patch`` field from the diff
+         to compute the line offset of the ``@@`` hunk that contains the
+         function name.
+
+    Returns ``(start, end)`` or ``(None, None)`` if no recovery is possible.
+    """
+    try:
+        relevant_file = (d.get("relevant_file") or "").strip()
+        existing_code = (d.get("existing_code") or "").strip()
+        if not relevant_file or not existing_code:
+            return None, None
+
+        # Walk diff_files; find the file and the matching line in head_file.
+        diff_files = getattr(git_provider, "diff_files", None) or git_provider.get_diff_files()
+        for f in diff_files:
+            if f.filename.strip() != relevant_file:
+                continue
+            head_lines = (f.head_file or "").splitlines()
+            needle = existing_code.splitlines()[0].strip() if existing_code else ""
+            if not needle:
+                return None, None
+            for idx, hl in enumerate(head_lines, start=1):
+                if needle in hl.strip():
+                    return idx, idx
+            return None, None
+    except Exception as e:
+        get_logger().debug(f"_recover_lines_start_end_from_existing_code failed: {e}")
+    return None, None
+
+
+
+
 def _enforce_scan_diff_for_missing_def_attrs(diff_text):
     """Parse a unified diff and emit findings for def lines that lack
     a docstring or type hints. Pure language-level detection.
@@ -1090,6 +1131,19 @@ class PRCodeSuggestions:
                 if get_settings().config.verbosity_level >= 2:
                     get_logger().info(f"suggestion: {d}")
                 relevant_file = d['relevant_file'].strip()
+                # Defensive: LLM sometimes drops relevant_lines_start/end entirely.
+                # Self-reflection is supposed to backfill them; when it doesn't,
+                # try to recover from existing_code, otherwise emit the
+                # suggestion as a regular comment (skip the inline DiffNote).
+                if 'relevant_lines_start' not in d or 'relevant_lines_end' not in d:
+                    rec_start, rec_end = _recover_lines_start_end_from_existing_code(d, self.git_provider)
+                    if rec_start is None:
+                        get_logger().warning(
+                            f"Skipping suggestion without line numbers and no recovery (file={relevant_file!r} keys={list(d.keys())})"
+                        )
+                        continue
+                    d['relevant_lines_start'] = rec_start
+                    d['relevant_lines_end'] = rec_end
                 relevant_lines_start = int(d['relevant_lines_start'])  # absolute position
                 relevant_lines_end = int(d['relevant_lines_end'])
                 content = d['suggestion_content'].rstrip()

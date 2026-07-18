@@ -701,3 +701,89 @@ def test_skeleton_does_not_inject_None_for_missing_return_annotation():
     # Header line keeps its trailing colon even when body lines are
     # spliced in below; the resulting snippet's first line is the def header.
     assert skel["existing_code"].splitlines()[0].endswith("):")
+
+
+# ---------------------------------------------------------------------------
+# Publish-stage recovery: LLM drops relevant_lines_start/end entirely
+# ---------------------------------------------------------------------------
+
+def test_recover_lines_from_existing_code_first_line_match():
+    """When the LLM forgets to emit relevant_lines_start/end, the publish
+    stage should still be able to anchor the suggestion via the first line
+    of ``existing_code`` against the file's head_file.
+    """
+    from pr_agent.tools.pr_code_suggestions import (
+        _recover_lines_start_end_from_existing_code,
+    )
+
+    class _FakeFile:
+        def __init__(self, filename, head_file):
+            self.filename = filename
+            self.head_file = head_file
+
+    class _FakeProvider:
+        def __init__(self, files):
+            self.diff_files = files
+        def get_diff_files(self):
+            return self.diff_files
+
+    head = (
+        "import json\n"
+        "\n"
+        "def safe_div(a, b):\n"
+        "    try:\n"
+        "        return a / b\n"
+        "    except Exception:\n"
+        "        pass\n"
+    )
+    provider = _FakeProvider([_FakeFile("x.py", head)])
+    d = {
+        "relevant_file": "x.py",
+        "existing_code": "def safe_div(a, b):\n    pass",
+    }
+    start, end = _recover_lines_start_end_from_existing_code(d, provider)
+    assert start == 3, f"expected line 3, got {start}"
+    assert end == 3
+
+
+def test_recover_lines_returns_none_when_no_match():
+    """If neither existing_code's first line nor the file matches, recovery
+    fails cleanly — caller will then skip the suggestion (it gets logged).
+    """
+    from pr_agent.tools.pr_code_suggestions import (
+        _recover_lines_start_end_from_existing_code,
+    )
+
+    class _FakeFile:
+        filename = "x.py"
+        head_file = "different content"
+
+    class _FakeProvider:
+        diff_files = [_FakeFile()]
+        def get_diff_files(self):
+            return self.diff_files
+
+    d = {"relevant_file": "x.py", "existing_code": "def missing():\n    pass"}
+    start, end = _recover_lines_start_end_from_existing_code(d, _FakeProvider())
+    assert start is None and end is None
+
+
+def test_recover_lines_returns_none_when_file_missing_from_diff():
+    """Suggestion whose ``relevant_file`` doesn't appear in the diff
+    should fail gracefully (returns None) instead of crashing."""
+    from pr_agent.tools.pr_code_suggestions import (
+        _recover_lines_start_end_from_existing_code,
+    )
+
+    class _FakeFile:
+        filename = "other.py"
+        head_file = "def foo():\n    pass"
+
+    class _FakeProvider:
+        diff_files = [_FakeFile()]
+        def get_diff_files(self):
+            return self.diff_files
+
+    d = {"relevant_file": "ghost.py", "existing_code": "def bar():\n    pass"}
+    start, end = _recover_lines_start_end_from_existing_code(d, _FakeProvider())
+    assert start is None and end is None
