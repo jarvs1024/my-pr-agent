@@ -592,6 +592,29 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
         try:
             if _resolve_apply_event(data) is not None:
                 _handle_apply_commit(data)
+                # Description-only / label-only MR updates carry ``last_commit``
+                # whose message still matches the original "Apply N suggestion(s)"
+                # commit. Re-running ``apply_commands`` on those would call
+                # ``/describe``, which rewrites the description, which fires
+                # yet another MR update webhook, which matches the regex
+                # again — an infinite ``/describe`` loop on the timeline.
+                # Require the update to be push-driven (``oldrev`` set on the
+                # ``merge_request`` payload, OR the payload is a ``push`` hook)
+                # before chaining the apply pipeline.
+                apply_is_push_driven = (
+                    data.get("object_kind") == "push"
+                    or bool((data.get("object_attributes") or {}).get("oldrev"))
+                )
+                if not apply_is_push_driven:
+                    get_logger().info(
+                        "apply-pipeline: skipping apply_commands re-run for "
+                        "non-push-driven MR update (description-only change); "
+                        "telemetry already updated."
+                    )
+                    return JSONResponse(
+                        status_code=status.HTTP_200_OK,
+                        content=jsonable_encoder({"message": "apply-telemetry-only"})
+                    )
                 # Also keep the MR activity row in telemetry consistent
                 # with the ``updated`` state the dispatcher would have
                 # emitted had we let control fall through.
