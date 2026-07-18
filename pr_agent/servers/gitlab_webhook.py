@@ -621,13 +621,24 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                     # so reuse the helper that the telemetry path already
                     # invokes.
                     apply_ev = _resolve_apply_event(data) or {}
+                    apply_mr_iid = apply_ev.get("mr_iid")
                     apply_url = apply_ev.get("pr_url")
                     if not apply_url:
-                        apply_url = (
-                            (data.get("object_attributes") or {}).get("url")
-                            or (data.get("project") or {}).get("web_url", "").rstrip("/")
-                            + f"/-/merge_requests/{apply_ev.get('mr_iid') or ''}"
+                        # push payloads don't carry a pr_url; look it up via
+                        # the project REST API using the push ref. Fall back
+                        # to constructing the URL from project.web_url only
+                        # when we actually have an iid, so we never produce
+                        # the broken ".../merge_requests/" (empty iid) form.
+                        lookup_mr_id, lookup_url = _lookup_mr_for_push(
+                            apply_ev.get("project_id") or (data.get("project") or {}).get("id"),
+                            apply_ev.get("ref") or "",
                         )
+                        if lookup_url:
+                            apply_url = lookup_url
+                        elif apply_mr_iid:
+                            project_web = (data.get("project") or {}).get("web_url", "").rstrip("/")
+                            if project_web:
+                                apply_url = f"{project_web}/-/merge_requests/{apply_mr_iid}"
                     if apply_url:
                         try:
                             await _perform_commands_gitlab(
