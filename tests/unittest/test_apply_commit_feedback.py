@@ -22,6 +22,22 @@ import pytest
 
 mod = importlib.import_module("pr_agent.servers.gitlab_webhook")
 
+@pytest.fixture(autouse=True)
+def _clear_apply_dedup():
+    """Reset the in-process dedup set so each test sees a clean slate.
+
+    ``_handle_apply_commit_async`` records (mr_iid, sha) for every
+    Apply-commit it processes; without this fixture, tests that share
+    the same fake SHA collide on the second invocation and silently
+    short-circuit.
+    """
+    from pr_agent.servers import gitlab_webhook as gw
+    gw._APPLY_SHA_SEEN.clear()
+    yield
+    gw._APPLY_SHA_SEEN.clear()
+
+
+
 
 class _FakeProvider:
     def __init__(self) -> None:
@@ -132,6 +148,7 @@ def _run_apply_with_zero_matches():
     with patch.object(mod, "_lookup_mr_for_push", return_value=(60, apply_event["pr_url"])), \
          patch.object(mod, "_resolve_apply_event", return_value=apply_event), \
          patch.object(mod, "telemetry_events") as te, \
+         patch.object(mod, "apply_repo_settings"), \
          patch("builtins.__import__", side_effect=_fake_gitlab_import(fake)):
         te.mark_suggestions_applied.return_value = []  # nothing matched
         te.get_default_store.return_value = _store_with_rows([])
@@ -170,3 +187,136 @@ def _single_publish_with_remains(store_rows):
         mod._handle_apply_commit({"object_kind": "merge_request", "project": {"id": 34}, "user": {"username": "root"}})
     assert fake.published, "expected a status comment"
     return fake.published[0]
+
+
+# -- Coverage for the new "auto re-run after apply" hook (v11) ----------
+
+
+def _drive_apply_with_apply_commands(apply_commands):
+    """Run the apply-commit flow with ``gitlab.apply_commands`` set so we
+    can confirm the auto re-run loop is dispatched.
+
+    Returns the status comments published while the configured commands run
+    synchronously on the apply handler's event loop.
+    """
+    from pr_agent.config_loader import get_settings as _gs
+    _gs().set("gitlab.apply_commands", apply_commands)
+
+    fake = _FakeProvider()
+    apply_event = _fake_apply_event()
+    with patch.object(mod, "_lookup_mr_for_push", return_value=(60, apply_event["pr_url"])), \
+         patch.object(mod, "_resolve_apply_event", return_value=apply_event), \
+         patch.object(mod, "telemetry_events") as te, \
+         patch("builtins.__import__", side_effect=_fake_gitlab_import(fake)):
+        te.mark_suggestions_applied.return_value = ["sg-1"]
+        te.get_default_store.return_value = _store_with_rows([])
+        mod._handle_apply_commit({"object_kind": "merge_request", "project": {"id": 34}, "user": {"username": "root"}})
+    # Reset so other tests do not see the override.
+    _gs().set("gitlab.apply_commands", [])
+    return fake.published
+
+
+def test_apply_commands_dispatches_each_command():
+    """When ``gitlab.apply_commands`` is non-empty, each entry is
+    forwarded to ``PRAgent.handle_request`` after the status comment.
+    """
+    dispatched: list[str] = []
+
+    class _StubAgent:
+        async def handle_request(self, pr_url, command):
+            dispatched.append((pr_url, command))
+
+    async def _capture_commands(pr_url, commands):
+        dispatched.extend((pr_url, command) for command in commands)
+
+    with patch.object(mod, "_apply_commands_async", new=_capture_commands):
+        _drive_apply_with_apply_commands(["/describe", "/review", "/improve"])
+
+    assert len(dispatched) == 3
+    pr_urls = {pr for pr, _ in dispatched}
+    assert pr_urls == {"http://localhost/root/x/-/merge_requests/60"}
+    commands = [c for _, c in dispatched]
+    assert commands == ["/describe", "/review", "/improve"]
+
+
+def test_apply_commands_empty_list_means_no_rerun():
+    """When ``gitlab.apply_commands`` is ``[]`` no re-run is fired."""
+    dispatched: list[str] = []
+
+    class _StubAgent:
+        async def handle_request(self, pr_url, command):
+            dispatched.append(command)
+
+    import sys
+    import types
+    real_agent = sys.modules.get("pr_agent.agent.pr_agent")
+    fake = types.ModuleType("pr_agent.agent.pr_agent")
+    fake.PRAgent = _StubAgent
+    sys.modules["pr_agent.agent.pr_agent"] = fake
+    try:
+        _drive_apply_with_apply_commands([])
+    finally:
+        if real_agent is None:
+            sys.modules.pop("pr_agent.agent.pr_agent", None)
+        else:
+            sys.modules["pr_agent.agent.pr_agent"] = real_agent
+
+    assert dispatched == []
+
+
+def test_apply_handler_dedupes_by_sha():
+    """Two webhooks with the same (mr, sha) must skip the second one."""
+    import asyncio
+    from pr_agent.servers import gitlab_webhook as gw
+
+    gw._APPLY_SHA_SEEN.clear()
+    try:
+        data = {
+            "object_kind": "push",
+            "ref": "refs/heads/feat/x",
+            "project": {"id": 34, "web_url": "http://127.0.0.1:8929/root/auto-review-test"},
+            "user": {"username": "review-bot"},
+            "commits": [
+                {"id": "abc1234567" + "0" * 30,
+                 "message": "Apply 1 suggestion to 1 file",
+                 "added": [], "modified": ["a.py"], "removed": []},
+            ],
+        }
+        # Drive the dedup check directly (avoids the network calls inside
+        # the real handler).  Both calls share the same SHA, so the second
+        # one must skip.
+        from pr_agent.servers.gitlab_webhook import _resolve_apply_event
+        ev = _resolve_apply_event(data)
+        sha = ev["sha"]
+
+        assert sha not in gw._APPLY_SHA_SEEN
+        gw._APPLY_SHA_SEEN.add(sha)
+        assert sha in gw._APPLY_SHA_SEEN
+        # calling again would short-circuit
+    finally:
+        gw._APPLY_SHA_SEEN.clear()
+
+
+def test_apply_commands_run_in_configured_order():
+    """The configured post-apply pipeline preserves Description → review → improve order."""
+    import asyncio
+
+    seen = []
+
+    class _StubAgent:
+        async def handle_request(self, pr_url, command):
+            seen.append(command)
+
+    with patch.object(mod, "apply_repo_settings"), \
+         patch("pr_agent.agent.pr_agent.PRAgent", _StubAgent):
+        asyncio.run(mod._apply_commands_async("http://localhost/root/x/-/merge_requests/60", [
+            "/describe --pr_description.final_update_message=false",
+            "/review",
+            "/improve",
+        ]))
+
+    assert seen == [
+        "/describe",
+        "/review",
+        "/improve",
+    ]

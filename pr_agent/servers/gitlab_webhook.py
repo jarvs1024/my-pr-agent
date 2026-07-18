@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import json
 import os
@@ -132,6 +133,7 @@ def _emit_mr_merged(data: dict) -> None:
 import re as _re_apply
 
 _APPLY_COMMIT_RE = _re_apply.compile(r"Apply\s+(\d+)\s+suggestion", _re_apply.IGNORECASE)
+_APPLY_SHA_SEEN: "set[str]" = set()
 
 
 def _resolve_apply_event(webhook_data: dict):
@@ -241,6 +243,48 @@ def _lookup_mr_for_push(project_id, ref):
 
 
 def _handle_apply_commit(webhook_data: dict) -> None:
+    """Schedule the async handler for an Apply-suggestion commit.
+
+    The actual work touches the GitLab REST API and may take a few seconds
+    (LLM re-review, if enabled). FastAPI request handlers must remain
+    non-blocking, so we delegate to the async version via the running
+    event loop.
+    """
+    # De-dup happens inside ``_handle_apply_commit_async`` once we have
+    # a real SHA from the resolved event (skip here so unit tests that
+    # patch _resolve_apply_event on the async path can still drive the
+    # synchronous entry point cleanly).
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(_handle_apply_commit_async(webhook_data))
+            return
+    except RuntimeError:
+        # No running loop in this thread — fall back to the sync path so
+        # unit tests (which drive the function directly) still work.
+        pass
+    _handle_apply_commit_sync(webhook_data)
+
+
+def _handle_apply_commit_sync(webhook_data: dict) -> None:
+    """Synchronous runner for unit tests (or any non-async context).
+
+    Production traffic always goes through ``_handle_apply_commit`` →
+    ``_handle_apply_commit_async`` (queued on the FastAPI event loop).
+    Here we materialize a private event loop so we can drive the same
+    coroutine end-to-end without needing pytest-asyncio glue.
+    """
+    try:
+        asyncio.run(_handle_apply_commit_async(webhook_data))
+    except RuntimeError as _e:
+        # asyncio.run cannot be called from inside a running loop either —
+        # catch the "asyncio.run() cannot be called from a running event
+        # loop" error and just fall through (the calling webhook handler
+        # already scheduled us as a task, so this should never trigger).
+        get_logger().debug(f"_handle_apply_commit_sync.run fall-through: {_e}")
+
+
+async def _handle_apply_commit_async(webhook_data: dict) -> None:
     """Detect GitLab's "Apply N suggestion(s)" commit and mark matching open
     suggestions as ``state=applied``.
 
@@ -253,6 +297,19 @@ def _handle_apply_commit(webhook_data: dict) -> None:
         ev = _resolve_apply_event(webhook_data)
         if ev is None:
             return
+        # De-dupe by SHA only: GitLab emits both a push hook and a
+        # merge_request update hook for the same Apply click, so the
+        # same SHA can land here twice (and again after /describe
+        # rewrites the description, triggering yet another MR update).
+        # GitLab SHAs are globally unique within a project, so SHA is
+        # sufficient to de-dupe across object_kind boundaries.
+        sha = ev.get("sha")
+        if sha:
+            global _APPLY_SHA_SEEN
+            if sha in _APPLY_SHA_SEEN:
+                get_logger().debug(f"apply-handler skip duplicate sha={sha[:10]}")
+                return
+            _APPLY_SHA_SEEN.add(sha)
         project_id = ev["project_id"]
         sha = ev["sha"]
         msg = ev["msg"]
@@ -382,7 +439,7 @@ def _handle_apply_commit(webhook_data: dict) -> None:
                 _status = (
                     "✅ 已自动记录 {n} 条建议为 applied (commit {sha}).\n\n"
                     "本次 commit 是 GitLab 的「Apply suggestion」操作, "
-                    "机器人**不会**自动重跑 `/improve` — 当前 diff 与 review-bot 的提示已同步."
+                    "机器人会按 `gitlab.apply_commands` 配置自动重跑 `/describe → /review → /improve`, 保持 MR 描述 / 评审指南 / 建议列表与最新 diff 同步."
                 ).format(n=_applied_total, sha=sha[:10])
                 _status += f"\n\n涉及文件: {_files_sorted}"
                 _status += _extra
@@ -396,8 +453,58 @@ def _handle_apply_commit(webhook_data: dict) -> None:
                     get_logger().warning(f"apply-commit status publish failed: {e}")
             except Exception as e:
                 get_logger().warning(f"apply-commit status build failed: {e}")
+
+        # ``gitlab.apply_commands`` lets operators opt into a
+        # ``/describe + /review + /improve`` re-run after each Apply so
+        # the bot keeps the MR Description, "PR 评审指南", and the
+        # pending-suggestion list in sync with the latest diff. The list
+        # is intentionally a settings-level list (just like
+        # ``gitlab.pr_commands``) — empty to disable.
+        #
+        try:
+            apply_commands = get_settings().get("gitlab.apply_commands", []) or []
+            # ``pr_url`` and ``mr_id`` are already populated above (either
+            # from the resolved event or from ``_lookup_mr_for_push``).
+            if apply_commands and pr_url and mr_id:
+                try:
+                    get_settings().set("config.is_auto_command", True)
+                except Exception:
+                    pass
+                get_logger().info(
+                    f"apply-commit auto re-run started for {pr_url}: {apply_commands}"
+                )
+                await _apply_commands_async(pr_url, list(apply_commands))
+        except Exception as _e_apply:
+            get_logger().warning(f"apply-commit auto re-run dispatch failed: {_e_apply}")
     except Exception as e:
         get_logger().warning(f"telemetry.on_apply_commit outer: {e}")
+
+async def _apply_commands_async(pr_url: str, commands: list) -> None:
+    """Re-run a list of slash commands on a thread-private event loop.
+
+    Mirrors ``_perform_commands_gitlab`` (``pr_commands`` / ``push_commands``)
+    so the same control-flow applies: ``is_auto_command`` is set, every
+    command is forwarded to ``PRAgent.handle_request``, and per-command
+    failures only log a warning without killing the loop.
+    """
+    apply_repo_settings(pr_url)
+    from pr_agent.agent.pr_agent import PRAgent as _PRAgent
+    _agent = _PRAgent()
+    for new_command in commands:
+        try:
+            cmd, _, args = new_command.partition(" ")
+            from pr_agent.algo.utils import update_settings_from_args as _upd
+            _args_norm = _upd(args.split()) if args.strip() else []
+            command_str = " ".join([cmd] + list(_args_norm)) if _args_norm else cmd
+            get_logger().info(
+                f"apply-commit auto re-run: {pr_url} → {command_str}"
+            )
+            await _agent.handle_request(pr_url, command_str)
+        except Exception as _e:
+            get_logger().warning(
+                f"apply-commit auto re-run cmd={new_command!r} failed: {_e}"
+            )
+
 
 async def handle_request(api_url: str, body: str, log_context: dict, sender_id: str, notify=None):
     log_context["action"] = body
@@ -469,6 +576,11 @@ def is_bot_user(data) -> bool:
     except Exception as e:
         get_logger().error(f"Failed 'is_bot_user' logic: {e}")
     return False
+
+
+def _is_gitlab_command_comment(body: str) -> bool:
+    """Return whether an MR note should enter the slash-command router."""
+    return isinstance(body, str) and body.lstrip().startswith("/")
 
 def is_draft(data) -> bool:
     try:
@@ -812,6 +924,11 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                 get_logger().info(f"A comment has been added to a merge request: {url}")
                 if note_type == 'DiffNote' and '/ask' in body: # /ask_line
                     body = handle_ask_line(body, data)
+
+                if not _is_gitlab_command_comment(body):
+                    get_logger().debug("Ignoring non-command GitLab MR comment")
+                    return JSONResponse(status_code=status.HTTP_200_OK,
+                                        content=jsonable_encoder({"message": "ignored non-command"}))
 
                 await handle_request(url, body, log_context, sender_id, notify=lambda: provider.add_eyes_reaction(comment_id))
 

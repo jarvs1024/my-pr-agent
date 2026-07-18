@@ -223,6 +223,183 @@ def _enforce_current_file(lines, idx):
         m = re.match(r"^\+\+\+ b/(.+)$", lines[j])
         if m:
             return m.group(1)
+
+
+def _enforce_pattern_keyword_re():
+    """Regex patterns that hint at a rule violation. They are intentionally
+    scoped to ``+``-lines only (i.e. lines that were added in this PR) and
+    used purely as evidence for the post-LLM coverage enforcer; the LLM is
+    still free to compose its own Apply suggestion that cites each rule
+    key. Each match only tags the line — the skeleton suggestion generator
+    below maps the tag to a concrete fix.
+    """
+    return [
+        # ``except Exception: pass`` (silent swallow) — emits a NO-LOG-EXC
+        # skeleton.
+        (re.compile(r"^\s*except\s+(?:[A-Za-z_]\w*\.)*(?:Exception|BaseException)\b[^:]*:[^\n]*\bpass\b"), "no_log_exc_silent"),
+        # ``except <broader>:`` followed by a body lacking ``logging.``
+        # anywhere. We do best-effort presence checks during skeleton
+        # generation rather than relying on a strict regex here.
+        (re.compile(r"^\s*except\s+[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\b"), "no_log_exc_branch"),
+        # Bare ``print(...)`` in production code paths. We filter out
+        # lines that obviously sit inside ``if __name__ == "__main__":``
+        # runners or inside test functions.
+        (re.compile(r"^(?!\s{8,})\s*print\s*\("), "bare_print"),
+    ]
+
+
+def _enforce_scan_diff_for_language_violations(diff_text):
+    """Walk a unified diff and return evidence rows for production-path
+    violations (NO-LOG-EXC, NO-BARE-PRINT).
+
+    Each evidence row carries enough context to anchor an inline comment
+    and to identify the *kind* of violation. Callers (see
+    ``_enforce_augment_suggestions``) decide whether to emit a skeleton
+    suggestion — typically only when the LLM-emitted payload did not
+    already cite the matching rule key at this exact (file, line).
+
+    The runner heuristic (skipping lines inside ``if __name__ ==
+    "__main__":`` blocks) is intentional: the AGENTS.md rules target
+    production paths, not smoke tests. False positives here would only
+    cause a duplicate Apply suggestion, which the user can dismiss.
+    """
+    if not diff_text:
+        return []
+    patterns = _enforce_pattern_keyword_re()
+    current_file = None
+    plus_offset = None
+    in_main_runner = False
+    in_test_function = False
+    hits = []
+    for line in diff_text.splitlines():
+        m_file = re.match(r"^\+\+\+ b/(.+)$", line)
+        if m_file:
+            current_file = m_file.group(1)
+            plus_offset = None
+            in_main_runner = False
+            in_test_function = False
+            continue
+        m_hunk = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+        if m_hunk:
+            plus_offset = int(m_hunk.group(1))
+            continue
+        if plus_offset is None or current_file is None:
+            continue
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        raw = line[1:]
+        stripped = raw.strip()
+        # Track when we are inside ``if __name__ == '__main__'`` tests or
+        # plain ``def test_*`` functions so we can skip those lines.
+        if re.match(r'^\s*if\s+__name__\s*==', stripped):
+            in_main_runner = True
+            plus_offset += 1
+            continue
+        if in_main_runner:
+            plus_offset += 1
+            continue
+        # ``def test_*`` or ``def _test_*``
+        if re.match(r'^\s*def\s+_?test_', raw):
+            in_test_function = True
+        if re.match(r'^\s*def\s+[A-Za-z_]\w*\(', raw):
+            # New function — leave test_function only if this itself is a
+            # test, which we just set above.
+            if not re.match(r'^\s*def\s+_?test_', raw):
+                in_test_function = False
+        if in_test_function:
+            plus_offset += 1
+            continue
+        for pat, key in patterns:
+            if pat.search(raw):
+                hits.append({
+                    "file": current_file,
+                    "line": int(plus_offset),
+                    "pattern_id": key,
+                    "snippet": stripped[:160],
+                })
+                break
+        plus_offset += 1
+    return hits
+
+
+def _enforce_make_pattern_skeleton(pattern_hit):
+    """Translate a language-pattern evidence row into an Apply suggestion.
+
+    The skeleton is purely defensive: callers only invoke this when the
+    LLM's output did NOT already cite a corresponding rule key for the
+    same (file, line). The text is deliberately terse; the real Apply
+    button works off ``improved_code`` which is the smallest snippet that
+    removes the violation.
+    """
+    pid = pattern_hit.get("pattern_id") or ""
+    file = pattern_hit.get("file") or ""
+    line = int(pattern_hit.get("line") or 0)
+    snippet = (pattern_hit.get("snippet") or "").strip()
+    if not (file and line):
+        return None
+    if pid == "no_log_exc_silent":
+        existing = snippet
+        improved = "logging.exception(\"re-raise context\")\\n    raise"
+        return {
+            "relevant_file": file,
+            "relevant_lines_start": line,
+            "relevant_lines_end": line,
+            "existing_code": existing,
+            "improved_code": improved,
+            "suggestion_content": (
+                "违反 `<PREFIX>-RULE-NO-LOG-EXC` (auto-enforced skeleton): "
+                "裸 ``except Exception: pass`` 必须替换为 ``logging.exception(...)`` + re-raise."
+            ),
+            "one_sentence_summary": "logging.exception + re-raise",
+            "label": "possible bug",
+            "score": 7,
+            "score_why": "",
+            "_enforce_kind": "no_log_exc_silent",
+            "_enforce_target": {"file": file, "line": line, "pattern_id": pid},
+        }
+    if pid == "no_log_exc_branch":
+        existing = snippet
+        improved = "logging.exception(\"logged context\")"
+        return {
+            "relevant_file": file,
+            "relevant_lines_start": line,
+            "relevant_lines_end": line,
+            "existing_code": existing,
+            "improved_code": improved,
+            "suggestion_content": (
+                "违反 `<PREFIX>-RULE-NO-LOG-EXC` (auto-enforced skeleton): "
+                "except 分支未使用 logging 记录异常, 补充 ``logging.exception(...)``."
+            ),
+            "one_sentence_summary": "异常分支补 logging.exception",
+            "label": "best practice",
+            "score": 6,
+            "score_why": "",
+            "_enforce_kind": "no_log_exc_branch",
+            "_enforce_target": {"file": file, "line": line, "pattern_id": pid},
+        }
+    if pid == "bare_print":
+        existing = snippet
+        # Conservative replacement: ``print(x)`` -> ``logging.info(x)``.
+        improved = "logging.info(" + snippet[snippet.find("(") + 1:].rstrip()
+        return {
+            "relevant_file": file,
+            "relevant_lines_start": line,
+            "relevant_lines_end": line,
+            "existing_code": existing,
+            "improved_code": improved,
+            "suggestion_content": (
+                "违反 `<PREFIX>-RULE-NO-BARE-PRINT` (auto-enforced skeleton): "
+                "生产路径禁止使用 ``print``, 用 ``logging.info(...)`` 替代."
+            ),
+            "one_sentence_summary": "print 改 logging.info",
+            "label": "best practice",
+            "score": 5,
+            "score_why": "",
+            "_enforce_kind": "bare_print",
+            "_enforce_target": {"file": file, "line": line, "pattern_id": pid},
+        }
+    return None
+
     return None
 
 
@@ -359,6 +536,8 @@ def _enforce_augment_suggestions(data, diff_text, rule_keys):
         return data
     findings = _enforce_scan_diff_for_missing_def_attrs(diff_text)
     findings = _enforce_enrich_docstring_findings(diff_text, findings)
+    language_hits = _enforce_scan_diff_for_language_violations(diff_text)
+
     existing = data.get("code_suggestions") or []
     covered = set()
     for s in existing:
@@ -370,6 +549,14 @@ def _enforce_augment_suggestions(data, diff_text, rule_keys):
                 covered.add((file_path, line, "missing_docstring"))
             if any(k in content for k in ("type hint", "typehint", "类型注解", "类型注释")):
                 covered.add((file_path, line, "missing_typehint"))
+            # NO-LOG-EXC / NO-BARE-PRINT coverage keys — used by the
+            # pattern enforcer below to avoid duplicating LLM-emitted
+            # suggestions that already cite the relevant rule.
+            if "no-log-exc" in content or "logging.exception" in content or "logging.exception" in (s.get("improved_code") or "").lower():
+                covered.add((file_path, line, "no_log_exc_branch"))
+                covered.add((file_path, line, "no_log_exc_silent"))
+            if "no-bare-print" in content or "logging.info" in content or "print" in (s.get("existing_code") or "").lower():
+                covered.add((file_path, line, "bare_print"))
     for finding in findings:
         for kind in ("missing_docstring", "missing_typehint"):
             if not finding.get(kind):
@@ -381,6 +568,19 @@ def _enforce_augment_suggestions(data, diff_text, rule_keys):
             if skel is not None:
                 existing.append(skel)
                 covered.add(key)
+    # Language patterns (NO-LOG-EXC, NO-BARE-PRINT) get the same
+    # per-(file, line, pattern_id) coverage key. If the LLM already
+    # emitted an Apply suggestion that anchors the same row and cites
+    # the corresponding rule key, we skip emitting a duplicate.
+    for hit in language_hits:
+        key = (hit["file"], hit["line"], hit["pattern_id"])
+        if key in covered:
+            continue
+        skel = _enforce_make_pattern_skeleton(hit)
+        if skel is None:
+            continue
+        existing.append(skel)
+        covered.add(key)
     data["code_suggestions"] = existing
     # Upgrade LLM-emitted entries that already cover a kind but forgot to cite
     # a rule key. This is what fills in the <AGENTS_MD_RULE_KEY> placeholder
