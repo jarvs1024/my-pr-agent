@@ -671,7 +671,33 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
             # (it matches the commit message regardless of object_kind).
             elif object_attributes.get('action') == 'update':
                 url = object_attributes.get('url')
-                _emit_mr_activity(data, state='updated')
+                # Skip purely cosmetic MR updates that don't carry a push:
+                # title / description / label / assignee edits don't have an
+                # ``oldrev`` and don't add new code to review. Running
+                # ``pr_commands`` or ``push_commands`` here causes the bot
+                # to post a fresh ``/describe``/``/review``/``/improve``
+                # cycle every time the bot's own previous ``/describe``
+                # writes the description — an infinite loop. Real code
+                # pushes always include ``oldrev``; we only re-run commands
+                # in that case (and the apply-suggestion chain still runs
+                # via the early-exit hook above).
+                if not object_attributes.get('oldrev'):
+                    # Still record the activity so the dashboard reflects
+                    # the description edit, but don't re-run the full
+                    # /describe + /review + /improve pipeline (which would
+                    # create the infinite-loop cycle described above).
+                    try:
+                        _emit_mr_activity(data, state='updated')
+                    except Exception as _emit_meta_err:
+                        get_logger().warning(
+                            f"non-push update _emit_mr_activity failed: {_emit_meta_err}"
+                        )
+                    get_logger().debug(
+                        f"Skipping non-push MR update for {url} "
+                        f"(no oldrev; description-only or label-only change)"
+                    )
+                    return JSONResponse(status_code=status.HTTP_200_OK,
+                                        content=jsonable_encoder({"message": "non-push-update-skip"}))
                 # Apply-suggestion detection moved to the early-exit hook above
                 # so it also fires for object_kind=push webhooks.
                 if is_draft(data):
