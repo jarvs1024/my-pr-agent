@@ -1349,6 +1349,107 @@ class PRCodeSuggestions:
 
         return data
 
+    def _suppress_resolved_suggestions(self, code_suggestions):
+        """Drop suggestions whose (file, line) is already resolved.
+
+        When /improve is re-run after an Apply or /dismiss, the LLM has
+        no memory of prior emissions and may produce the same finding
+        again.  Looking at the telemetry store, we know which lines
+        have been marked applied or dismissed, and we can suppress
+        them here so the MR does not collect duplicate DiffNotes.
+
+        Returns the filtered list.  Telemetry / state are not touched.
+        """
+        if not code_suggestions:
+            return code_suggestions
+        try:
+            mr_id = (
+                getattr(self.git_provider, "id_mr", None)
+                or getattr(self.git_provider, "pr_id", None)
+                or getattr(getattr(self.git_provider, "pr", None), "iid", None)
+                or getattr(getattr(self.git_provider, "pr", None), "id", 0)
+            )
+            raw_project = (
+                getattr(self.git_provider, "id_project", None)
+                or getattr(self.git_provider, "project_id", None)
+                or 0
+            )
+            project_id = raw_project
+            if not isinstance(raw_project, int):
+                try:
+                    gl = getattr(self.git_provider, "gl", None)
+                    if gl is not None and raw_project:
+                        project_id = gl.projects.get(raw_project).id
+                except Exception:
+                    project_id = 0
+            if not mr_id:
+                return code_suggestions
+            pr_url = (
+                getattr(self.git_provider, "pr_url", None)
+                or getattr(getattr(self.git_provider, "pr", None), "web_url", None)
+            )
+            existing = telemetry_events.get_default_store().list_suggestions(
+                mr_id=int(mr_id),
+                project_id=int(project_id) if project_id else None,
+                attach_severity=False,
+                pr_url=pr_url,
+            )
+        except Exception as e:
+            get_logger().debug(f"suppress-resolved lookup failed (skip): {e}")
+            return code_suggestions
+
+        # Build (file, line) -> set of resolved states.  A small
+        # line-window (3 lines) catches the common case where the LLM
+        # anchors the new suggestion to a slightly different line in
+        # the same function after the user has already applied the fix.
+        resolved = {}
+        for s in existing:
+            state = s.get("state")
+            if state not in ("applied", "dismissed"):
+                continue
+            f = (s.get("file") or "").strip()
+            ln = s.get("line")
+            if not f or not ln:
+                continue
+            resolved.setdefault(f, {}).setdefault(ln, set()).add(state)
+
+        def _is_resolved(file, line):
+            fmap = resolved.get((file or "").strip())
+            if not fmap or not line:
+                return None
+            # exact line hit
+            states = fmap.get(line)
+            if states:
+                return states
+            # ±3 line hit (LLM often re-anchors suggestions after the
+            # file is updated; the resolved line is typically within
+            # the same function body)
+            for delta in range(1, 4):
+                for candidate in (line - delta, line + delta):
+                    states = fmap.get(candidate)
+                    if states:
+                        return states
+            return None
+
+        kept = []
+        dropped = 0
+        for cs in code_suggestions:
+            f = cs.get("relevant_file")
+            ln = cs.get("relevant_lines_start")
+            states = _is_resolved(f, ln)
+            if states:
+                get_logger().info(
+                    f"suppress-resolved: skip {f}:{ln} (prior state={sorted(states)})"
+                )
+                dropped += 1
+                continue
+            kept.append(cs)
+        if dropped:
+            get_logger().info(
+                f"push_inline_code_suggestions: suppressed {dropped} already-resolved suggestion(s)"
+            )
+        return kept
+
     async def push_inline_code_suggestions(self, data):
         code_suggestions = []
 
@@ -1404,6 +1505,10 @@ class PRCodeSuggestions:
             except Exception:
                 get_logger().info(f"Could not parse suggestion: {d}")
 
+        code_suggestions = self._suppress_resolved_suggestions(code_suggestions)
+        if not code_suggestions:
+            get_logger().info('All LLM suggestions were already applied or dismissed.')
+            return
         is_successful = self.git_provider.publish_code_suggestions(code_suggestions)
         # Emit telemetry events for the suggestions we just attempted to publish.
         try:

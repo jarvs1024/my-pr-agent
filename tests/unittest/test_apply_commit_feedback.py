@@ -22,6 +22,96 @@ import pytest
 
 mod = importlib.import_module("pr_agent.servers.gitlab_webhook")
 
+def test_push_inline_skips_already_applied_lines(monkeypatch):
+    """Re-running /improve after an Apply must not re-emit the same
+    suggestion on the same (file, line).  Otherwise the MR accumulates
+    duplicate DiffNotes that GitLab then renders as 'cannot apply'
+    (since the lines have moved on) — pure noise for the reviewer.
+    """
+    from pr_agent.tools.pr_code_suggestions import PRCodeSuggestions
+    from pr_agent.telemetry import events as telemetry_events
+
+    fake_store = type("FakeStore", (), {})()
+    def fake_list(mr_id, project_id=None, *, attach_severity=True, pr_url=None):
+        return [
+            {"file": "shipment.py", "line": 20, "state": "applied",
+             "rule_keys": [], "importance": 9},
+            {"file": "shipment.py", "line": 30, "state": "dismissed",
+             "rule_keys": [], "importance": 5},
+        ]
+    fake_store.list_suggestions = fake_list
+    monkeypatch.setattr(telemetry_events, "get_default_store", lambda: fake_store)
+
+    # Build a minimal PRCodeSuggestions instance, bypassing __init__.
+    p = PRCodeSuggestions.__new__(PRCodeSuggestions)
+    p.git_provider = type("GP", (), {
+        "id_mr": 99,
+        "id_project": 1,
+        "pr_url": "http://x/root/x/-/merge_requests/99",
+    })()
+
+    code_suggestions = [
+        {"relevant_file": "shipment.py", "relevant_lines_start": 20,  # already applied
+         "body": "**Suggestion:** x"},
+        {"relevant_file": "shipment.py", "relevant_lines_start": 30,  # dismissed
+         "body": "**Suggestion:** y"},
+        {"relevant_file": "shipment.py", "relevant_lines_start": 22,  # within 3 of applied
+         "body": "**Suggestion:** z"},
+        {"relevant_file": "shipment.py", "relevant_lines_start": 50,  # NEW
+         "body": "**Suggestion:** new"},
+        {"relevant_file": "other.py",    "relevant_lines_start": 20,  # new file
+         "body": "**Suggestion:** new-file"},
+    ]
+    kept = p._suppress_resolved_suggestions(code_suggestions)
+    surviving_lines = [cs["relevant_lines_start"] for cs in kept]
+    # applied + dismissed + ±3 hit should be dropped, the 50/other.py kept
+    assert surviving_lines == [50, 20], surviving_lines
+
+
+def test_push_inline_dedup_no_op_when_no_resolved(monkeypatch):
+    """When the telemetry store reports no resolved suggestions, all
+    code_suggestions pass through unchanged.
+    """
+    from pr_agent.tools.pr_code_suggestions import PRCodeSuggestions
+    from pr_agent.telemetry import events as telemetry_events
+
+    fake_store = type("FakeStore", (), {})()
+    fake_store.list_suggestions = lambda *a, **k: []
+    monkeypatch.setattr(telemetry_events, "get_default_store", lambda: fake_store)
+
+    p = PRCodeSuggestions.__new__(PRCodeSuggestions)
+    p.git_provider = type("GP", (), {
+        "id_mr": 99, "id_project": 1,
+        "pr_url": "http://x/root/x/-/merge_requests/99",
+    })()
+
+    cs = [{"relevant_file": "a.py", "relevant_lines_start": 1, "body": "x"}]
+    assert p._suppress_resolved_suggestions(cs) == cs
+
+
+def test_push_inline_dedup_handles_missing_mr_id(monkeypatch):
+    """When the git_provider cannot supply an mr_id we must not crash
+    and must return the input unchanged.
+    """
+    from pr_agent.tools.pr_code_suggestions import PRCodeSuggestions
+    from pr_agent.telemetry import events as telemetry_events
+
+    called = {"n": 0}
+    def fake_list(*a, **k):
+        called["n"] += 1
+        return []
+    fake_store = type("FakeStore", (), {})()
+    fake_store.list_suggestions = fake_list
+    monkeypatch.setattr(telemetry_events, "get_default_store", lambda: fake_store)
+
+    p = PRCodeSuggestions.__new__(PRCodeSuggestions)
+    p.git_provider = type("GP", (), {})()  # no mr info
+
+    cs = [{"relevant_file": "a.py", "relevant_lines_start": 1, "body": "x"}]
+    assert p._suppress_resolved_suggestions(cs) == cs
+    assert called["n"] == 0  # we should not have queried telemetry
+
+
 @pytest.fixture(autouse=True)
 def _clear_apply_dedup():
     """Reset the in-process dedup set so each test sees a clean slate.
