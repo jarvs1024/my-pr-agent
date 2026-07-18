@@ -521,8 +521,23 @@ class PRCodeSuggestions:
         environment = Environment(undefined=StrictUndefined)
         system_prompt = environment.from_string(self.pr_code_suggestions_prompt_system).render(variables)
         user_prompt = environment.from_string(get_settings().pr_code_suggestions_prompt.user).render(variables)
-        response, finish_reason = await self.ai_handler.chat_completion(
-            model=model, temperature=get_settings().config.temperature, system=system_prompt, user=user_prompt)
+        # Hard timeout: ``config.ai_timeout`` is passed to litellm but a slow
+        # reasoning model can still hang forever on a connection that never
+        # resets.  Wrap the call in ``asyncio.wait_for`` so the worst case is a
+        # clean TimeoutError that the outer ``except`` block can convert into a
+        # ``status=failed`` telemetry row instead of a permanently ``started``
+        # row that never closes.
+        try:
+            import asyncio as _asyncio
+            _ai_timeout = float(get_settings().config.ai_timeout or 120)
+        except Exception:
+            _ai_timeout = 120.0
+        response, finish_reason = await _asyncio.wait_for(
+            self.ai_handler.chat_completion(
+                model=model, temperature=get_settings().config.temperature,
+                system=system_prompt, user=user_prompt),
+            timeout=_ai_timeout,
+        )
         if not get_settings().config.publish_output:
             get_settings().system_prompt = system_prompt
             get_settings().user_prompt = user_prompt
@@ -1124,10 +1139,17 @@ class PRCodeSuggestions:
                     get_settings().pr_code_suggestions_reflect_prompt.user).render(variables)
 
             with get_logger().contextualize(command="self_reflect_on_suggestions"):
-                response_reflect, finish_reason_reflect = await self.ai_handler.chat_completion(model=model,
-                                                                                                system=system_prompt_reflect,
-                                                                                                temperature=get_settings().config.temperature,
-                                                                                                user=user_prompt_reflect)
+                # Same hard-timeout wrapper as the main LLM call above.
+                import asyncio as _asyncio2
+                _ai_timeout_ref = float(get_settings().config.ai_timeout or 120)
+                response_reflect, finish_reason_reflect = await _asyncio2.wait_for(
+                    self.ai_handler.chat_completion(
+                        model=model,
+                        system=system_prompt_reflect,
+                        temperature=get_settings().config.temperature,
+                        user=user_prompt_reflect),
+                    timeout=_ai_timeout_ref,
+                )
         except Exception as e:
             get_logger().info("Could not reflect on suggestions, error: %s", format_exception_chain(e))
             return ""

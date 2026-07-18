@@ -411,6 +411,37 @@ def is_bot_user(data) -> bool:
     except Exception as e:
         get_logger().error(f"Failed 'is_bot_user' logic: {e}")
     return False
+def _is_sender_bot_account(data) -> bool:
+    """Return True when the webhook actor's username looks like a bot account.
+
+    Unlike :func:`is_bot_user` this helper is **not** short-circuited by the
+    ``config.allowed_bot_usernames`` whitelist. ``allowed_bot_usernames`` is
+    there to let a bot account trigger /review /improve etc. (the early return
+    in the comment handler), not to decide whether the bot can speak for the
+    user when parsing /dismiss commands. A bot replying to its own inline
+    suggestion must never trigger ``resolve_discussion`` — the suggestion body
+    it posted already contains the literal word ``dismiss`` ("回复 ``/dismiss``
+    忽略原因"), which would otherwise be matched and resolved.
+
+    Returns ``True`` if the sender username ends with ``-bot`` / ``_bot`` or
+    the sender display name contains ``codium`` / ``bot_`` / ``bot-`` / ``_bot``
+    / ``-bot`` substrings. Returns ``False`` for a regular human username such
+    as ``jarvs`` so a real ``/dismiss 误报`` reply is still resolved.
+    """
+    try:
+        sender_name = (data.get("user", {}).get("name") or "").lower()
+        sender_username = (data.get("user", {}).get("username") or "").lower()
+        if not sender_username:
+            return False
+        if sender_username.endswith("-bot") or sender_username.endswith("_bot"):
+            return True
+        bot_indicators = ['codium', 'bot_', 'bot-', '_bot', '-bot']
+        if any(indicator in sender_name for indicator in bot_indicators):
+            return True
+    except Exception:
+        pass
+    return False
+
 
 def is_draft(data) -> bool:
     try:
@@ -681,7 +712,32 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                 # non-empty text remains after stripping the trigger keyword and trivial
                 # wrappers around it (leading/trailing `/`, `?`, quotes, whitespace,
                 # and common CJK / ASCII punctuation).
-                _dismiss_match = re.search(r'(?<![A-Za-z0-9])dismiss(?![A-Za-z0-9])', body, flags=re.IGNORECASE)
+                # Sender guard: a bot account (e.g. ``review-bot``) must not trigger
+                # ``resolve_discussion`` when its own DiffNote body happens to contain
+                # the literal word ``dismiss``. Inline suggestions posted by the bot
+                # include the helper text "回复 ``/dismiss`` 忽略原因", so a naive
+                # substring match against the bot's own note would self-resolve every
+                # freshly posted suggestion. ``is_bot_user`` returns False for
+                # ``review-bot`` because ``allowed_bot_usernames`` is whitelisted (so
+                # the bot can still trigger /review etc.), so we use the whitelist-
+                # independent ``_is_sender_bot_account`` here. A real human /dismiss
+                # reply (note body starts with /dismiss or dismiss) is still matched.
+                _sender_is_bot = _is_sender_bot_account(data)
+                _body_stripped = body.lstrip()
+                _body_looks_like_explicit_dismiss = (
+                    _body_stripped.lower().startswith('/dismiss')
+                    or _body_stripped.lower().startswith('dismiss')
+                    or _body_stripped.startswith('?dismiss')
+                )
+                if _sender_is_bot and not _body_looks_like_explicit_dismiss:
+                    get_logger().info(
+                        f"Ignoring dismiss keyword in bot-authored DiffNote from "
+                        f"{data.get('user', {}).get('username')!r} "
+                        f"(body does not look like an explicit /dismiss command)."
+                    )
+                    _dismiss_match = None
+                else:
+                    _dismiss_match = re.search(r'(?<![A-Za-z0-9])dismiss(?![A-Za-z0-9])', body, flags=re.IGNORECASE)
                 if note_type == 'DiffNote' and _dismiss_match:
                     # Split on the matched keyword and strip wrappers on both halves so
                     # `/dismiss 忽略原因测试` → `忽略原因测试` and `dismiss忽略` → `忽略`.
