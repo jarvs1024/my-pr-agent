@@ -75,7 +75,8 @@ def _enforce_scan_diff_for_missing_def_attrs(diff_text):
     current_file = None
     plus_line_offset = None
 
-    for line in diff_text.split("\n"):
+    lines = diff_text.split("\n")
+    for idx, line in enumerate(lines):
         m_file = re.match(r"^\+\+\+ b/(.+)$", line)
         if m_file:
             current_file = m_file.group(1)
@@ -109,10 +110,25 @@ def _enforce_scan_diff_for_missing_def_attrs(diff_text):
                 if ":" not in p:
                     param_missing = True
                     break
+            body_lines = []
+            for next_line in lines[idx + 1: idx + 8]:
+                if not next_line.startswith("+"):
+                    break
+                nr = next_line[1:]
+                if nr.strip() == "":
+                    body_lines.append("")
+                    continue
+                body_lines.append(nr)
+                if len(body_lines) >= 4:
+                    break
             findings.append({
                 "file": current_file,
                 "line": plus_line_offset,
                 "def": m_def.group(2),
+                "indent": m_def.group(1) or "",
+                "params": params,
+                "ret": ret,
+                "body_lines": body_lines,
                 "missing_docstring": True,
                 "missing_typehint": param_missing or (ret is None),
             })
@@ -169,18 +185,86 @@ def _enforce_current_file(lines, idx):
     return None
 
 
-def _enforce_skeleton_for_kind(kind):
+def _enforce_skeleton_for_kind(finding, kind):
+    """Build (existing_code, improved_code, summary) for ``finding``.
+
+    The existing_code snippet is reconstructed from the diff hunk so the
+    inline comment's `````suggestion`` block actually matches the diff
+    content the user sees in GitLab.
+    """
+    indent = finding.get("indent", "")
+    def_name = finding.get("def", "example")
+    params = finding.get("params", "x")
+    ret = finding.get("ret", "")
+    body_lines = finding.get("body_lines") or []
+    # Keep the trailing colon — the function definition is incomplete without it.
+    ret_str = ret or ""
+    def_header = f"{indent}def {def_name}({params}){ret_str}:"
+
+    # If the diff captured any body lines, splice them onto the def header.
+    if body_lines:
+        real_existing = def_header + "\n" + "\n".join(body_lines)
+    else:
+        real_existing = f"{def_header}\n{indent}    pass"
+
     if kind == "missing_docstring":
-        existing = "def example(x):\n    return x"
-        improved = "def example(x):\n    \"\"\"TODO: describe the function.\"\"\"\n    return x"
+        improved = (
+            f"{def_header}\n{indent}    \"\"\"TODO: describe {def_name}.\"\"\""
+        )
+        if body_lines:
+            improved += "\n" + "\n".join(body_lines)
+        else:
+            improved += f"\n{indent}    pass"
         summary = "添加 docstring"
-        return existing, improved, summary
+        return real_existing, improved, summary
+
     if kind == "missing_typehint":
-        existing = "def example(x):\n    return x"
-        improved = "def example(x: int) -> int:\n    return x"
+        typed_params = _enforce_inject_basic_typehints(params)
+        typed_ret = ret.strip() if ret else "-> None"
+        # Only prefix with -> if not already present
+        if not typed_ret.startswith("->"):
+            typed_ret = "-> None"
+        typed_header = f"{indent}def {def_name}({typed_params}) {typed_ret}".rstrip()
+        improved = typed_header + ":\n" + "\n".join(body_lines) if body_lines else typed_header + ":\n" + indent + "    pass"
         summary = "添加参数与返回值类型注解"
-        return existing, improved, summary
+        return real_existing, improved, summary
+
     return '', '', ''
+
+
+def _enforce_inject_basic_typehints(params):
+    """Add ``: Any`` to params that have no annotation. Keeps existing
+    ``: Type`` annotations intact. Best-effort only — callers rely on
+    language-level detection, not on Python's full grammar.
+    """
+    out = []
+    for p in [x.strip() for x in params.split(",") if x.strip()]:
+        if p in ("self", "cls"):
+            out.append(p)
+            continue
+        if p.startswith("**"):
+            inner = p[2:]
+            if ":" not in inner:
+                inner = inner + ": Any"
+            out.append("**" + inner)
+            continue
+        if p.startswith("*"):
+            inner = p[1:]
+            if ":" not in inner:
+                inner = inner + ": Any"
+            out.append("*" + inner)
+            continue
+        if "=" in p:
+            name, default = p.split("=", 1)
+            name = name.strip()
+            if ":" not in name:
+                name = name + ": Any"
+            out.append(f"{name}={default.strip()}")
+            continue
+        if ":" not in p:
+            p = p + ": Any"
+        out.append(p)
+    return ", ".join(out)
 
 
 def _enforce_make_skeleton_suggestion(finding, kind):
@@ -191,7 +275,7 @@ def _enforce_make_skeleton_suggestion(finding, kind):
     """
     if kind not in ("missing_docstring", "missing_typehint"):
         return None
-    existing, improved, summary = _enforce_skeleton_for_kind(kind)
+    existing, improved, summary = _enforce_skeleton_for_kind(finding, kind)
     file_path = finding["file"]
     line_no = finding["line"]
     def_name = finding["def"]

@@ -604,3 +604,100 @@ def test_extract_rule_keys_handles_multiple_projects():
                 )
         assert "<AGENTS_MD_RULE_KEY>" in skel["suggestion_content"]
         assert out["_repo_rule_keys"] == rule_set
+
+
+# ---------------------------------------------------------------------------
+# Realistic existing_code/improved_code from diff hunks
+# ---------------------------------------------------------------------------
+
+def test_skeleton_existing_code_matches_diff():
+    """The skeleton ``existing_code`` must be reconstructed from the actual
+    diff content (def header + first body lines), not a hard-coded
+    ``def example(x):`` placeholder.
+    """
+    from pr_agent.tools.pr_code_suggestions import _enforce_augment_suggestions
+    diff_text = (
+        "diff --git a/bug_buried.py b/bug_buried.py\n"
+        "--- a/bug_buried.py\n"
+        "+++ b/bug_buried.py\n"
+        "@@ -1,2 +1,7 @@\n"
+        "+import logging\n"
+        "+def record_latency(name, ms):\n"
+        "+    bucket = name.split(\".\")[0]\n"
+        "+    print(bucket, ms)\n"
+    )
+    data = {"code_suggestions": []}
+    _enforce_augment_suggestions(data, diff_text, ["SSD-RULE-DOCSTRING-REQUIRED"])
+    assert data["code_suggestions"], "expected at least one skeleton"
+    skel = data["code_suggestions"][0]
+    # existing_code must contain the real def + body, not a placeholder
+    assert "def example" not in skel["existing_code"]
+    assert "def record_latency(name, ms):" in skel["existing_code"]
+    assert "print(bucket, ms)" in skel["existing_code"]
+
+
+def test_skeleton_typehint_uses_any_for_unannotated_params():
+    """For missing_typehint the improved code should annotate every
+    parameter with ``: Any`` if the original had no annotation.
+    """
+    from pr_agent.tools.pr_code_suggestions import _enforce_augment_suggestions
+    diff_text = (
+        "diff --git a/bug_buried.py b/bug_buried.py\n"
+        "--- a/bug_buried.py\n"
+        "+++ b/bug_buried.py\n"
+        "@@ -1,2 +1,6 @@\n"
+        "+def record_latency(name, ms):\n"
+        "+    bucket = name.split(\".\")[0]\n"
+    )
+    data = {"code_suggestions": []}
+    _enforce_augment_suggestions(data, diff_text, ["SSD-RULE-TYPEHINTS"])
+    typehint = [s for s in data["code_suggestions"] if s.get("_enforce_kind") == "missing_typehint"]
+    assert len(typehint) == 1
+    improved = typehint[0]["improved_code"]
+    assert "name: Any" in improved
+    assert "ms: Any" in improved
+    assert "-> None" in improved
+
+
+def test_skeleton_handles_def_without_body_lines():
+    """If the diff hunk ends right after ``def foo():`` (no body),
+    the skeleton should still produce a valid existing_code snippet
+    using ``pass`` as a placeholder body.
+    """
+    from pr_agent.tools.pr_code_suggestions import _enforce_augment_suggestions
+    diff_text = (
+        "diff --git a/x.py b/x.py\n"
+        "--- a/x.py\n"
+        "+++ b/x.py\n"
+        "@@ -1,2 +1,4 @@\n"
+        "+def stub(x):\n"
+    )
+    data = {"code_suggestions": []}
+    _enforce_augment_suggestions(data, diff_text, ["SSD-RULE-DOCSTRING-REQUIRED"])
+    skel = data["code_suggestions"][0]
+    assert "def stub(x):" in skel["existing_code"]
+    # body should fall back to ``pass``
+    assert "pass" in skel["existing_code"]
+
+
+def test_skeleton_does_not_inject_None_for_missing_return_annotation():
+    """When the def has no return annotation, the skeleton header
+    must not end up rendering ``def foo(x)None:`` — that was the
+    pre-fix bug where ``f"{ret}"`` rendered ``None`` literally.
+    """
+    from pr_agent.tools.pr_code_suggestions import _enforce_augment_suggestions
+    diff_text = (
+        "diff --git a/x.py b/x.py\n"
+        "--- a/x.py\n"
+        "+++ b/x.py\n"
+        "@@ -1,2 +1,4 @@\n"
+        "+def stub(x):\n"
+        "+    return x\n"
+    )
+    data = {"code_suggestions": []}
+    _enforce_augment_suggestions(data, diff_text, ["SSD-RULE-DOCSTRING-REQUIRED"])
+    skel = data["code_suggestions"][0]
+    assert ")None:" not in skel["existing_code"]
+    # Header line keeps its trailing colon even when body lines are
+    # spliced in below; the resulting snippet's first line is the def header.
+    assert skel["existing_code"].splitlines()[0].endswith("):")
