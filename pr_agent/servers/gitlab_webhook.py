@@ -592,6 +592,51 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
         try:
             if _resolve_apply_event(data) is not None:
                 _handle_apply_commit(data)
+                # Also keep the MR activity row in telemetry consistent
+                # with the ``updated`` state the dispatcher would have
+                # emitted had we let control fall through.
+                try:
+                    mr_url = (
+                        (data.get("object_attributes") or {}).get("url")
+                    )
+                    if mr_url:
+                        _emit_mr_activity(data, state='updated')
+                except Exception as _emit_apply_err:
+                    get_logger().warning(
+                        f"apply-path _emit_mr_activity failed: {_emit_apply_err}"
+                    )
+                # Re-run the user-configured ``apply_commands`` pipeline so
+                # /describe updates the Description, /review refreshes the
+                # parent review guide, and /improve issues any remaining
+                # suggestions against the new diff. ``apply_commands`` is
+                # already declared in the deployment configuration but the
+                # original dispatcher returned before reaching it, leaving
+                # Description / review_guide stale until the next push.
+                # We deliberately do NOT return here — the apply commit must
+                # both update telemetry AND chain into apply_commands.
+                apply_cmds = get_settings().get("gitlab.apply_commands", []) or []
+                if apply_cmds:
+                    # Resolve a usable MR url: merge_request-update payloads
+                    # carry it on object_attributes.url; push payloads don't,
+                    # so reuse the helper that the telemetry path already
+                    # invokes.
+                    apply_ev = _resolve_apply_event(data) or {}
+                    apply_url = apply_ev.get("pr_url")
+                    if not apply_url:
+                        apply_url = (
+                            (data.get("object_attributes") or {}).get("url")
+                            or (data.get("project") or {}).get("web_url", "").rstrip("/")
+                            + f"/-/merge_requests/{apply_ev.get('mr_iid') or ''}"
+                        )
+                    if apply_url:
+                        try:
+                            await _perform_commands_gitlab(
+                                "apply_commands", PRAgent(), apply_url, log_context, data
+                            )
+                        except Exception as _apply_chain_err:
+                            get_logger().warning(
+                                f"apply_commands re-run failed: {_apply_chain_err}"
+                            )
                 return JSONResponse(status_code=status.HTTP_200_OK, content=jsonable_encoder({"message": "apply-handled"}))
         except Exception as e:
             get_logger().warning(f"_handle_apply_commit early-exit outer: {e}")
