@@ -820,6 +820,97 @@ class GitLabProvider(GitProvider):
             get_logger().exception(f"Failed to resolve discussion {discussion_id}: {e}")
             return False
 
+    @staticmethod
+    def _suggestion_target_is_unchanged(old_content: str, current_content: str, start: int, end: int) -> bool:
+        old_lines = old_content.splitlines()
+        current_lines = current_content.splitlines()
+        if start < 0 or end <= start or end > len(old_lines):
+            return True
+        matcher = difflib.SequenceMatcher(None, old_lines, current_lines, autojunk=False)
+        return any(
+            tag == "equal" and old_start <= start and end <= old_end
+            for tag, old_start, old_end, _, _ in matcher.get_opcodes()
+        )
+
+    def resolve_superseded_suggestion_discussions(self, bot_usernames: set[str]) -> list[str]:
+        """Resolve bot suggestions whose target range changed in a newer MR revision."""
+        allowed_bots = {username.strip().lower() for username in bot_usernames if username and username.strip()}
+        if not allowed_bots:
+            return []
+
+        diff_refs = getattr(self.mr, "diff_refs", {}) or {}
+        current_sha = getattr(self.mr, "sha", None) or diff_refs.get("head_sha")
+        if not current_sha:
+            return []
+
+        resolved_discussions = []
+        content_cache = {}
+        for discussion_summary in self.mr.discussions.list(get_all=True):
+            summary_attributes = getattr(discussion_summary, "attributes", {}) or {}
+            discussion_id = getattr(discussion_summary, "id", None)
+            if discussion_id is None:
+                discussion_id = summary_attributes.get("id")
+            if not discussion_id:
+                continue
+            notes = summary_attributes.get("notes")
+            if notes is None:
+                try:
+                    discussion = self.mr.discussions.get(discussion_id)
+                    notes = (getattr(discussion, "attributes", {}) or {}).get("notes", [])
+                except Exception as error:
+                    get_logger().warning(f"Could not load MR discussion {discussion_id}: {error}")
+                    continue
+
+            should_resolve = False
+            for note in notes:
+                body = note.get("body") or ""
+                author = (note.get("author") or {}).get("username", "").strip().lower()
+                position = note.get("position") or {}
+                if note.get("resolved") or not note.get("resolvable"):
+                    continue
+                if author not in allowed_bots or "```suggestion" not in body:
+                    continue
+
+                old_sha = position.get("head_sha")
+                file_path = position.get("new_path")
+                anchor_line = position.get("new_line")
+                if not old_sha or not file_path or not anchor_line or old_sha == current_sha:
+                    continue
+
+                range_match = re.search(r"```suggestion:-(\d+)\+(\d+)", body)
+                lines_before = int(range_match.group(1)) if range_match else 0
+                lines_after = int(range_match.group(2)) if range_match else 0
+                target_start = int(anchor_line) - 1 - lines_before
+                target_end = int(anchor_line) + lines_after
+
+                old_key = (file_path, old_sha)
+                current_key = (file_path, current_sha)
+                if old_key not in content_cache:
+                    content_cache[old_key] = self.get_pr_file_content(file_path, old_sha)
+                if current_key not in content_cache:
+                    content_cache[current_key] = self.get_pr_file_content(file_path, current_sha)
+                old_content = content_cache[old_key]
+                current_content = content_cache[current_key]
+                if not old_content or not current_content:
+                    continue
+                if not self._suggestion_target_is_unchanged(
+                    old_content,
+                    current_content,
+                    target_start,
+                    target_end,
+                ):
+                    should_resolve = True
+                    break
+
+            if should_resolve and self.resolve_discussion(str(discussion_id)):
+                resolved_discussions.append(str(discussion_id))
+
+        if resolved_discussions:
+            get_logger().info(
+                f"Resolved {len(resolved_discussions)} superseded suggestion discussion(s) on MR {self.id_mr}"
+            )
+        return resolved_discussions
+
     def get_title(self):
         return self.mr.title
 

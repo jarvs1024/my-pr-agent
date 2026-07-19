@@ -33,12 +33,16 @@ Additional scoring considerations:
 - Error handling or type checking suggestions should not receive a score above 8 (and may be lower).
 - If the 'existing_code' snippet is equal to the 'improved_code' snippet, it should not receive a score above 7 (and may be lower).
 - Assume each suggestion is independent and is not influenced by the other suggestions.
+{%- if agents_md_rules %}
+- The repository rules injected below (AGENTS.md) override the upstream "score 0" defaults below for docstring, type-hint, and comment suggestions. When a suggestion explicitly cites one of the repository rule keys in its `suggestion_content` and the cited rule requires docstrings, type hints, or comments, score it as a high-importance finding (typical range 7-9 depending on severity and coverage breadth) rather than 0.
+{%- else %}
 - Assign a score of 0 to suggestions aiming at:
    - Adding docstring, type hints, or comments
    - Remove unused imports or variables
    - Add missing import statements
    - Using more specific exception types.
    - Questions the definition, declaration, import, or initialization of any entity in the PR code, that might be done in the outer codebase.
+{%- endif %}
 
 
 

@@ -240,6 +240,7 @@ auto_extended_mode=true
 num_code_suggestions_per_chunk=3
 max_number_of_calls = 3
 parallel_calls = true
+resolved_suggestions_rule_line_window = 10
 
 final_clip_factor = 0.8
 decouple_hunks = false

@@ -273,3 +273,10 @@ def mark_suggestion_dismissed(suggestion_id: str, actor: str = "", reason: str =
         )
     except Exception as e:
         get_logger().warning(f"telemetry.mark_suggestion_dismissed failed: {e}")
+
+
+def mark_suggestion_superseded(suggestion_id: str) -> None:
+    try:
+        get_default_store().update_suggestion_state(suggestion_id, "superseded")
+    except Exception as e:
+        get_logger().warning(f"telemetry.mark_suggestion_superseded failed: {e}")

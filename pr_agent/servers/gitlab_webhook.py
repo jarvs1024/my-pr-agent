@@ -341,6 +341,44 @@ def _handle_apply_commit(webhook_data: dict) -> None:
     except Exception as e:
         get_logger().warning(f"telemetry.on_apply_commit outer: {e}")
 
+
+def _resolve_superseded_suggestions(pr_url: str) -> list[str]:
+    if not pr_url:
+        return []
+    try:
+        gitlab_user = (get_settings().get("gitlab.user", "") or "").strip()
+        allowed_raw = (
+            get_settings().get("config.allowed_bot_usernames")
+            or get_settings().get("config", {}).get("allowed_bot_usernames")
+            or []
+        )
+        if isinstance(allowed_raw, str):
+            allowed_raw = [username.strip() for username in allowed_raw.split(",") if username.strip()]
+        bot_usernames = set(allowed_raw)
+        if gitlab_user:
+            bot_usernames.add(gitlab_user)
+
+        provider = get_git_provider_with_context(pr_url)
+        resolved_discussions = provider.resolve_superseded_suggestion_discussions(bot_usernames)
+        actor = gitlab_user or (sorted(bot_usernames)[0] if bot_usernames else "pr-agent")
+        store = telemetry_events.get_default_store()
+        for discussion_id in resolved_discussions:
+            suggestion = store.get_suggestion_by_note_id(discussion_id)
+            if suggestion is None or suggestion.get("state") not in ("open", "applied"):
+                continue
+            telemetry_events.mark_suggestion_superseded(suggestion["suggestion_id"])
+            telemetry_events.emit_action(
+                action="resolved",
+                suggestion_id=suggestion["suggestion_id"],
+                mr_id=int(suggestion.get("mr_id") or 0),
+                actor=actor,
+                note=f"superseded by source update; resolved discussion {discussion_id}",
+            )
+        return resolved_discussions
+    except Exception as error:
+        get_logger().warning(f"Failed to resolve superseded suggestions for {pr_url}: {error}")
+        return []
+
 async def handle_request(api_url: str, body: str, log_context: dict, sender_id: str, notify=None):
     log_context["action"] = body
     log_context["event"] = "pull_request" if body == "/review" else "comment"
@@ -481,9 +519,16 @@ def is_draft_ready(data) -> bool:
 
 def should_process_pr_logic(data) -> bool:
     try:
-        if not data.get('object_attributes', {}):
+        # ``object_attributes`` is only present on merge_request payloads,
+        # not on push hooks. Allow push hooks through so the apply-pipeline
+        # can run when an Apply-suggestion commit is pushed; the per-MR
+        # ignore rules (title, labels, target_branch) simply won't apply.
+        # Without this guard, the apply-pipeline silently no-ops on push
+        # hooks because ``_perform_commands_gitlab`` short-circuits on
+        # ``should_process_pr_logic == False`` and never logs the run.
+        if not data.get('object_attributes', {}) and data.get('object_kind') != 'push':
             return False
-        title = data['object_attributes'].get('title')
+        title = data.get('object_attributes', {}).get('title')
         sender = data.get("user", {}).get("username", "")
         repo_full_name = data.get('project', {}).get('path_with_namespace', "")
 
@@ -509,28 +554,31 @@ def should_process_pr_logic(data) -> bool:
 
         #
         if ignore_mr_source_branches:
-            source_branch = data['object_attributes'].get('source_branch')
+            source_branch = data.get('object_attributes', {}).get('source_branch')
             if any(re.search(regex, source_branch) for regex in ignore_mr_source_branches):
                 get_logger().info(
                     f"Ignoring MR with source branch '{source_branch}' due to gitlab.ignore_mr_source_branches settings")
                 return False
 
         if ignore_mr_target_branches:
-            target_branch = data['object_attributes'].get('target_branch')
+            target_branch = data.get('object_attributes', {}).get('target_branch')
             if any(re.search(regex, target_branch) for regex in ignore_mr_target_branches):
                 get_logger().info(
                     f"Ignoring MR with target branch '{target_branch}' due to gitlab.ignore_mr_target_branches settings")
                 return False
 
         if ignore_mr_labels:
-            labels = [label['title'] for label in data['object_attributes'].get('labels', [])]
+            labels = [label['title'] for label in data.get('object_attributes', {}).get('labels', [])]
             if any(label in ignore_mr_labels for label in labels):
                 labels_str = ", ".join(labels)
                 get_logger().info(f"Ignoring MR with labels '{labels_str}' due to gitlab.ignore_mr_labels settings")
                 return False
 
         if ignore_mr_title:
-            if any(re.search(regex, title) for regex in ignore_mr_title):
+            # title is None for push hooks (no MR object); skip the
+            # regex match so we don't TypeError on ``re.search(None, ...)``
+            # and end up returning False from the outer except.
+            if title and any(re.search(regex, title) for regex in ignore_mr_title):
                 get_logger().info(f"Ignoring MR with title '{title}' due to gitlab.ignore_mr_title settings")
                 return False
     except Exception as e:
@@ -590,7 +638,8 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
         # branch in this handler). Returns success on hit to avoid the
         # dispatcher's normal push/MR handling running again on the same event.
         try:
-            if _resolve_apply_event(data) is not None:
+            apply_event = _resolve_apply_event(data)
+            if apply_event is not None:
                 _handle_apply_commit(data)
                 # Description-only / label-only MR updates carry ``last_commit``
                 # whose message still matches the original "Apply N suggestion(s)"
@@ -628,6 +677,39 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                     get_logger().warning(
                         f"apply-path _emit_mr_activity failed: {_emit_apply_err}"
                     )
+                apply_mr_iid = apply_event.get("mr_iid")
+                apply_url = apply_event.get("pr_url")
+                if not apply_url:
+                    lookup_mr_id, lookup_url = _lookup_mr_for_push(
+                        apply_event.get("project_id") or (data.get("project") or {}).get("id"),
+                        apply_event.get("ref") or "",
+                    )
+                    if lookup_url:
+                        apply_url = lookup_url
+                    elif apply_mr_iid:
+                        project_web = (data.get("project") or {}).get("web_url", "").rstrip("/")
+                        if project_web:
+                            apply_url = f"{project_web}/-/merge_requests/{apply_mr_iid}"
+                if apply_url:
+                    _resolve_superseded_suggestions(apply_url)
+                # GitLab fires both a ``push`` hook AND a ``merge_request update``
+                # hook for the same Apply-suggestion commit. The push hook arrives
+                # first and runs ``apply_commands`` below; the merge_request update
+                # arrives second and would otherwise re-run
+                # ``/describe + /review + /improve`` on the same diff, producing
+                # duplicate review comments and duplicate ``/improve`` suggestions.
+                # Stop at the merge_request update branch — telemetry is already
+                # up to date, and the push hook already chained ``apply_commands``.
+                if data.get("object_kind") == "merge_request":
+                    get_logger().info(
+                        "apply-pipeline: skipping apply_commands re-run on "
+                        "merge_request update hook (push hook already chained "
+                        "apply_commands for this commit); telemetry already updated."
+                    )
+                    return JSONResponse(
+                        status_code=status.HTTP_200_OK,
+                        content=jsonable_encoder({"message": "apply-mr-update-noop"})
+                    )
                 # Re-run the user-configured ``apply_commands`` pipeline so
                 # /describe updates the Description, /review refreshes the
                 # parent review guide, and /improve issues any remaining
@@ -638,42 +720,30 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                 # We deliberately do NOT return here — the apply commit must
                 # both update telemetry AND chain into apply_commands.
                 apply_cmds = get_settings().get("gitlab.apply_commands", []) or []
-                if apply_cmds:
-                    # Resolve a usable MR url: merge_request-update payloads
-                    # carry it on object_attributes.url; push payloads don't,
-                    # so reuse the helper that the telemetry path already
-                    # invokes.
-                    apply_ev = _resolve_apply_event(data) or {}
-                    apply_mr_iid = apply_ev.get("mr_iid")
-                    apply_url = apply_ev.get("pr_url")
-                    if not apply_url:
-                        # push payloads don't carry a pr_url; look it up via
-                        # the project REST API using the push ref. Fall back
-                        # to constructing the URL from project.web_url only
-                        # when we actually have an iid, so we never produce
-                        # the broken ".../merge_requests/" (empty iid) form.
-                        lookup_mr_id, lookup_url = _lookup_mr_for_push(
-                            apply_ev.get("project_id") or (data.get("project") or {}).get("id"),
-                            apply_ev.get("ref") or "",
+                if apply_cmds and apply_url:
+                    try:
+                        await _perform_commands_gitlab(
+                            "apply_commands", PRAgent(), apply_url, log_context, data
                         )
-                        if lookup_url:
-                            apply_url = lookup_url
-                        elif apply_mr_iid:
-                            project_web = (data.get("project") or {}).get("web_url", "").rstrip("/")
-                            if project_web:
-                                apply_url = f"{project_web}/-/merge_requests/{apply_mr_iid}"
-                    if apply_url:
-                        try:
-                            await _perform_commands_gitlab(
-                                "apply_commands", PRAgent(), apply_url, log_context, data
-                            )
-                        except Exception as _apply_chain_err:
-                            get_logger().warning(
-                                f"apply_commands re-run failed: {_apply_chain_err}"
-                            )
+                    except Exception as _apply_chain_err:
+                        get_logger().warning(
+                            f"apply_commands re-run failed: {_apply_chain_err}"
+                        )
                 return JSONResponse(status_code=status.HTTP_200_OK, content=jsonable_encoder({"message": "apply-handled"}))
         except Exception as e:
-            get_logger().warning(f"_handle_apply_commit early-exit outer: {e}")
+            # Catch any unexpected error from the apply-pipeline so we
+            # don't fall through to the main dispatcher (which would
+            # re-run push_commands on the same event and produce
+            # duplicate review comments + /improve suggestions).
+            # Each inner step (_handle_apply_commit, _emit_mr_activity,
+            # the apply_commands chain) already has its own try/except,
+            # so this is a defence-in-depth net for genuinely
+            # unexpected exceptions (e.g. JSON encoding failures).
+            get_logger().warning(f"apply-pipeline failed: {e}")
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content=jsonable_encoder({"message": "apply-error"}),
+            )
         if data.get('object_kind') == 'merge_request':
             # ignore MRs based on title, labels, source and target branches
             if not should_process_pr_logic(data):
@@ -731,6 +801,7 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                 # push commands or handle_push_trigger.
                 if object_attributes.get('oldrev'):
                     apply_repo_settings(url)
+                    _resolve_superseded_suggestions(url)
                     commands_on_push = get_settings().get(f"gitlab.push_commands", {})
                     handle_push_trigger = get_settings().get(f"gitlab.handle_push_trigger", False)
                     if not commands_on_push or not handle_push_trigger:

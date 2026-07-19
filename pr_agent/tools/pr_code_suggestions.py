@@ -228,19 +228,46 @@ class PRCodeSuggestions:
                     )})
 
                     # Inline-only path has no persistent review body for the coverage
-                    # checklist; emit a standalone comment so reviewers still see which
-                    # AGENTS.md rules the LLM silently dropped. No DiffNote created.
+                    # checklist. Decide what to post based on what the pipeline
+                    # actually did with the LLM output:
+                    #   1. LLM emitted 0 suggestions -> "no suggestions found"
+                    #   2. LLM emitted N but pipeline suppressed all of them
+                    #      -> tell the reviewer explicitly which lines were
+                    #         skipped, so they don't mistake silence for a
+                    #         clean review.
+                    #   3. Otherwise -> standard rule-coverage checklist.
+                    _outcome = getattr(self, '_last_suggestion_outcome', None) or {}
                     if get_settings().config.publish_output:
-                        _inline_uncovered = compute_uncovered_rules(
-                            self.vars.get("agents_md_rules") or [],
-                            data.get("code_suggestions") or [],
-                        )
-                        _inline_total = len(self.vars.get("agents_md_rules") or [])
-                        _inline_details = render_uncovered_details(
-                            _inline_uncovered, total_required=_inline_total,
-                        )
-                        if _inline_details:
-                            self.git_provider.publish_comment(_inline_details)
+                        if (_outcome.get('llm_emitted', 0) > 0
+                                and _outcome.get('kept', 0) == 0
+                                and _outcome.get('suppressed_count', 0) > 0):
+                            _sup_lines = _outcome.get('suppressed_lines') or []
+                            _shown = _sup_lines[:5]
+                            _more = len(_sup_lines) - len(_shown)
+                            _lines_str = ", ".join(
+                                f"{fn.rsplit('/', 1)[-1]}:L{ln}"
+                                for fn, ln, _ in _shown
+                            )
+                            _more_str = f" 等 {len(_sup_lines)} 处" if _more > 0 else ""
+                            _body = (
+                                "本次 `/improve` 生成 **" + str(len(_sup_lines)) + "** 条建议，"
+                                " 但都匹配到已 resolve 的位置或同规则行号漂移记录，已自动跳过：\n\n"
+                                "- " + _lines_str + _more_str + "\n\n"
+                                "如果这些行仍然有问题，可手动修改源文件后再跑 `/improve`，"
+                                " 或先用 `/suggestion_status` 看 telemetry 状态。"
+                            )
+                            self.git_provider.publish_comment(_body)
+                        else:
+                            _inline_uncovered = compute_uncovered_rules(
+                                self.vars.get("agents_md_rules") or [],
+                                data.get("code_suggestions") or [],
+                            )
+                            _inline_total = len(self.vars.get("agents_md_rules") or [])
+                            _inline_details = render_uncovered_details(
+                                _inline_uncovered, total_required=_inline_total,
+                            )
+                            if _inline_details:
+                                self.git_provider.publish_comment(_inline_details)
             else:
                 get_logger().info('Code suggestions generated for PR, but not published since publish_output is False.')
                 pr_body = self.generate_summarized_suggestions(data)
@@ -681,6 +708,10 @@ class PRCodeSuggestions:
 
                 if ('existing_code' in suggestion) and ('improved_code' in suggestion):
                     suggestion = self._truncate_if_needed(suggestion)
+                    # Reject suggestions that look like LLM body-truncation
+                    # hallucinations (replacing function bodies with '...')
+                    # before they ever reach the GitLab DiffNote pipeline.
+                    suggestion = self.validate_suggestion_does_not_truncate_body(suggestion)
                     one_sentence_summary_list.append(suggestion['one_sentence_summary'])
                     suggestion_list.append(suggestion)
                 else:
@@ -691,6 +722,185 @@ class PRCodeSuggestions:
         data['code_suggestions'] = suggestion_list
 
         return data
+
+    def _suppress_resolved_suggestions(self, code_suggestions):
+        """Drop suggestions whose (file, line) is already resolved.
+
+        When /improve is re-run after an Apply or /dismiss, the LLM has
+        no memory of prior emissions and may produce the same finding
+        again.  Looking at the telemetry store, we know which lines
+        have been marked applied or dismissed, and we can suppress
+        them here so the MR does not collect duplicate DiffNotes.
+
+        Returns the filtered list.  Telemetry / state are not touched.
+        """
+        if not code_suggestions:
+            return code_suggestions
+        try:
+            mr_id = (
+                getattr(self.git_provider, "id_mr", None)
+                or getattr(self.git_provider, "pr_id", None)
+                or getattr(getattr(self.git_provider, "pr", None), "iid", None)
+                or getattr(getattr(self.git_provider, "pr", None), "id", 0)
+            )
+            raw_project = (
+                getattr(self.git_provider, "id_project", None)
+                or getattr(self.git_provider, "project_id", None)
+                or 0
+            )
+            project_id = raw_project
+            if not isinstance(raw_project, int):
+                try:
+                    gl = getattr(self.git_provider, "gl", None)
+                    if gl is not None and raw_project:
+                        project_id = gl.projects.get(raw_project).id
+                except Exception:
+                    project_id = 0
+            if not mr_id:
+                return code_suggestions
+            pr_url = (
+                getattr(self.git_provider, "pr_url", None)
+                or getattr(getattr(self.git_provider, "pr", None), "web_url", None)
+            )
+            existing = telemetry_events.get_default_store().list_suggestions(
+                mr_id=int(mr_id),
+                project_id=int(project_id) if project_id else None,
+                attach_severity=False,
+                pr_url=pr_url,
+            )
+        except Exception as e:
+            get_logger().debug(f"suppress-resolved lookup failed (skip): {e}")
+            return code_suggestions
+
+        # Build (file, line) -> resolved suggestion metadata. A small
+        # line-window (3 lines) catches ordinary re-anchoring. Dismissed
+        # suggestions with the same repository rule key get a wider window,
+        # because unrelated applies can move the same function by more lines.
+        resolved = {}
+        for s in existing:
+            state = s.get("state")
+            if state not in ("applied", "dismissed"):
+                continue
+            f = (s.get("file") or "").strip()
+            ln = s.get("line")
+            if not f or not ln:
+                continue
+            prior_rule_keys = set(telemetry_events.extract_rule_keys_from_text(str(s.get("rule_keys") or "")))
+            resolved.setdefault(f, {}).setdefault(ln, []).append({
+                "state": state,
+                "rule_keys": prior_rule_keys,
+            })
+
+        def _states(entries):
+            return {entry["state"] for entry in entries} if entries else None
+
+        def _is_resolved(file, line, rule_keys):
+            fmap = resolved.get((file or "").strip())
+            if not fmap or not line:
+                return None
+            # exact line hit
+            states = _states(fmap.get(line))
+            if states:
+                return states
+            # ±3 line hit (LLM often re-anchors suggestions after the
+            # file is updated; the resolved line is typically within
+            # the same function body)
+            for delta in range(1, 4):
+                for candidate in (line - delta, line + delta):
+                    states = _states(fmap.get(candidate))
+                    if states:
+                        return states
+            if rule_keys:
+                rule_line_window = int(
+                    get_settings().pr_code_suggestions.get("resolved_suggestions_rule_line_window", 10)
+                )
+                for delta in range(4, rule_line_window + 1):
+                    for candidate in (line - delta, line + delta):
+                        entries = fmap.get(candidate) or []
+                        if any(
+                            entry["state"] == "dismissed" and rule_keys.intersection(entry["rule_keys"])
+                            for entry in entries
+                        ):
+                            return {"dismissed"}
+            return None
+
+        kept = []
+        dropped = 0
+        for cs in code_suggestions:
+            f = cs.get("relevant_file")
+            ln = cs.get("relevant_lines_start")
+            original_suggestion = cs.get("original_suggestion") or {}
+            rule_text = " ".join([
+                str(cs.get("body") or ""),
+                str(original_suggestion.get("suggestion_content") or ""),
+                str(original_suggestion.get("one_sentence_summary") or ""),
+            ])
+            rule_keys = set(telemetry_events.extract_rule_keys_from_text(rule_text))
+            states = _is_resolved(f, ln, rule_keys)
+            if states:
+                get_logger().info(
+                    f"suppress-resolved: skip {f}:{ln} (prior state={sorted(states)})"
+                )
+                dropped += 1
+                continue
+            kept.append(cs)
+        if dropped:
+            get_logger().info(
+                f"push_inline_code_suggestions: suppressed {dropped} already-resolved suggestion(s)"
+            )
+        return kept
+
+    def _dedup_same_round_suggestions(self, code_suggestions):
+        """Drop overlapping suggestions emitted in the same LLM round.
+
+        When the LLM produces two patches targeting the same file / start
+        line / label (e.g. one inline patch + one full-function replacement
+        for the same NO-LOG-EXC fix), only the highest-scoring one is kept.
+        Suggestions with different rule labels at the same line are
+        preserved, so a DOCSTRING + TYPEHINTS pair on the same function
+        is not collapsed.
+        """
+        groups = {}
+        order = []
+        for cs in code_suggestions:
+            key = (
+                (cs.get("relevant_file") or "").strip(),
+                cs.get("relevant_lines_start"),
+                (cs.get("label") or "").strip(),
+            )
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(cs)
+
+        kept = []
+        dropped = 0
+        for key in order:
+            bucket = groups[key]
+            if len(bucket) == 1:
+                kept.append(bucket[0])
+                continue
+            bucket.sort(
+                key=lambda x: (x.get("original_suggestion") or {}).get("score") or 0,
+                reverse=True,
+            )
+            winner = bucket[0]
+            kept.append(winner)
+            for loser in bucket[1:]:
+                dropped += 1
+                get_logger().info(
+                    "same-round dedup: drop "
+                    f"{loser.get('relevant_file')}:{loser.get('relevant_lines_start')} "
+                    f"(label={key[2]!r}, score="
+                    f"{(loser.get('original_suggestion') or {}).get('score')}) "
+                    f"in favor of higher-scored duplicate (score="
+                    f"{(winner.get('original_suggestion') or {}).get('score')})"
+                )
+        if dropped:
+            get_logger().info(
+                f"push_inline_code_suggestions: same-round dedup dropped {dropped} duplicate(s)"
+            )
+        return kept
 
     async def push_inline_code_suggestions(self, data):
         code_suggestions = []
@@ -730,10 +940,34 @@ class PRCodeSuggestions:
                 code_suggestions.append({'body': body, 'relevant_file': relevant_file,
                                          'relevant_lines_start': relevant_lines_start,
                                          'relevant_lines_end': relevant_lines_end,
+                                         'label': label,
                                          'original_suggestion': d})
             except Exception:
                 get_logger().info(f"Could not parse suggestion: {d}")
 
+        pre_dedup_count = len(code_suggestions)
+        code_suggestions = self._dedup_same_round_suggestions(code_suggestions)
+        dedup_dropped = pre_dedup_count - len(code_suggestions)
+        pre_suppress_count = len(code_suggestions)
+        # Capture (file, line, label) for every entry we are about to feed
+        # into _suppress_resolved_suggestions so we can tell the reviewer
+        # exactly which lines were dropped on the way out.
+        suppressed_lines = [
+            (cs.get('relevant_file'), cs.get('relevant_lines_start'), (cs.get('label') or '').strip())
+            for cs in code_suggestions
+        ]
+        code_suggestions = self._suppress_resolved_suggestions(code_suggestions)
+        suppressed_count = pre_suppress_count - len(code_suggestions)
+        self._last_suggestion_outcome = {
+            'llm_emitted': pre_dedup_count,
+            'dedup_dropped': dedup_dropped,
+            'suppressed_count': suppressed_count,
+            'kept': len(code_suggestions),
+            'suppressed_lines': suppressed_lines[:suppressed_count],
+        }
+        if not code_suggestions:
+            get_logger().info('All LLM suggestions were already applied or dismissed.')
+            return
         is_successful = self.git_provider.publish_code_suggestions(code_suggestions)
         # Emit telemetry events for the suggestions we just attempted to publish.
         try:
@@ -814,10 +1048,21 @@ class PRCodeSuggestions:
                 original_initial_spaces = len(original_initial_line) - len(original_initial_line.lstrip()) # lstrip works both for spaces and tabs
                 suggested_initial_spaces = len(suggested_initial_line) - len(suggested_initial_line.lstrip())
                 delta_spaces = original_initial_spaces - suggested_initial_spaces
-                if delta_spaces > 0:
+                if delta_spaces != 0:
                     # Detect indentation character from original line
                     indent_char = '\t' if original_initial_line.startswith('\t') else ' '
-                    new_code_snippet = textwrap.indent(new_code_snippet, delta_spaces * indent_char).rstrip('\n')
+                    if delta_spaces > 0:
+                        new_code_snippet = textwrap.indent(new_code_snippet, delta_spaces * indent_char)
+                    else:
+                        # LLM sometimes emits `improved_code` with extra leading
+                        # whitespace (e.g. a module-level `def` carried over from
+                        # a nested snippet context). Strip the common leading
+                        # whitespace first so the diff lands at the right column.
+                        # textwrap.dedent is a no-op when the snippet has no
+                        # common leading whitespace, so this is safe even when
+                        # the snippet is already at the right indentation.
+                        new_code_snippet = textwrap.dedent(new_code_snippet)
+                    new_code_snippet = new_code_snippet.rstrip('\n')
         except Exception as e:
             get_logger().error("Error when dedenting code snippet for file {relevant_file}, error: %s", format_exception_chain(e))
 
@@ -848,6 +1093,62 @@ class PRCodeSuggestions:
         except Exception as e:
             get_logger().exception(f"Error validating one-liner suggestion", artifact={"error": e})
 
+        return suggestion
+
+    def validate_suggestion_does_not_truncate_body(self, suggestion):
+        """Guard against LLM body-truncation hallucination.
+
+        When the model is asked to add a docstring / refactor a function, it
+        sometimes emits an ``improved_code`` where the original body has been
+        replaced with a single ``...`` (Ellipsis) on its own line, leaving the
+        function effectively unimplemented. Applying that suggestion via the
+        GitLab UI then silently deletes real code (e.g. note 2060 on MR 78
+        destroyed four function bodies in ``services/payment_router.py``).
+
+        Heuristic rejection: when the original code has >= 4 non-blank lines,
+        the improved code has >= 1 standalone ``...`` line, and the improved
+        code lost >= 40% of the line count, set ``score`` to 0 so the
+        downstream ``score_threshold`` filter drops it.
+        """
+        try:
+            existing_code = (suggestion.get("existing_code") or "").strip()
+            improved_code = (suggestion.get("improved_code") or "").strip()
+            if not existing_code or not improved_code:
+                return suggestion
+
+            orig_lines = [ln for ln in existing_code.splitlines() if ln.strip()]
+            new_lines = [ln for ln in improved_code.splitlines() if ln.strip()]
+            ellipsis_count = sum(1 for ln in new_lines if ln.strip() == "...")
+
+            # Count how many *real* (non-Ellipsis) lines disappeared between
+            # existing_code and improved_code. If the LLM dropped >= 2 real
+            # lines AND introduced at least one Ellipsis placeholder, the
+            # suggestion is almost certainly a body-truncation hallucination.
+            lost_real_lines = len(orig_lines) - (len(new_lines) - ellipsis_count)
+
+            if (len(orig_lines) >= 4
+                    and ellipsis_count >= 1
+                    and lost_real_lines >= 2):
+                suggestion["score"] = 0
+                suggestion["score_why"] = (
+                    f"body-truncation guard: improved_code replaces "
+                    f"{len(orig_lines)} original lines with "
+                    f"{len(new_lines)} lines including {ellipsis_count} "
+                    f"standalone '...' Ellipsis — looks like LLM "
+                    f"body-truncation hallucination, rejected."
+                )
+                get_logger().warning(
+                    f"validate_suggestion_does_not_truncate_body: rejected "
+                    f"{suggestion.get('relevant_file')}:"
+                    f"{suggestion.get('relevant_lines_start')} "
+                    f"({len(orig_lines)}->{len(new_lines)} lines, "
+                    f"{ellipsis_count} '...')"
+                )
+        except Exception as e:
+            get_logger().exception(
+                "Error in validate_suggestion_does_not_truncate_body",
+                artifact={"error": e},
+            )
         return suggestion
 
     def remove_line_numbers(self, patches_diff_list: List[str]) -> List[str]:
@@ -1124,7 +1425,8 @@ class PRCodeSuggestions:
                          'num_code_suggestions': len(suggestion_list),
                          'prev_suggestions_str': prev_suggestions_str,
                          "is_ai_metadata": get_settings().get("config.enable_ai_metadata", False),
-                         'duplicate_prompt_examples': get_settings().config.get('duplicate_prompt_examples', False)}
+                         'duplicate_prompt_examples': get_settings().config.get('duplicate_prompt_examples', False),
+                         'agents_md_rules': self.vars.get('agents_md_rules') or []}
             environment = Environment(undefined=StrictUndefined)
 
             if dedicated_prompt:
