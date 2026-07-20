@@ -702,9 +702,10 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                 # up to date, and the push hook already chained ``apply_commands``.
                 if data.get("object_kind") == "merge_request":
                     get_logger().info(
-                        "apply-pipeline: skipping apply_commands re-run on "
+                        "apply-pipeline: skipping command re-run on "
                         "merge_request update hook (push hook already chained "
-                        "apply_commands for this commit); telemetry already updated."
+                        "apply_commands + push_commands for this commit); "
+                        "telemetry already updated."
                     )
                     return JSONResponse(
                         status_code=status.HTTP_200_OK,
@@ -728,6 +729,25 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                     except Exception as _apply_chain_err:
                         get_logger().warning(
                             f"apply_commands re-run failed: {_apply_chain_err}"
+                        )
+                # Chain push_commands too so /describe + /review + /improve
+                # re-run against the post-Apply diff. Most deployments only
+                # configure push_commands (not apply_commands), so without
+                # this the reviewer sees no fresh feedback after an Apply
+                # click — the apply-pipeline guard short-circuits before the
+                # normal push dispatcher would have run them.
+                # Guard with handle_push_trigger so deployments that opt out
+                # of push_commands (e.g. gate on reviewers only) stay opted out.
+                push_cmds = get_settings().get("gitlab.push_commands", []) or []
+                handle_push_trigger = get_settings().get("gitlab.handle_push_trigger", False)
+                if push_cmds and handle_push_trigger and apply_url:
+                    try:
+                        await _perform_commands_gitlab(
+                            "push_commands", PRAgent(), apply_url, log_context, data
+                        )
+                    except Exception as _push_chain_err:
+                        get_logger().warning(
+                            f"push_commands re-run (post-apply) failed: {_push_chain_err}"
                         )
                 return JSONResponse(status_code=status.HTTP_200_OK, content=jsonable_encoder({"message": "apply-handled"}))
         except Exception as e:
