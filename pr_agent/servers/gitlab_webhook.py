@@ -701,16 +701,30 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                 # Stop at the merge_request update branch — telemetry is already
                 # up to date, and the push hook already chained ``apply_commands``.
                 if data.get("object_kind") == "merge_request":
-                    get_logger().info(
-                        "apply-pipeline: skipping command re-run on "
-                        "merge_request update hook (push hook already chained "
-                        "apply_commands + push_commands for this commit); "
-                        "telemetry already updated."
-                    )
-                    return JSONResponse(
-                        status_code=status.HTTP_200_OK,
-                        content=jsonable_encoder({"message": "apply-mr-update-noop"})
-                    )
+                    # If the MR update is push-driven (oldrev set), fall through
+                    # so the action=update dispatcher can run push_commands.
+                    # This covers deployments that configure "Merge request events"
+                    # but NOT "Push events" in GitLab webhook settings — the push
+                    # hook never arrives, so we cannot rely on it having chained
+                    # commands. Telemetry is already updated; the action=update
+                    # handler is idempotent for _resolve_superseded_suggestions.
+                    if (data.get("object_attributes") or {}).get("oldrev"):
+                        get_logger().info(
+                            "apply-pipeline: telemetry updated on push-driven "
+                            "MR update; falling through to action=update "
+                            "dispatcher to run push_commands."
+                        )
+                        # Don't return — let the dispatcher handle it.
+                    else:
+                        get_logger().info(
+                            "apply-pipeline: skipping command re-run on "
+                            "non-push-driven MR update (description-only "
+                            "change); telemetry already updated."
+                        )
+                        return JSONResponse(
+                            status_code=status.HTTP_200_OK,
+                            content=jsonable_encoder({"message": "apply-mr-update-noop"})
+                        )
                 # Re-run the user-configured ``apply_commands`` pipeline so
                 # /describe updates the Description, /review refreshes the
                 # parent review guide, and /improve issues any remaining
