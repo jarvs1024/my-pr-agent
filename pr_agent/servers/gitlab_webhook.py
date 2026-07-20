@@ -443,7 +443,7 @@ def is_bot_user(data) -> bool:
         if any(indicator in sender_name for indicator in bot_indicators):
             get_logger().info(f"Skipping GitLab bot user: {sender_name}")
             return True
-        if sender_username.endswith("-bot") or sender_username.endswith("_bot"):
+        if (sender_username.endswith("-bot") or sender_username.endswith("_bot") or sender_username.endswith("bot")):
             get_logger().info(f"Skipping GitLab bot username: {sender_username}")
             return True
     except Exception as e:
@@ -471,7 +471,7 @@ def _is_sender_bot_account(data) -> bool:
         sender_username = (data.get("user", {}).get("username") or "").lower()
         if not sender_username:
             return False
-        if sender_username.endswith("-bot") or sender_username.endswith("_bot"):
+        if (sender_username.endswith("-bot") or sender_username.endswith("_bot") or sender_username.endswith("bot")):
             return True
         bot_indicators = ['codium', 'bot_', 'bot-', '_bot', '-bot']
         if any(indicator in sender_name for indicator in bot_indicators):
