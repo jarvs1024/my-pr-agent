@@ -278,6 +278,30 @@ class LiteLLMAIHandler(BaseAiHandler):
         # Models that require streaming
         self.streaming_required_models = STREAMING_REQUIRED_MODELS
 
+        # Zhipu (GLM) keep-alive hardening: when LITELLM.ZHIPU_NATIVE_FALLBACK=true,
+        # replace the litellm-managed httpx client with one that disables HTTP keep-alive.
+        # Each /improve / /review / /describe call then forces a fresh TCP+TLS handshake
+        # to BigModel, which avoids corporate NAT / proxy idle timeouts that cut long
+        # streaming requests (>120s) and produce httpx.RemoteProtocolError / connection
+        # reset failures. Trade-off: +200~500ms TLS handshake per LLM call.
+        if get_settings().get("LITELLM.ZHIPU_NATIVE_FALLBACK", False):
+            try:
+                import httpx as _httpx
+                _limits = _httpx.Limits(max_keepalive_connections=0, max_connections=20)
+                _timeout = _httpx.Timeout(connect=10, read=900, write=10, pool=10)
+                _sync_client = _httpx.Client(timeout=_timeout, limits=_limits)
+                _async_client = _httpx.AsyncClient(timeout=_timeout, limits=_limits)
+                litellm.client_session = _sync_client
+                litellm.aclient_session = _async_client
+                get_logger().info(
+                    "Zhipu keep-alive disabled: litellm.client_session replaced with "
+                    "max_keepalive_connections=0 httpx client (LITELLM.ZHIPU_NATIVE_FALLBACK=true)"
+                )
+            except Exception as _z_err:
+                get_logger().warning(
+                    f"Failed to apply LITELLM.ZHIPU_NATIVE_FALLBACK patch: {_z_err}"
+                )
+
     @staticmethod
     def _write_frozen_aws_creds_to_env(frozen) -> None:
         """Write a botocore FrozenCredentials snapshot into os.environ for litellm/Bedrock."""
