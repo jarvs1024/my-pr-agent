@@ -335,6 +335,42 @@ Base path: `/api/v1/telemetry`. 所有 endpoint 返回 JSON. 默认端口是 pr-
 `suggestions` 表新增 `dismissed_reason TEXT` 列 (idempotent migration, 旧库自动 `ALTER TABLE` 加上).
 `Suggestion` dataclass (`pr_agent/telemetry/models.py`) 同步加字段. `mark_suggestion_dismissed(suggestion_id, actor, reason)` 接受 `reason` 参数.
 
+## Adopt (隐式接受) 追踪
+
+用户在代码建议 thread 里表达"按建议改了 (包含手动重写/ux)"的意思时, 可以回复 `/adopt` (可选带理由). 与
+`/dismiss` 对称, `/adopt` 也会解决该条 DiffNote (让应用提示按钮不再可点), 但会在 `action_events` 表里
+写一行 `action = 'adopted_implicitly'` 而不是 `'dismissed'`, 供接纳率分析使用.
+
+示意字段: `effective_adoption_rate = (applied + adopted_implicitly) / total`,
+旧字段 `adoption_rate = applied / total` 保留 (向后兼容).
+
+三种写法, 都有效:
+
+| 输入 | `action_events.action` | suggestions.state |
+|------|---------------------|-------------------|
+| `/adopt` | `adopted_implicitly` (note = NULL) | `dismissed` |
+| `/adopt 改用 logging` | `adopted_implicitly` (note = `改用 logging`) | `dismissed` |
+| `/adopt
+第一行
+第二行` | `adopted_implicitly` (note = `第一行\n第二行`) | `dismissed` |
+
+解析逻辑在 `pr_agent/servers/gitlab_webhook.py`: 首先匹配 `adopt` 关键字 (大小写不敏感,
+边界检查, 拦截 `adoption` / `dismissed` 这类含该子串的词), 然后以匹配位置为分界
+拆出 reason, 给两端上 wrapper-strip regex (ascii 引号 + CJK 标点 + 全角双引号 + 全角冒号 U+FF1A,
+以及连字符 / 下划线 / 括号等).
+
+与 `/dismiss` 互为补集, 两者连起来能够提供以下信息:
+
+- `suggestion_counts.adoption_rate` — 被用户采纳 (点应用按钮)
+- `suggestion_counts.effective_adoption_rate` — 采纳 + 隐式接受 (`/adopt`), 这个是推荐的衡量指标
+- `dismissal_rate` — `dismissed` 的比例, 反映推荐质量
+- `/dismissals` 该路径仍然只包含被拒绝的建议, 不受影响
+
+### API 补充
+
+`GET /api/v1/telemetry/mrs/{p}/{m}/stats` 在 `adoption_rate` 之外多一个 `effective_adoption_rate` 字段, 內容是
+`(applied + adopted_implicitly) / total`. 老 dashboard 如果只读 `adoption_rate` 不会跳变.
+
 ### API
 
 `GET /api/v1/telemetry/dismissals` — 被 dismiss 的建议明细 (含 `dismissed_reason`):

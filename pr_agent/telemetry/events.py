@@ -274,6 +274,17 @@ def mark_suggestion_dismissed(suggestion_id: str, actor: str = "", reason: str =
     except Exception as e:
         get_logger().warning(f"telemetry.mark_suggestion_dismissed failed: {e}")
 
+def mark_suggestion_adopted(suggestion_id: str, actor: str = "", reason: str = "") -> None:
+    """State-update helper for /adopt (manual / rewritten adoption).
+
+    Reuses ``mark_suggestion_dismissed`` (state = dismissed) so the
+    suggestions table schema is unchanged. The distinction between
+    "ignored" and "implicitly adopted" lives in the action_events table
+    (action=adopted_implicitly) and is surfaced via ``adoption_rate``
+    in the telemetry API.
+    """
+    mark_suggestion_dismissed(suggestion_id, actor=actor, reason=reason)
+
 
 def mark_suggestion_superseded(suggestion_id: str) -> None:
     try:

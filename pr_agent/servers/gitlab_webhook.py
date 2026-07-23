@@ -934,6 +934,72 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                 # reply (note body starts with /dismiss or dismiss) is still matched.
                 _sender_is_bot = _is_sender_bot_account(data)
                 _body_stripped = body.lstrip()
+                # /adopt: accept the suggestion (optionally with a reason), even if
+                # the user rewrote it manually. Matched BEFORE /dismiss so a body
+                # like "/adopt 用 dismiss 风格重写" still routes to /adopt (the
+                # user explicitly chose /adopt, so their intent wins). When
+                # neither /adopt nor /dismiss keywords appear, the body is
+                # treated as a normal comment and falls through to the regular
+                # handler_request path. Bot guard mirrors /dismiss: a bot user's
+                # own DiffNote containing the literal word `adopt` must not
+                # trigger anything. The reason is the non-empty text that remains
+                # after stripping the trigger keyword and trivial wrappers
+                # (leading/trailing `/`, `?`, quotes, whitespace and the usual
+                # CJK / ASCII punctuation, including the full-width colon
+                # U+FF1A so a trailing "：" does not pollute the reason).
+                _adopt_match = re.search(r"(?<![A-Za-z0-9])adopt(?![A-Za-z0-9])", body, flags=re.IGNORECASE)
+                if note_type == 'DiffNote' and _adopt_match and not _sender_is_bot:
+                    _adopt_word = _adopt_match.group(0)
+                    _before, _sep, _after = body.partition(_adopt_word)
+                    _reason = (_before + _after).strip()
+                    _wrapper_strip = re.compile(
+                        r'^[\s/\\?"\'\u2018\u2019\u201c\u201d,;:。,;:：!\-—_()]+'
+                        r'|'
+                        r'[\s/\\?"\'\u2018\u2019\u201c\u201d,;:。,;:：!\-—_()]+$'
+                    )
+                    _reason = _wrapper_strip.sub('', _reason).strip()
+                    discussion_id = obj_attrs.get('discussion_id')
+                    if discussion_id:
+                        suggestion = telemetry_events.get_default_store().get_suggestion_by_note_id(discussion_id)
+                        if suggestion is None or suggestion.get('state') not in ('open', 'applied'):
+                            get_logger().info(
+                                f"Ignoring /adopt for non-open suggestion {discussion_id} "
+                                f"(state={suggestion and suggestion.get('state')})"
+                            )
+                            return JSONResponse(
+                                status_code=status.HTTP_200_OK,
+                                content=jsonable_encoder({'message': 'adopt-skipped-state'}),
+                            )
+                        provider = get_git_provider_with_context(pr_url=url)
+                        ok = provider.resolve_discussion(discussion_id)
+                        if ok:
+                            get_logger().info(
+                                f"/adopt resolved MR discussion {discussion_id}"
+                                + (f" (reason={_reason!r})" if _reason else ""))
+                            try:
+                                author = data.get('user', {}).get('username', '')
+                                mr_iid = data.get('merge_request', {}).get('iid')
+                                telemetry_events.emit_action(
+                                    action='adopted_implicitly',
+                                    suggestion_id=suggestion['suggestion_id'],
+                                    mr_id=int(mr_iid or suggestion['mr_id'] or 0),
+                                    actor=author,
+                                    note=_reason,
+                                )
+                                telemetry_events.mark_suggestion_adopted(
+                                    suggestion['suggestion_id'],
+                                    actor=author,
+                                    reason=_reason,
+                                )
+                            except Exception as e:
+                                get_logger().warning(f"telemetry.on_adopt failed: {e}")
+                        else:
+                            get_logger().warning(f"/adopt failed to resolve discussion {discussion_id}")
+                        return JSONResponse(
+                            status_code=status.HTTP_200_OK,
+                            content=jsonable_encoder({'message': 'adopted' if ok else 'adopt fail'}),
+                        )
+
                 _body_looks_like_explicit_dismiss = (
                     _body_stripped.lower().startswith('/dismiss')
                     or _body_stripped.lower().startswith('dismiss')
@@ -955,9 +1021,9 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                     _before, _sep, _after = body.partition(_dismiss_word)
                     _reason = (_before + _after).strip()
                     _wrapper_strip = re.compile(
-                        r'^[\s/\\?"\'\u2018\u2019\u201c\u201d,;:。,;:!\-—_()]+'
+                        r'^[\s/\\?"\'\u2018\u2019\u201c\u201d,;:。,;:：!\-—_()]+'
                         r'|'
-                        r'[\s/\\?"\'\u2018\u2019\u201c\u201d,;:。,;:!\-—_()]+$'
+                        r'[\s/\\?"\'\u2018\u2019\u201c\u201d,;:。,;:：!\-—_()]+$'
                     )
                     _reason = _wrapper_strip.sub('', _reason).strip()
                     discussion_id = obj_attrs.get('discussion_id')

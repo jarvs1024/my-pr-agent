@@ -515,6 +515,17 @@ class TelemetryStore:
             rows = cur.fetchall()
         return [_row_to_run(r) for r in rows]
 
+    def count_adopted_implicitly(self, mr_id: int) -> int:
+        """Count distinct suggestion_ids with action=adopted_implicitly for one MR. """
+        if self.backend != "sqlite" or self._db is None:
+            return 0
+        with self._lock:
+            cur = self._db.execute(
+                "SELECT COUNT(DISTINCT suggestion_id) FROM action_events WHERE mr_id=? AND action=? AND suggestion_id IS NOT NULL",
+                (mr_id, "adopted_implicitly"))
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
+
     def list_actions(self, mr_id: int, limit: int = 50):
         if self.backend != "sqlite" or self._db is None:
             return []

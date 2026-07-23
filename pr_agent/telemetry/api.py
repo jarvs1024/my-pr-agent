@@ -113,6 +113,11 @@ def mr_stats(project_id: int, mr_id: int) -> dict:
     counts = {"applied": 0, "dismissed": 0, "open": 0, "superseded": 0, "total": len(suggestions)}
     for s in suggestions:
         counts[s.get("state", "open")] = counts.get(s.get("state", "open"), 0) + 1
+    # adopted_implicitly is sourced from action_events (not suggestions.state),
+    # since /adopt reuses state=dismissed. The /adopt command writes
+    # action=adopted_implicitly so the dashboard can surface manual/rewritten
+    # adoptions separately from GitLab "Apply suggestion" clicks.
+    counts["adopted_implicitly"] = store.count_adopted_implicitly(mr_id)
     rule_keys = sorted({k for s in suggestions for k in s.get("rule_keys", [])})
     severity_counts: dict[str, int] = {}
     for s in suggestions:
@@ -123,6 +128,9 @@ def mr_stats(project_id: int, mr_id: int) -> dict:
         "project_id": project_id,
         "suggestion_counts": counts,
         "adoption_rate": (counts["applied"] / counts["total"]) if counts["total"] else 0.0,
+        # effective_adoption_rate counts both "applied" (GitLab Apply click) and
+        # "adopted_implicitly" (manual /adopt reply, often with rewritten code) as adoption.
+        "effective_adoption_rate": ((counts["applied"] + counts["adopted_implicitly"]) / counts["total"]) if counts["total"] else 0.0,
         "distinct_rules": rule_keys,
         "severity_counts": severity_counts,
         "runs": runs,
