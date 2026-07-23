@@ -124,7 +124,11 @@ def mr_stats(project_id: int, mr_id: int) -> dict:
         sev = s.get("severity", "unknown")
         severity_counts[sev] = severity_counts.get(sev, 0) + 1
     if counts["total"]:
-        adoption_rate = (counts["applied"] + counts["adopted_implicitly"]) / counts["total"]
+        # state=applied already covers BOTH GitLab Apply-click and /adopt
+        # (mark_suggestion_adopted writes state="applied"). The
+        # drill-down `adopted_implicitly` field is NOT added to the rate to
+        # avoid double-counting /adopt entries.
+        adoption_rate = counts["applied"] / counts["total"]
     else:
         adoption_rate = 0.0
     return {

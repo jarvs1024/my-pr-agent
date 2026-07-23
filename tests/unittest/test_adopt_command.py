@@ -212,18 +212,33 @@ class TestMrStatsSimplified:
             (repo / "pr_agent/telemetry/events.py").read_text(),
         )
 
-    def test_adoption_rate_uses_both_applied_and_adopted_implicitly(self):
-        """The adoption_rate formula must include adopted_implicitly."""
+    def test_adoption_rate_uses_state_applied_only(self):
+        """``adoption_rate`` must read ``counts["applied"]`` (state=applied)
+        only. The /adopt and Apply-click paths both write state="applied"
+        so this single counter covers both flows without double-counting."""
         api_src, _ = self._sources()
-        # Use chr(34) to dodge quote-escaping inside the source-level
-        # assertion — the literal we're looking for contains double
-        # quotes that would collide with the Python string delimiter.
         q = chr(34)
-        needle = (
-            "(counts[" + q + "applied" + q + "] + counts["
-            + q + "adopted_implicitly" + q + "]) / counts[" + q + "total" + q + "]"
-        )
+        needle = "adoption_rate = counts[" + q + "applied" + q + "] / counts[" + q + "total" + q + "]"
         assert needle in api_src
+
+    def test_adoption_rate_does_not_add_adopted_implicitly(self):
+        """Regression guard: an earlier formula added adopted_implicitly to
+        the rate, which double-counted /adopt entries (since
+        mark_suggestion_adopted sets state=applied AND records an
+        adopted_implicitly action)."""
+        api_src, _ = self._sources()
+        assert "applied_adopted_implicitly" not in api_src
+        # No "applied + adopted_implicitly" pattern in the rate line.
+        q = chr(34)
+        bad_needle = "counts[" + q + "applied" + q + "] + counts[" + q + "adopted_implicitly" + q + "]"
+        # Allow it as a comment but never as the rate expression.
+        rate_line = next(
+            (ln for ln in api_src.splitlines() if "adoption_rate =" in ln and "=" in ln and not ln.lstrip().startswith("#")),
+            None,
+        )
+        if rate_line is not None:
+            assert bad_needle not in rate_line
+
 
     def test_effective_adoption_rate_removed(self):
         api_src, _ = self._sources()

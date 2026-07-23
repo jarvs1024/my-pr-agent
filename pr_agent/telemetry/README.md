@@ -357,7 +357,7 @@ Base path: `/api/v1/telemetry`. 所有 endpoint 返回 JSON. 默认端口是 pr-
 
 - `suggestion_counts.state` 二元化 — `applied` / `dismissed` / `open` / `superseded` / `total`
 - `suggestion_counts.adopted_implicitly` — `/adopt` 这一具体路径的次数, drill-down 用
-- `adoption_rate` = `(applied + adopted_implicitly) / total`, 同时覆盖 Apply 按钮和 /adopt 两种采纳
+- `adoption_rate` = `state=applied / total`. 同时覆盖 Apply 按钮与 /adopt 两种采纳路径, 不双计. `adopted_implicitly` 只供 drill-down (drill-in), 不进入 adoption_rate
 - `dismissal_rate` (旧字段) = `dismissed / total`, 不再被 /adopt 污染
 
 ### 旧 v24 字段已删除
