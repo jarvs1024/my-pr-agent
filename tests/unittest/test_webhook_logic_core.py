@@ -59,6 +59,40 @@ def _gitlab_payload(**object_attributes):
     }
 
 
+def test_gitlab_changed_new_line_ranges_parses_multiple_hunks(gitlab_webhook_module):
+    diff = """@@ -8,3 +8,3 @@ def first():
+ unchanged
+-old
++new
+ unchanged
+@@ -27,0 +28,2 @@ def second():
++added_one
++added_two
+"""
+
+    assert gitlab_webhook_module._changed_new_line_ranges(diff) == [(9, 9), (27, 29)]
+
+
+def test_gitlab_changed_new_line_ranges_includes_pure_insertion_anchor(gitlab_webhook_module):
+    diff = """@@ -9,3 +9,4 @@
+ import csv
+ import json
++import logging
+ import os
+"""
+
+    assert gitlab_webhook_module._changed_new_line_ranges(diff) == [(10, 11)]
+
+
+def test_gitlab_changed_new_line_ranges_ignores_deleted_lines(gitlab_webhook_module):
+    diff = """@@ -20,2 +20,0 @@ def removed():
+-old_one
+-old_two
+"""
+
+    assert gitlab_webhook_module._changed_new_line_ranges(diff) == []
+
+
 def test_bitbucket_server_should_process_pr_logic_ignores_author_title_and_branch():
     settings = get_settings()
     original = {

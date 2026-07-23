@@ -317,20 +317,36 @@ class TelemetryStore:
         elif self.backend == "jsonl":
             self._write_jsonl("action", d)
 
-    def mark_file_applied(self, mr_id: int, project_id: int, file: str, *, applied_at: str) -> list[str]:
-        """Mark every open suggestion in (mr_id, project_id, file) as applied.
+    def mark_lines_applied(self, mr_id: int, project_id: int, file: str,
+                        line_ranges: list[tuple[int, int]],
+                        *, applied_at: str) -> list[str]:
+        """Mark open suggestions in (mr_id, project_id, file) whose ``line`` is
+        inside any of ``line_ranges`` as applied.
 
-        Returns the suggestion_ids that were updated. Open + already-resolved rows
-        are left alone (a single push only really applies once; the second
-        confirmation is idempotent but does not flip dismissed -> applied).
+        Returns the suggestion_ids that were updated. Already-resolved rows
+        are left untouched — apply is idempotent and does not flip
+        dismissed -> applied.
+
+        ``line_ranges`` is a list of inclusive (start, end) tuples. An empty
+        list is treated as a no-op (caller must explicitly opt-in to the
+        file-level legacy behaviour via ``mark_file_applied``).
         """
         if self.backend != "sqlite" or self._db is None:
             return []
+        if not line_ranges:
+            return []
         with self._lock:
+            id_clauses = []
+            params: list = []
+            for start, end in line_ranges:
+                id_clauses.append("(line BETWEEN ? AND ?)")
+                params.extend([start, end])
+            where = " OR ".join(id_clauses)
             cur = self._db.execute(
-                "SELECT suggestion_id FROM suggestions "
-                "WHERE project_id=? AND mr_id=? AND file=? AND state='open'",
-                (project_id, mr_id, file),
+                f"SELECT suggestion_id FROM suggestions "
+                f"WHERE project_id=? AND mr_id=? AND file=? "
+                f"AND state='open' AND ({where})",
+                (project_id, mr_id, file, *params),
             )
             ids = [row[0] for row in cur.fetchall()]
             if not ids:
@@ -343,6 +359,28 @@ class TelemetryStore:
             )
             self._db.commit()
         return ids
+
+    def mark_file_applied(self, mr_id: int, project_id: int, file: str, *, applied_at: str) -> list[str]:
+        """Legacy entry point kept for backwards compatibility: marks EVERY
+        open suggestion in (mr_id, project_id, file) as applied.
+
+        New code should use ``mark_lines_applied`` with the exact lines
+        changed by the commit. ``mark_file_applied`` is preserved for
+        webhook paths that cannot fetch a commit diff (e.g. merge_request
+        event without files_hint AND without diff access). It is a strict
+        superset of mark_lines_applied with line_ranges spanning the whole
+        file.
+        """
+        if self.backend != "sqlite" or self._db is None:
+            return []
+        # Wide line range that captures all reasonable suggestion lines. The
+        # max line we ever see on a Python file in this repo is well under
+        # 100_000, so this is a safe upper bound.
+        return self.mark_lines_applied(
+            mr_id=mr_id, project_id=project_id, file=file,
+            line_ranges=[(1, 1_000_000)],
+            applied_at=applied_at,
+        )
 
     def update_suggestion_state(self, suggestion_id: str, state: str, **fields) -> None:
         if self.backend != "sqlite" or self._db is None:

@@ -282,29 +282,35 @@ def _handle_apply_commit(webhook_data: dict) -> None:
             get_logger().warning(f"telemetry.on_apply_commit provider setup: {e}")
             return
         files = list(files_hint)
-        if not files:
-            # merge_request hook has no files_hint. Pull the commit directly via
-            # GitLab REST — python-gitlab's mr.commits.get(sha) returns a
-            # generator method, not a commit object, so we bypass the SDK here.
-            try:
-                import requests
-                gl_token = get_settings().get("GITLAB.PERSONAL_ACCESS_TOKEN")
-                base = get_settings().get("GITLAB.URL", "http://127.0.0.1:8929").rstrip("/")
-                url = f"{base}/api/v4/projects/{project_id}/repository/commits/{sha}/diff"
-                resp = requests.get(
-                    url,
-                    headers={"PRIVATE-TOKEN": gl_token},
-                    params={"per_page": 50},
-                    timeout=10,
+        line_ranges_by_file: dict[str, list[tuple[int, int]]] = {}
+        # Pull the commit directly via GitLab REST even when the push payload
+        # contains file hints: hints identify files, but not which suggestion
+        # lines the Apply button changed.
+        try:
+            import requests
+            gl_token = get_settings().get("GITLAB.PERSONAL_ACCESS_TOKEN")
+            base = get_settings().get("GITLAB.URL", "http://127.0.0.1:8929").rstrip("/")
+            url = f"{base}/api/v4/projects/{project_id}/repository/commits/{sha}/diff"
+            resp = requests.get(
+                url,
+                headers={"PRIVATE-TOKEN": gl_token},
+                params={"per_page": 50},
+                timeout=10,
+            )
+            if resp.ok:
+                for diff_entry in resp.json():
+                    file = diff_entry.get("new_path") or diff_entry.get("old_path")
+                    if not file:
+                        continue
+                    if file not in files:
+                        files.append(file)
+                    line_ranges_by_file[file] = _changed_new_line_ranges(diff_entry.get("diff") or "")
+            else:
+                get_logger().warning(
+                    f"telemetry.on_apply_commit commit lookup status={resp.status_code} sha={sha[:10]}"
                 )
-                if resp.ok:
-                    for d in resp.json():
-                        for key in ("new_path", "old_path"):
-                            f = d.get(key)
-                            if f and f not in files:
-                                files.append(f)
-            except Exception as e:
-                get_logger().warning(f"telemetry.on_apply_commit commit lookup: {e}")
+        except Exception as e:
+            get_logger().warning(f"telemetry.on_apply_commit commit lookup: {e}")
         if not files:
             try:
                 recent = telemetry_events.get_default_store().list_suggestions(
@@ -325,12 +331,19 @@ def _handle_apply_commit(webhook_data: dict) -> None:
         actor = ev.get("actor") or ""
         for file in files:
             try:
+                line_ranges = line_ranges_by_file.get(file, [])
+                if not line_ranges:
+                    get_logger().warning(
+                        f"telemetry.on_apply_commit: no changed new-line ranges for {file}; skipping state update"
+                    )
+                    continue
                 updated = telemetry_events.mark_suggestions_applied(
                     mr_id=int(mr_id),
                     project_id=int(project_id),
                     file=file,
                     actor=actor,
                     apply_event_sha=sha,
+                    line_ranges=line_ranges,
                 )
                 if updated:
                     get_logger().info(
@@ -340,6 +353,43 @@ def _handle_apply_commit(webhook_data: dict) -> None:
                 get_logger().warning(f"telemetry.on_apply_commit per-file: {e}")
     except Exception as e:
         get_logger().warning(f"telemetry.on_apply_commit outer: {e}")
+
+
+def _changed_new_line_ranges(diff: str) -> list[tuple[int, int]]:
+    """Return inclusive ranges for added/replaced lines in a unified diff."""
+    ranges: list[tuple[int, int]] = []
+    new_line = None
+    range_start = None
+    deleted_before_addition = False
+
+    def close_range() -> None:
+        nonlocal range_start
+        if range_start is not None and new_line is not None:
+            ranges.append((range_start, new_line - 1))
+            range_start = None
+
+    for line in diff.splitlines():
+        hunk = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+        if hunk:
+            close_range()
+            new_line = int(hunk.group(1))
+            deleted_before_addition = False
+            continue
+        if new_line is None:
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            if range_start is None:
+                range_start = new_line if deleted_before_addition else max(1, new_line - 1)
+            new_line += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            close_range()
+            deleted_before_addition = True
+        else:
+            close_range()
+            deleted_before_addition = False
+            new_line += 1
+    close_range()
+    return ranges
 
 
 def _resolve_superseded_suggestions(pr_url: str) -> list[str]:
@@ -978,14 +1028,6 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                                 + (f" (reason={_reason!r})" if _reason else ""))
                             try:
                                 author = data.get('user', {}).get('username', '')
-                                mr_iid = data.get('merge_request', {}).get('iid')
-                                telemetry_events.emit_action(
-                                    action='adopted_implicitly',
-                                    suggestion_id=suggestion['suggestion_id'],
-                                    mr_id=int(mr_iid or suggestion['mr_id'] or 0),
-                                    actor=author,
-                                    note=_reason,
-                                )
                                 telemetry_events.mark_suggestion_adopted(
                                     suggestion['suggestion_id'],
                                     actor=author,

@@ -187,7 +187,6 @@ class TestAdoptSourceShape:
 
     def test_adopt_block_present_in_webhook(self):
         src = (self._repo_root() / "pr_agent/servers/gitlab_webhook.py").read_text()
-        assert "adopted_implicitly" in src
         assert "mark_suggestion_adopted(" in src
         assert "resolve_discussion(discussion_id)" in src
         assert src.index("/adopt") < src.index("dismiss_match = re.search")
@@ -253,3 +252,10 @@ class TestMrStatsSimplified:
         assert "mark_suggestion_applied(" in body
         assert "mark_suggestion_dismissed(" not in body
 
+    def test_webhook_adopt_uses_single_action_writer(self):
+        """Webhook delegates action recording to mark_suggestion_adopted only."""
+        webhook_src = (Path(__file__).resolve().parents[2] / "pr_agent/servers/gitlab_webhook.py").read_text()
+        start = webhook_src.find("_adopt_match =")
+        body = webhook_src[start:start + 6000]
+        assert "mark_suggestion_adopted(" in body
+        assert "emit_action(\n                                    action='adopted_implicitly'" not in body

@@ -220,8 +220,9 @@ def emit_action(
 def mark_suggestions_applied(mr_id: int, project_id: int, file: str, *,
                        applied_at: Optional[str] = None,
                        actor: str = "",
-                       apply_event_sha: Optional[str] = None) -> list[str]:
-    """Mark every open suggestion matching (mr, project, file) as applied.
+                       apply_event_sha: Optional[str] = None,
+                       line_ranges: Optional[list[tuple[int, int]]] = None) -> list[str]:
+    """Mark open suggestions matching the file and optional changed lines as applied.
 
     Returns the list of suggestion_ids that were flipped, so the caller can
     also emit `action_events` rows.
@@ -231,7 +232,18 @@ def mark_suggestions_applied(mr_id: int, project_id: int, file: str, *,
         from datetime import datetime, timezone
         applied_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     try:
-        updated = store.mark_file_applied(mr_id=mr_id, project_id=project_id, file=file, applied_at=applied_at)
+        if line_ranges is None:
+            updated = store.mark_file_applied(
+                mr_id=mr_id, project_id=project_id, file=file, applied_at=applied_at
+            )
+        else:
+            updated = store.mark_lines_applied(
+                mr_id=mr_id,
+                project_id=project_id,
+                file=file,
+                line_ranges=line_ranges,
+                applied_at=applied_at,
+            )
     except Exception as e:
         get_logger().warning(f"telemetry.mark_suggestions_applied failed: {e}")
         return []
