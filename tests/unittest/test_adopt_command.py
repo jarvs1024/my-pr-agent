@@ -196,3 +196,45 @@ class TestAdoptSourceShape:
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+class TestMrStatsSimplified:
+    """Source-level checks for the simplified mr_stats schema (v25+).
+
+    The runtime path (mr_stats call) requires a working pr_agent.log
+    module so it is exercised via the e2e MR flow, not unit tests.
+    """
+
+    def _sources(self):
+        repo = Path(__file__).resolve().parents[2]
+        return (
+            (repo / "pr_agent/telemetry/api.py").read_text(),
+            (repo / "pr_agent/telemetry/events.py").read_text(),
+        )
+
+    def test_adoption_rate_uses_both_applied_and_adopted_implicitly(self):
+        """The adoption_rate formula must include adopted_implicitly."""
+        api_src, _ = self._sources()
+        # Use chr(34) to dodge quote-escaping inside the source-level
+        # assertion — the literal we're looking for contains double
+        # quotes that would collide with the Python string delimiter.
+        q = chr(34)
+        needle = (
+            "(counts[" + q + "applied" + q + "] + counts["
+            + q + "adopted_implicitly" + q + "]) / counts[" + q + "total" + q + "]"
+        )
+        assert needle in api_src
+
+    def test_effective_adoption_rate_removed(self):
+        api_src, _ = self._sources()
+        assert "effective_adoption_rate" not in api_src
+
+    def test_mark_suggestion_adopted_uses_applied_state(self):
+        """``/adopt`` must set state=applied (not dismissed)."""
+        _, events_src = self._sources()
+        idx = events_src.find("def mark_suggestion_adopted")
+        assert idx >= 0, "mark_suggestion_adopted not found"
+        body = events_src[idx:idx + 2000]
+        assert "mark_suggestion_applied(" in body
+        assert "mark_suggestion_dismissed(" not in body
+

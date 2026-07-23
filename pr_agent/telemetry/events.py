@@ -277,13 +277,25 @@ def mark_suggestion_dismissed(suggestion_id: str, actor: str = "", reason: str =
 def mark_suggestion_adopted(suggestion_id: str, actor: str = "", reason: str = "") -> None:
     """State-update helper for /adopt (manual / rewritten adoption).
 
-    Reuses ``mark_suggestion_dismissed`` (state = dismissed) so the
-    suggestions table schema is unchanged. The distinction between
-    "ignored" and "implicitly adopted" lives in the action_events table
-    (action=adopted_implicitly) and is surfaced via ``adoption_rate``
-    in the telemetry API.
+    After simplification, ``/adopt`` and the GitLab ``Apply suggestion``
+    button are both counted as adoption: state is set to ``applied`` so
+    ``adoption_rate = state=applied count / total`` covers both flows.
+    The distinction (button vs /adopt) is still recorded in
+    ``action_events.action`` (``applied`` vs ``adopted_implicitly``) for
+    future analysis but is NOT surfaced via the stats API.
     """
-    mark_suggestion_dismissed(suggestion_id, actor=actor, reason=reason)
+    mark_suggestion_applied(suggestion_id)
+    if actor or reason:
+        try:
+            get_default_store().record_action(models.ActionEvent(
+                action="adopted_implicitly",
+                suggestion_id=suggestion_id,
+                mr_id=0,
+                actor=actor,
+                note=reason or None,
+            ))
+        except Exception as e:
+            get_logger().warning(f"telemetry.adopt_action emit failed: {e}")
 
 
 def mark_suggestion_superseded(suggestion_id: str) -> None:
