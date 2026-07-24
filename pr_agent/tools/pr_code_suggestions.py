@@ -1036,6 +1036,19 @@ class PRCodeSuggestions:
                             return new_code_snippet
                         else:
                             original_initial_line = file_lines[relevant_lines_start - 1]
+                            if not original_initial_line.strip():
+                                for offset in range(1, len(file_lines)):
+                                    candidates = (
+                                        relevant_lines_start - 1 + offset,
+                                        relevant_lines_start - 1 - offset,
+                                    )
+                                    original_initial_line = next(
+                                        (file_lines[index] for index in candidates
+                                         if 0 <= index < len(file_lines) and file_lines[index].strip()),
+                                        original_initial_line,
+                                    )
+                                    if original_initial_line.strip():
+                                        break
                     else:
                         get_logger().warning("Could not dedent code snippet, because head_file is missing",
                                              artifact={'filename': file.filename,

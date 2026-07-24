@@ -358,3 +358,26 @@ def test_get_score_str_returns_bucket_for_default_thresholds(score, expected):
         assert tool.get_score_str(score) == expected
     finally:
         restore_settings(snapshot)
+
+
+def test_dedent_code_aligns_top_level_suggestion_when_target_line_is_blank():
+    provider = MagicMock()
+    provider.diff_files = [
+        FilePatchInfo(
+            base_file="",
+            head_file="\n\ndef export_csv(stock_dict=[]):\n    return stock_dict\n",
+            patch="",
+            filename="services/inventory.py",
+        )
+    ]
+    tool = _make_tool(provider)
+
+    result = tool.dedent_code(
+        "services/inventory.py",
+        2,
+        "    def export_csv(stock_dict: list | None = None) -> None:\n"
+        "        \"\"\"Export stock levels.\"\"\"",
+    )
+
+    assert result.startswith("def export_csv")
+    assert "\n    \"\"\"Export stock levels.\"\"\"" in result
