@@ -224,7 +224,7 @@ Base path: `/api/v1/telemetry`. 所有 endpoint 返回 JSON. 默认端口是 pr-
 | GET    | `/mrs/{project_id}/{mr_id}/suggestions`             | 该 MR 的所有 suggestions                                       |
 | GET    | `/mrs/{project_id}/{mr_id}/runs`                    | 该 MR 的所有 runs (limit 默认 20)                              |
 | GET    | `/mrs/{project_id}/{mr_id}/timeline`                | MR + suggestions + runs + actions 一次性返回                  |
-| GET    | `/mrs/{project_id}/{mr_id}/stats`                   | suggestion_counts (各状态数) + adoption_rate + distinct_rules  |
+| GET    | `/mrs/{project_id}/{mr_id}/stats`                   | suggestion_counts (含 adopted_implicitly) + adoption_rate + distinct_rules + severity_counts  |
 | GET    | `/dismissals?since=...&project_id=...&rule_key=...&mr_id=...&limit=50` | 被 dismiss 的建议列表 (含 `dismissed_reason`), 用于规则改进分析 |
 | GET    | `/dismissals/by-rule?since=...&project_id=...`       | 按 `rule_keys` 聚合 dismiss 计数 + reason 分布 (定位反复被误报的规则) |
 
@@ -244,7 +244,7 @@ Base path: `/api/v1/telemetry`. 所有 endpoint 返回 JSON. 默认端口是 pr-
 ```json
 {
   "mrs": {"total": 2, "merged": 1, "open": 1},
-  "suggestions": {"total": 2, "applied": 0, "dismissed": 0, "open": 2, "adoption_rate": 0.0, "dismissal_rate": 0.0},
+  "suggestions": {"total": 2, "applied": 0, "dismissed": 0, "open": 2, "adoption_rate": 0.0},
   "runs": {"total": 3, "failed": 0, "success_rate": 1.0}
 }
 ```
@@ -275,6 +275,27 @@ Base path: `/api/v1/telemetry`. 所有 endpoint 返回 JSON. 默认端口是 pr-
 ]
 ```
 
+**`GET /api/v1/telemetry/mrs/34/40/stats`**
+
+```json
+{
+  "mr_id": 40,
+  "project_id": 34,
+  "suggestion_counts": {
+    "total": 2,
+    "applied": 1,
+    "dismissed": 0,
+    "open": 1,
+    "superseded": 0,
+    "adopted_implicitly": 1
+  },
+  "adoption_rate": 0.5,
+  "distinct_rules": [],
+  "severity_counts": {"high": 1, "medium": 1},
+  "runs": []
+}
+```
+
 **`GET /api/v1/telemetry/mrs/34/40/timeline`**
 
 ```json
@@ -301,7 +322,7 @@ Base path: `/api/v1/telemetry`. 所有 endpoint 返回 JSON. 默认端口是 pr-
 - `severity` (`critical` / `high` / `medium` / `low` / `unknown`)
 - `severity_source` (哪一层给的等级, 例 `rule:<PREFIX>-RULE-NO-LOG-EXC` / `pattern:NO-LOG-EXC` / `llm:7` / `unknown`)
 
-`GET /api/v1/telemetry/mrs/{p}/{m}/stats` 多一个 `severity_counts` 字段 (各等级 suggestion 数).
+`GET /api/v1/telemetry/mrs/{p}/{m}/stats` 返回 `severity_counts` 和 `suggestion_counts.adopted_implicitly`；MR stats 本身不返回 `dismissal_rate`。
 
 ## Dismiss reason 捕获
 
@@ -358,7 +379,7 @@ Base path: `/api/v1/telemetry`. 所有 endpoint 返回 JSON. 默认端口是 pr-
 - `suggestion_counts.state` 二元化 — `applied` / `dismissed` / `open` / `superseded` / `total`
 - `suggestion_counts.adopted_implicitly` — `/adopt` 这一具体路径的次数, drill-down 用
 - `adoption_rate` = `state=applied / total`. 同时覆盖 Apply 按钮与 /adopt 两种采纳路径, 不双计. `adopted_implicitly` 只供 drill-down (drill-in), 不进入 adoption_rate
-- `dismissal_rate` (旧字段) = `dismissed / total`, 不再被 /adopt 污染
+- `dismissal_rate` 不属于 MR stats 返回字段；需要 dismiss 比例时由前端使用 `dismissed / total` 计算。`/metrics/severity` 仍返回分级的 `dismissal_rate`。
 
 ### 旧 v24 字段已删除
 
@@ -593,8 +614,8 @@ async function getOverview() {
 
 | 数据 | 现状 | 补法 |
 |------|------|------|
-| `applied_at` / `state=applied` | 字段已建, 仅在 GitLab 端点 `Apply suggestion` 后由 GitLab 推 `discussion.unresolve` 时才会回写 (目前只接 resolve → dismissed) | 接 GitLab `merge_request_event` 推送, 在 webhook 拦 `applied` 事件 |
-| 与 GitLab Apply 同源的 event 也填 action_events | `action=applied` 没接 | 同上 |
+| `applied_at` / `state=applied` | 已接入 GitLab Apply commit 和 `/adopt` | 无 |
+| Apply / `/adopt` 的 action_events | 已接入，分别记录 `applied` / `adopted_implicitly` | 无 |
 (已完成: 时间窗过滤, 按作者聚合, note_id, /review telemetry, /dismiss telemetry, **/dismiss reason 捕获 + /dismissals + /dismissals/by-rule 端点**, **severity 三层 fallback + /metrics/severity 端点**)
 
 数据模型已经预留了这些字段的列, schema 不会变, 后续只是补 hook / endpoint, 不破坏现有数据.
