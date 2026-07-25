@@ -381,3 +381,77 @@ def test_dedent_code_aligns_top_level_suggestion_when_target_line_is_blank():
 
     assert result.startswith("def export_csv")
     assert "\n    \"\"\"Export stock levels.\"\"\"" in result
+
+
+class TestValidateSuggestionListOfFunctions:
+    """The body-truncation guard must NOT fire on "list of functions" patches
+    where each ``def`` is followed by its own ``...`` placeholder. That
+    pattern is the LLM's way of saying "body unchanged for every function
+    in this file" — it's a valid patch (e.g. "add type hints to all defs"),
+    not a hallucination that deletes code.
+    """
+
+    def _make_suggestion(self, existing: str, improved: str) -> dict:
+        return {
+            "relevant_file": "x.py",
+            "relevant_lines_start": 1,
+            "existing_code": existing,
+            "improved_code": improved,
+            "score": 5,
+        }
+
+    def test_list_of_functions_with_ellipsis_is_accepted(self):
+        from pr_agent.tools.pr_code_suggestions import PRCodeSuggestions
+        sug = self._make_suggestion(
+            existing=(
+                "def stream_records(a, b, c):\n"
+                "    src = open(a)\n"
+                "    dst = open(b)\n"
+                "    for line in src:\n"
+                "        dst.write(line)\n"
+                "\n"
+                "def enqueue(item, queue=[]):\n"
+                "    queue.append(item)\n"
+                "    return queue\n"
+                "\n"
+                "def lookup_user(handle):\n"
+                "    conn = sqlite3.connect('/x')\n"
+                "    return conn.execute(handle)\n"
+            ),
+            improved=(
+                "def stream_records(a: str, b: str, c: str) -> None:\n"
+                "    ...\n"
+                "\n"
+                "def enqueue(item: object, queue: list = []) -> list:\n"
+                "    ...\n"
+                "\n"
+                "def lookup_user(handle: str) -> tuple | None:\n"
+                "    ...\n"
+            ),
+        )
+        out = PRCodeSuggestions().validate_suggestion_does_not_truncate_body(sug)
+        assert out.get("score") != 0, (
+            f"list-of-functions patch was wrongly rejected "
+            f"(score_why={out.get('score_why')})"
+        )
+
+    def test_single_function_body_truncation_is_still_rejected(self):
+        from pr_agent.tools.pr_code_suggestions import PRCodeSuggestions
+        sug = self._make_suggestion(
+            existing=(
+                "def render(x):\n"
+                "    if x is None:\n"
+                "        return 0\n"
+                "    if x < 0:\n"
+                "        return -1\n"
+                "    return x * 2\n"
+            ),
+            improved=(
+                "def render(x: int) -> int:\n"
+                "    ...\n"
+            ),
+        )
+        out = PRCodeSuggestions().validate_suggestion_does_not_truncate_body(sug)
+        assert out.get("score") == 0, (
+            "single-function body-truncation hallucination must still be rejected"
+        )

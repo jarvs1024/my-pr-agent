@@ -1296,9 +1296,31 @@ class PRCodeSuggestions:
             # suggestion is almost certainly a body-truncation hallucination.
             lost_real_lines = len(orig_lines) - (len(new_lines) - ellipsis_count)
 
+            # Skip the "list-of-functions" pattern: when improved_code shows
+            # multiple ``def`` signatures each followed by a standalone ``...``
+            # placeholder, the LLM is signalling "body unchanged for each of
+            # these functions" (typical of "add type hints to all defs"
+            # suggestions). Those are valid patches, not body truncations.
+            def_indices = [
+                i for i, ln in enumerate(new_lines) if ln.lstrip().startswith("def ")
+            ]
+            ellipsis_indices = {
+                i for i, ln in enumerate(new_lines) if ln.strip() == "..."
+            }
+            is_list_of_functions = (
+                len(def_indices) >= 2
+                and len(ellipsis_indices) >= len(def_indices)
+                and all(
+                    (di + 1) in ellipsis_indices
+                    or any(ei > di for ei in ellipsis_indices)
+                    for di in def_indices
+                )
+            )
+
             if (len(orig_lines) >= 4
                     and ellipsis_count >= 1
-                    and lost_real_lines >= 2):
+                    and lost_real_lines >= 2
+                    and not is_list_of_functions):
                 suggestion["score"] = 0
                 suggestion["score_why"] = (
                     f"body-truncation guard: improved_code replaces "
