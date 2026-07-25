@@ -255,7 +255,7 @@ class TestMrStatsSimplified:
     def test_webhook_adopt_uses_single_action_writer(self):
         """Webhook delegates action recording to mark_suggestion_adopted only."""
         webhook_src = (Path(__file__).resolve().parents[2] / "pr_agent/servers/gitlab_webhook.py").read_text()
-        start = webhook_src.find("_adopt_match =")
+        start = webhook_src.find("def _process_adopt_reply")
         body = webhook_src[start:start + 6000]
         assert "mark_suggestion_adopted(" in body
         assert "emit_action(\n                                    action='adopted_implicitly'" not in body

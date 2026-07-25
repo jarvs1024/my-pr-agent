@@ -146,7 +146,10 @@ CREATE TABLE IF NOT EXISTS suggestions (
     dismissed_at TEXT,
     dismissed_by TEXT,
     dismissed_reason TEXT,
-    note_id TEXT
+    note_id TEXT,
+    line_end INTEGER,
+    fingerprint TEXT,
+    posted_head_sha TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sug_mr ON suggestions(mr_id);
 CREATE INDEX IF NOT EXISTS idx_sug_state ON suggestions(state);
@@ -162,6 +165,17 @@ CREATE TABLE IF NOT EXISTS action_events (
 );
 CREATE INDEX IF NOT EXISTS idx_act_mr ON action_events(mr_id);
 """
+
+_SUGGESTION_PUBLIC_COLUMNS = (
+    "suggestion_id", "mr_id", "project_id", "file", "line", "label", "importance",
+    "one_sentence_summary", "rule_keys", "score", "posted_at", "state", "applied_at",
+    "dismissed_at", "dismissed_by", "note_id", "dismissed_reason",
+)
+_SUGGESTION_PUBLIC_SELECT = ", ".join(_SUGGESTION_PUBLIC_COLUMNS)
+_SUGGESTION_INTERNAL_COLUMNS = _SUGGESTION_PUBLIC_COLUMNS + (
+    "line_end", "fingerprint", "posted_head_sha",
+)
+_SUGGESTION_INTERNAL_SELECT = ", ".join(_SUGGESTION_INTERNAL_COLUMNS)
 
 
 class TelemetryStore:
@@ -211,6 +225,22 @@ class TelemetryStore:
                         "telemetry: added suggestions.dismissed_reason")
             except Exception as e:
                 get_logger().warning(f"telemetry dismissed_reason migration skipped: {e}")
+            try:
+                cur_cols = [r[1] for r in self._db.execute(
+                    "PRAGMA table_info(suggestions)").fetchall()]
+                for column, column_type in (
+                    ("line_end", "INTEGER"),
+                    ("fingerprint", "TEXT"),
+                    ("posted_head_sha", "TEXT"),
+                ):
+                    if column not in cur_cols:
+                        self._db.execute(
+                            f"ALTER TABLE suggestions ADD COLUMN {column} {column_type}"
+                        )
+                        get_logger().info(f"telemetry: added suggestions.{column}")
+                self._db.commit()
+            except Exception as e:
+                get_logger().warning(f"telemetry fingerprint migration skipped: {e}")
             self._db.commit()
         elif backend == "jsonl":
             _jsonl_env = os.environ.get("REVIEW_TELEMETRY_JSONL_PATH")
@@ -298,8 +328,18 @@ class TelemetryStore:
         if self.backend == "sqlite":
             with self._lock:
                 self._db.execute(
-                    "INSERT OR REPLACE INTO suggestions (suggestion_id, mr_id, project_id, file, line, label, importance, one_sentence_summary, rule_keys, score, posted_at, state, applied_at, dismissed_at, dismissed_by, dismissed_reason, note_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (d["suggestion_id"], d["mr_id"], d["project_id"], d["file"], d["line"], d["label"], d["importance"], d["one_sentence_summary"], json.dumps(d["rule_keys"], ensure_ascii=False), d["score"], d["posted_at"], d["state"], d["applied_at"], d["dismissed_at"], d["dismissed_by"], d.get("dismissed_reason"), d["note_id"]),
+                    "INSERT OR REPLACE INTO suggestions "
+                    "(suggestion_id, mr_id, project_id, file, line, label, importance, one_sentence_summary, "
+                    "rule_keys, score, posted_at, state, applied_at, dismissed_at, dismissed_by, dismissed_reason, "
+                    "note_id, line_end, fingerprint, posted_head_sha) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        d["suggestion_id"], d["mr_id"], d["project_id"], d["file"], d["line"], d["label"],
+                        d["importance"], d["one_sentence_summary"], json.dumps(d["rule_keys"], ensure_ascii=False),
+                        d["score"], d["posted_at"], d["state"], d["applied_at"], d["dismissed_at"],
+                        d["dismissed_by"], d.get("dismissed_reason"), d["note_id"], d.get("line_end"),
+                        d.get("fingerprint"), d.get("posted_head_sha"),
+                    ),
                 )
                 self._db.commit()
         elif self.backend == "jsonl":
@@ -360,6 +400,33 @@ class TelemetryStore:
             self._db.commit()
         return ids
 
+    def mark_suggestion_ids_applied(self, mr_id: int, project_id: int,
+                                    suggestion_ids: list[str], *, applied_at: str) -> list[str]:
+        if self.backend != "sqlite" or self._db is None:
+            return []
+        unique_ids = list(dict.fromkeys(suggestion_ids or []))
+        if not unique_ids:
+            return []
+        placeholders = ",".join(["?"] * len(unique_ids))
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT suggestion_id FROM suggestions "
+                f"WHERE project_id=? AND mr_id=? AND state='open' AND suggestion_id IN ({placeholders})",
+                (project_id, mr_id, *unique_ids),
+            ).fetchall()
+            matched_ids = {row[0] for row in rows}
+            updated = [suggestion_id for suggestion_id in unique_ids if suggestion_id in matched_ids]
+            if not updated:
+                return []
+            update_placeholders = ",".join(["?"] * len(updated))
+            self._db.execute(
+                "UPDATE suggestions SET state='applied', applied_at=? "
+                f"WHERE suggestion_id IN ({update_placeholders})",
+                (applied_at, *updated),
+            )
+            self._db.commit()
+        return updated
+
     def mark_file_applied(self, mr_id: int, project_id: int, file: str, *, applied_at: str) -> list[str]:
         """Legacy entry point kept for backwards compatibility: marks EVERY
         open suggestion in (mr_id, project_id, file) as applied.
@@ -398,9 +465,13 @@ class TelemetryStore:
         if self.backend != "sqlite" or self._db is None:
             return None
         with self._lock:
-            cur = self._db.execute("SELECT * FROM suggestions WHERE note_id=? ORDER BY posted_at DESC LIMIT 1", (note_id,))
+            cur = self._db.execute(
+                f"SELECT {_SUGGESTION_INTERNAL_SELECT} FROM suggestions "
+                "WHERE note_id=? ORDER BY posted_at DESC LIMIT 1",
+                (note_id,),
+            )
             row = cur.fetchone()
-        return _row_to_suggestion(row) if row else None
+        return _row_to_suggestion(row, _SUGGESTION_INTERNAL_COLUMNS) if row else None
 
     def list_dismissals(
         self,
@@ -439,7 +510,8 @@ class TelemetryStore:
         params.append(limit)
         with self._lock:
             cur = self._db.execute(
-                f"SELECT * FROM suggestions{where} ORDER BY dismissed_at DESC LIMIT ?",
+                f"SELECT {_SUGGESTION_PUBLIC_SELECT} FROM suggestions{where} "
+                "ORDER BY dismissed_at DESC LIMIT ?",
                 params,
             )
             rows = cur.fetchall()
@@ -530,9 +602,17 @@ class TelemetryStore:
             return []
         with self._lock:
             if project_id is not None:
-                cur = self._db.execute("SELECT * FROM suggestions WHERE project_id=? AND mr_id=? ORDER BY posted_at", (project_id, mr_id))
+                cur = self._db.execute(
+                    f"SELECT {_SUGGESTION_PUBLIC_SELECT} FROM suggestions "
+                    "WHERE project_id=? AND mr_id=? ORDER BY posted_at",
+                    (project_id, mr_id),
+                )
             else:
-                cur = self._db.execute("SELECT * FROM suggestions WHERE mr_id=? ORDER BY posted_at", (mr_id,))
+                cur = self._db.execute(
+                    f"SELECT {_SUGGESTION_PUBLIC_SELECT} FROM suggestions "
+                    "WHERE mr_id=? ORDER BY posted_at",
+                    (mr_id,),
+                )
             rows = cur.fetchall()
         out = [_row_to_suggestion(r) for r in rows]
         if attach_severity:
@@ -544,6 +624,34 @@ class TelemetryStore:
                 s["severity"] = sev
                 s["severity_source"] = src
         return out
+
+    def list_open_suggestion_records(self, mr_id: int, project_id: int) -> list[dict]:
+        if self.backend != "sqlite" or self._db is None:
+            return []
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT {_SUGGESTION_INTERNAL_SELECT} FROM suggestions "
+                "WHERE project_id=? AND mr_id=? AND state='open' ORDER BY posted_at",
+                (project_id, mr_id),
+            ).fetchall()
+        return [_row_to_suggestion(row, _SUGGESTION_INTERNAL_COLUMNS) for row in rows]
+
+    def list_suggestion_fingerprints(self, mr_id: int, project_id: Optional[int] = None):
+        if self.backend != "sqlite" or self._db is None:
+            return []
+        clauses = ["mr_id=?", "fingerprint IS NOT NULL", "fingerprint != ''"]
+        params = [mr_id]
+        if project_id is not None:
+            clauses.append("project_id=?")
+            params.append(project_id)
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT suggestion_id, file, line, line_end, state, fingerprint "
+                f"FROM suggestions WHERE {' AND '.join(clauses)}",
+                params,
+            ).fetchall()
+        columns = ("suggestion_id", "file", "line", "line_end", "state", "fingerprint")
+        return [dict(zip(columns, row)) for row in rows]
 
     def list_runs(self, mr_id: int, limit: int = 20):
         if self.backend != "sqlite" or self._db is None:
@@ -803,16 +911,8 @@ def _row_to_mr(row):
     return dict(zip(cols, row))
 
 
-def _row_to_suggestion(row):
-    # Column order MUST match the live SQLite schema (PRAGMA table_info):
-    #   ... dismissed_by(14), note_id(15), dismissed_reason(16).
-    # The CREATE TABLE in this file lists them in the opposite order, but the
-    # deployed DB was built when ``note_id`` already existed (added in an
-    # earlier version as INTEGER, then migrated to TEXT, then ``dismissed_reason``
-    # was ADDed later). A mismatched SELECT * column order would silently swap
-    # the two fields' values in the JSON response (note_id ↔ dismissed_reason).
-    cols = ["suggestion_id", "mr_id", "project_id", "file", "line", "label", "importance", "one_sentence_summary", "rule_keys", "score", "posted_at", "state", "applied_at", "dismissed_at", "dismissed_by", "note_id", "dismissed_reason"]
-    d = dict(zip(cols, row))
+def _row_to_suggestion(row, columns=_SUGGESTION_PUBLIC_COLUMNS):
+    d = dict(zip(columns, row))
     try:
         d["rule_keys"] = json.loads(d["rule_keys"] or "[]")
     except Exception:

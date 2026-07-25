@@ -71,7 +71,7 @@ Webhook 处理 MR 事件时 upsert (以 `project_id + mr_id` 为 PK):
 | `finished_at`       | text? | ISO 8601                                         |
 | `error`             | text? | 失败时的错误信息                                 |
 | `duration_ms`       | int?  | 从 started 到 finished 的毫秒数                  |
-| `suggestion_count`  | int   | 产出的建议数 (success 时)                        |
+| `suggestion_count`  | int   | 实际成功发布的建议数 (success 时)                |
 | `rule_keys_cited`   | text  | JSON 数组, 本次运行里 LLM cite 的规则键          |
 | `triggered_by`      | text  | `user` / `auto` (webhook 自动触发)              |
 
@@ -96,6 +96,12 @@ Webhook 处理 MR 事件时 upsert (以 `project_id + mr_id` 为 PK):
 | `dismissed_by`       | text?  | dismiss 操作者的 username / user id            |
 | `dismissed_reason`   | text?  | 用户提供的忽略原因 (见 "Dismiss reason 捕获")    |
 | `note_id`            | text?  | GitLab discussion id (40-char SHA1 哈希, publish 时捕获, /dismiss 反查) |
+| `line_end`           | int?   | 内部字段, suggestion 结束行; telemetry HTTP API 不返回 |
+| `fingerprint`        | text?  | 内部字段, 代码 patch SHA-256; telemetry HTTP API 不返回 |
+| `posted_head_sha`    | text?  | 内部字段, suggestion 发布时的 MR head SHA; `/adopt` 校验使用, HTTP API 不返回 |
+
+`line_end`、`fingerprint` 和 `posted_head_sha` 仅用于跨轮去重和内部定位。公开 telemetry API 的 suggestion
+响应结构保持不变，前端无需新增字段适配。
 
 ### `action_events` — 用户对建议的操作
 
@@ -358,7 +364,9 @@ Base path: `/api/v1/telemetry`. 所有 endpoint 返回 JSON. 默认端口是 pr-
 
 ## Adopt (用户手动采纳) 追踪
 
-用户按建议改但**没用 GitLab "Apply suggestion" 按钮**时, 在代码建议 thread 里回复 `/adopt` (可选带理由), 与点 Apply 等价: 该条 DiffNote 会被 resolve 掉, state 设为 `applied`, 同样纳入 `adoption_rate` 计算. 区分"点按钮 vs /adopt"的信息仍在 `action_events` 里保留 (`action` 列: `applied` / `adopted_implicitly`), 但 dashboard 不再消费它 — 简化后的二元语义是 "`dismissed` = 忽略, 其余非 open/superseded state = 采纳".
+用户按建议改但**没用 GitLab "Apply suggestion" 按钮**时, 先提交代码，再在代码建议 thread 里回复 `/adopt` (可选带理由). 对新发布的建议，webhook 会使用 `posted_head_sha` 对比当前 head，并确认 suggestion 目标范围或相邻边界确实发生变化；未提交代码、只修改同文件其他位置或文件内容读取失败时不会 resolve discussion，也不会改变 state. 历史建议没有 `posted_head_sha` 时保持旧兼容行为.
+
+校验通过后 `/adopt` 与点 Apply 等价: 该条 DiffNote 会被 resolve 掉, state 设为 `applied`, 同样纳入 `adoption_rate` 计算. 区分"点按钮 vs /adopt"的信息仍在 `action_events` 里保留 (`action` 列: `applied` / `adopted_implicitly`), 但 dashboard 不再消费它 — 简化后的二元语义是 "`dismissed` = 忽略, 其余非 open/superseded state = 采纳".
 
 三种写法, 都有效:
 
@@ -371,6 +379,19 @@ Base path: `/api/v1/telemetry`. 所有 endpoint 返回 JSON. 默认端口是 pr-
 第二行` | `adopted_implicitly` (note = `第一行\n第二行`) | `applied` |
 
 解析逻辑在 `pr_agent/servers/gitlab_webhook.py`: 首先匹配 `adopt` 关键字 (大小写不敏感, 边界检查, 拦截 `adoption` / `dismissed` 这类含该子串的词), 然后以匹配位置为分界拆出 reason, 给两端上 wrapper-strip regex (ascii 引号 + CJK 标点 + 全角双引号 + 全角冒号 U+FF1A, 以及连字符 / 下划线 / 括号等).
+
+## GitLab Apply commit 精确归因
+
+GitLab Apply webhook 不再使用 suggestion 首次发布时的旧行号匹配 commit changed ranges. 旧行号会在连续 Apply 增删代码后漂移，可能把相邻建议提前标成 `applied`.
+
+当前流程：
+
+1. 从 commit message 读取 `Apply N suggestion(s)` 的 N.
+2. 通过 `note_id` 加载 open suggestion 对应的 GitLab discussion，并提取实际 `suggestion` code block.
+3. 对比 Apply commit parent/current 文件，要求该 patch 完整出现在 current 文件、本 commit 的 changed range 与 patch 区间相交，且该区间不是 parent/current 的 unchanged block.
+4. 只有精确候选数量等于 N 时，才按 suggestion ID 写入 `state=applied` 和 `action_events.action=applied`.
+
+GitLab discussion、commit diff 或文件读取失败，以及候选数量不一致时，所有候选保持 `open`. 该路径不回退到旧行号批量更新，避免把真实问题错误关闭. 匹配使用的 suggestion 代码不写入 SQLite、JSONL 或日志.
 
 ### Stats API 字段
 
@@ -608,6 +629,8 @@ async function getOverview() {
 - `note_id`: `GitLabProvider.send_inline_comment` 在 publish 路径返回 GitLab discussion id, primary / fallback 两条路都回填 (`pr_agent/git_providers/gitlab_provider.py`). 写入 `suggestions.note_id`.
 - `/review`: `PRReviewer.run` 围着 `_run_id = emit_run_started()` 加了同样的 finally / 错误处理 (`pr_agent/tools/pr_reviewer.py`). `/describe` 复用同一条管道, command 字段区分.
 - `/dismiss` (inline 建议的 thread reply): webhook 调 `resolve_discussion` 成功后, 反查 `note_id` 关联的 suggestion, 写 `action_events` 一行 (`action=dismissed`), 同步 `mark_suggestion_dismissed` 更新 `state=dismissed` / `dismissed_at` / `dismissed_by` / `dismissed_reason` (`pr_agent/servers/gitlab_webhook.py`). 支持 inline reason (`/dismiss 误报: ...`) 和下行 multi-line reason (`/dismiss\n说明`); 解析后存到 `suggestions.dismissed_reason`. 见 [Dismiss reason 捕获](#dismiss-reason-捕获).
+- GitLab Apply commit: 通过 discussion patch + parent/current 文件精确匹配 suggestion ID；匹配歧义时保持 open，不使用漂移行号 fallback.
+- `/adopt`: 新建议要求 `posted_head_sha` 之后目标代码发生变化；校验通过后 resolve discussion、写 `state=applied` 和 `action=adopted_implicitly`. 历史空 SHA 记录保持兼容.
 - **Severity 分级**: 每条 suggestion 写入时通过 `pr_agent.algo.repo_context.resolve_severity` 计算 severity (三层 fallback: 规则文件 → config pattern → LLM importance). API 返回时附在 `severity` + `severity_source` 字段. 详见 [Severity 分级](#severity-分级).
 
 ## 已知缺口 / 后续可补的钩子

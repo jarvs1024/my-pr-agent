@@ -5,6 +5,10 @@ import pytest
 
 import pr_agent.servers.bitbucket_server_webhook as bitbucket_server_webhook
 from pr_agent.config_loader import get_settings
+from pr_agent.servers.apply_pipeline_coordinator import (
+    ApplyPipelineCoordinator,
+    ApplyPipelineJob,
+)
 
 
 @pytest.fixture
@@ -57,6 +61,79 @@ def _gitlab_payload(**object_attributes):
         "project": {"path_with_namespace": "org/repo"},
         "user": {"username": "alice", "name": "Alice"},
     }
+
+
+def _apply_job(sha):
+    return ApplyPipelineJob(
+        project_id=34,
+        mr_iid=97,
+        sha=sha,
+        pr_url="http://gitlab/root/repo/-/merge_requests/97",
+        data={"sha": sha},
+        log_context={},
+        commands_conf="apply_commands",
+    )
+
+
+def test_gitlab_apply_event_parses_expected_suggestion_count(gitlab_webhook_module):
+    push = {
+        "object_kind": "push",
+        "before": "parent-sha",
+        "ref": "refs/heads/feature",
+        "project": {"id": 34},
+        "user": {"username": "alice"},
+        "commits": [{
+            "id": "current-sha",
+            "message": "Apply 3 suggestion(s) to 1 file(s)",
+            "modified": ["service.py"],
+        }],
+    }
+
+    event = gitlab_webhook_module._resolve_apply_event(push)
+
+    assert event["suggestion_count"] == 3
+    assert event["parent_sha"] == "parent-sha"
+
+
+@pytest.mark.asyncio
+async def test_gitlab_apply_pipeline_drain_serializes_pending_jobs(
+    gitlab_webhook_module, monkeypatch
+):
+    import asyncio
+
+    coordinator = ApplyPipelineCoordinator()
+    monkeypatch.setattr(gitlab_webhook_module, "_APPLY_PIPELINE_COORDINATOR", coordinator)
+    monkeypatch.setattr(gitlab_webhook_module, "_resolve_superseded_suggestions", lambda url: [])
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    calls = []
+    active = 0
+    max_active = 0
+
+    async def fake_perform(commands_conf, agent, api_url, log_context, data):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        calls.append(data["sha"])
+        if data["sha"] == "sha-1":
+            first_started.set()
+            await release_first.wait()
+        active -= 1
+
+    monkeypatch.setattr(gitlab_webhook_module, "_perform_commands_gitlab", fake_perform)
+    first = _apply_job("sha-1")
+    second = _apply_job("sha-2")
+    assert coordinator.enqueue(first) == "start"
+
+    task = asyncio.create_task(gitlab_webhook_module._drain_apply_pipeline(first))
+    await first_started.wait()
+    assert coordinator.enqueue(second) == "queued"
+    assert calls == ["sha-1"]
+    release_first.set()
+    await task
+
+    assert calls == ["sha-1", "sha-2"]
+    assert max_active == 1
 
 
 def test_gitlab_changed_new_line_ranges_parses_multiple_hunks(gitlab_webhook_module):

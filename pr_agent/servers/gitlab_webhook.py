@@ -2,8 +2,6 @@ import copy
 import json
 import os
 import re
-import threading
-import time
 from datetime import datetime
 
 import uvicorn
@@ -21,6 +19,14 @@ from pr_agent.config_loader import get_settings, global_settings
 from pr_agent.git_providers.utils import apply_repo_settings
 from pr_agent.log import LoggingFormat, get_logger, setup_logger
 from pr_agent.secret_providers import get_secret_provider
+from pr_agent.servers.apply_pipeline_coordinator import (
+    ApplyPipelineCoordinator,
+    ApplyPipelineJob,
+)
+from pr_agent.servers.gitlab_suggestion_matcher import (
+    find_applied_suggestion_candidates,
+    target_region_changed,
+)
 from pr_agent.telemetry import events as telemetry_events, api as telemetry_api
 from pr_agent.git_providers import get_git_provider_with_context
 
@@ -134,26 +140,7 @@ def _emit_mr_merged(data: dict) -> None:
 import re as _re_apply
 
 _APPLY_COMMIT_RE = _re_apply.compile(r"Apply\s+(\d+)\s+suggestion", _re_apply.IGNORECASE)
-_APPLY_PIPELINE_CLAIMS: dict[tuple[int, str], float] = {}
-_APPLY_PIPELINE_CLAIMS_LOCK = threading.Lock()
-_APPLY_PIPELINE_CLAIM_TTL_SECONDS = 600
-
-
-def _claim_apply_pipeline(project_id, sha: str) -> bool:
-    """Allow one automatic pipeline for an Apply commit across duplicate hooks."""
-    if not sha:
-        return True
-    key = (int(project_id or 0), sha)
-    now = time.monotonic()
-    with _APPLY_PIPELINE_CLAIMS_LOCK:
-        expired = [claim_key for claim_key, claimed_at in _APPLY_PIPELINE_CLAIMS.items()
-                   if now - claimed_at > _APPLY_PIPELINE_CLAIM_TTL_SECONDS]
-        for claim_key in expired:
-            del _APPLY_PIPELINE_CLAIMS[claim_key]
-        if key in _APPLY_PIPELINE_CLAIMS:
-            return False
-        _APPLY_PIPELINE_CLAIMS[key] = now
-        return True
+_APPLY_PIPELINE_COORDINATOR = ApplyPipelineCoordinator()
 
 
 def _resolve_apply_event(webhook_data: dict):
@@ -180,9 +167,12 @@ def _resolve_apply_event(webhook_data: dict):
         ref = webhook_data.get("ref") or ""
         commits = webhook_data.get("commits") or []
         apply_commit = None
+        apply_match = None
         for c in reversed(commits):
-            if _APPLY_COMMIT_RE.search((c.get("message") or "")):
+            match = _APPLY_COMMIT_RE.search((c.get("message") or ""))
+            if match:
                 apply_commit = c
+                apply_match = match
                 break
         if apply_commit is None:
             return None
@@ -193,7 +183,9 @@ def _resolve_apply_event(webhook_data: dict):
                     files_hint.append(f)
         return {
             "sha": apply_commit.get("id"),
+            "parent_sha": webhook_data.get("before") if len(commits) == 1 else None,
             "msg": (apply_commit.get("message") or "").strip(),
+            "suggestion_count": int(apply_match.group(1)),
             "project_id": project_id,
             "ref": ref,
             "mr_iid": None,
@@ -209,11 +201,14 @@ def _resolve_apply_event(webhook_data: dict):
         last_commit = (object_attributes.get("last_commit") or {}) or {}
         sha = last_commit.get("id")
         msg = (last_commit.get("message") or "").strip()
-        if not (sha and _APPLY_COMMIT_RE.search(msg)):
+        apply_match = _APPLY_COMMIT_RE.search(msg)
+        if not (sha and apply_match):
             return None
         return {
             "sha": sha,
+            "parent_sha": object_attributes.get("oldrev"),
             "msg": msg,
+            "suggestion_count": int(apply_match.group(1)),
             "project_id": project_id or object_attributes.get("target_project_id"),
             "ref": None,
             "mr_iid": object_attributes.get("iid") or object_attributes.get("id"),
@@ -262,6 +257,174 @@ def _lookup_mr_for_push(project_id, ref):
     return None, None
 
 
+def _load_suggestion_notes(provider, discussion_ids: set[str]) -> dict[str, dict]:
+    if not discussion_ids:
+        return {}
+    bot_usernames = _resolve_bot_usernames()
+    notes_by_discussion = {}
+    for discussion_summary in provider.mr.discussions.list(get_all=True):
+        attributes = getattr(discussion_summary, "attributes", {}) or {}
+        discussion_id = str(
+            getattr(discussion_summary, "id", None) or attributes.get("id") or ""
+        ).strip()
+        if discussion_id not in discussion_ids:
+            continue
+        notes = attributes.get("notes")
+        if notes is None:
+            try:
+                discussion = provider.mr.discussions.get(discussion_id)
+                notes = (getattr(discussion, "attributes", {}) or {}).get("notes", [])
+            except Exception as e:
+                get_logger().warning(
+                    f"telemetry.on_apply_commit discussion lookup failed: {discussion_id}: {e}"
+                )
+                continue
+        for note in notes or []:
+            if "```suggestion" not in (note.get("body") or ""):
+                continue
+            author = note.get("author") or {}
+            author_username = str(author.get("username") or "").strip()
+            if bot_usernames and author_username not in bot_usernames:
+                # Discussion notes authored by a human (or unknown bot) must
+                # never drive apply-attribution matching: only the configured
+                # bot is allowed to publish suggestion blocks.
+                get_logger().debug(
+                    f"skipping non-bot note on discussion {discussion_id} (author={author_username!r})"
+                )
+                continue
+            notes_by_discussion[discussion_id] = note
+            break
+    return notes_by_discussion
+
+
+def _load_apply_commit_files(provider, files: list[str], parent_sha: str, current_sha: str):
+    parent_files = {}
+    current_files = {}
+    if not parent_sha or not current_sha:
+        return parent_files, current_files
+    for file_path in files:
+        try:
+            parent_content = provider.get_pr_file_content(file_path, parent_sha)
+            current_content = provider.get_pr_file_content(file_path, current_sha)
+        except Exception as e:
+            get_logger().warning(
+                f"telemetry.on_apply_commit file lookup failed: {file_path}: {e}"
+            )
+            continue
+        if not parent_content or not current_content:
+            get_logger().warning(
+                f"telemetry.on_apply_commit file content unavailable: {file_path}"
+            )
+            continue
+        parent_files[file_path] = parent_content
+        current_files[file_path] = current_content
+    return parent_files, current_files
+
+
+_POSTED_HEAD_SHA_SENTINEL = "__unavailable__"
+
+
+def _resolve_bot_usernames() -> set[str]:
+    """Resolve the set of usernames that count as the bot for suggestion ownership."""
+    gitlab_user = (get_settings().get("gitlab.user", "") or "").strip()
+    allowed_raw = (
+        get_settings().get("config.allowed_bot_usernames")
+        or get_settings().get("config", {}).get("allowed_bot_usernames")
+        or []
+    )
+    if isinstance(allowed_raw, str):
+        allowed_raw = [username.strip() for username in allowed_raw.split(",") if username.strip()]
+    bot_usernames = {str(username).strip() for username in allowed_raw if str(username).strip()}
+    if gitlab_user:
+        bot_usernames.add(gitlab_user)
+    return bot_usernames
+
+
+def _validate_adopt_target_change(provider, suggestion: dict) -> tuple[bool, str]:
+    posted_head_sha = str(suggestion.get("posted_head_sha") or "").strip()
+    if not posted_head_sha:
+        # No recorded publication metadata means we cannot compare pre /
+        # post content for this suggestion, so /adopt can't be proven safe.
+        return False, "posted-sha-unavailable"
+    if posted_head_sha == _POSTED_HEAD_SHA_SENTINEL:
+        return False, "posted-head-unavailable"
+    mr = getattr(provider, "mr", None)
+    diff_refs = getattr(mr, "diff_refs", {}) or {}
+    current_head_sha = str(
+        getattr(mr, "sha", None) or diff_refs.get("head_sha") or ""
+    ).strip()
+    if not current_head_sha:
+        return False, "current-head-unavailable"
+    if current_head_sha == posted_head_sha:
+        return False, "same-head"
+    file_path = str(suggestion.get("file") or "").strip()
+    line = int(suggestion.get("line") or 0)
+    line_end = int(suggestion.get("line_end") or line or 0)
+    if not file_path or line < 1 or line_end < line:
+        return False, "target-metadata-unavailable"
+    try:
+        posted_content = provider.get_pr_file_content(file_path, posted_head_sha)
+        current_content = provider.get_pr_file_content(file_path, current_head_sha)
+    except Exception as e:
+        get_logger().warning(f"/adopt target content lookup failed: {e}")
+        return False, "content-unavailable"
+    if not posted_content or not current_content:
+        return False, "content-unavailable"
+    if not target_region_changed(
+        posted_content,
+        current_content,
+        line=line,
+        line_end=line_end,
+        context_lines=1,
+    ):
+        return False, "target-unchanged"
+    return True, "changed"
+
+
+def _process_adopt_reply(provider, discussion_id: str, suggestion: dict,
+                         actor: str, reason: str, mr_id: int) -> str:
+    allowed, validation_reason = _validate_adopt_target_change(provider, suggestion)
+    if not allowed:
+        # ``posted-sha-unavailable`` joins the user-facing "未检测到代码修改"
+        # bucket: from the reviewer's perspective, we don't know whether
+        # their commit landed, so asking them to retry-without-changes is
+        # the only actionable thing to say.
+        if validation_reason in {"content-unavailable", "current-head-unavailable"}:
+            message = "暂时无法验证这条建议对应位置的代码修改，请稍后重试 `/adopt`。"
+        else:
+            message = (
+                "未检测到这条建议对应位置的代码修改，暂不能标记为手工采纳。"
+                "请先提交修改，再回复 `/adopt [说明]`。"
+            )
+        try:
+            provider.reply_to_comment_from_comment_id(discussion_id, message)
+        except Exception as e:
+            get_logger().warning(f"/adopt validation reply failed for {discussion_id}: {e}")
+        get_logger().info(
+            f"Rejected /adopt for suggestion {suggestion.get('suggestion_id')} "
+            f"(reason={validation_reason})"
+        )
+        return "adopt-validation-failed"
+    ok = provider.resolve_discussion(discussion_id)
+    if not ok:
+        get_logger().warning(f"/adopt failed to resolve discussion {discussion_id}")
+        return "adopt fail"
+    get_logger().info(
+        f"/adopt resolved MR discussion {discussion_id}"
+        + (f" (reason={reason!r})" if reason else "")
+    )
+    try:
+        telemetry_events.mark_suggestion_adopted(
+            suggestion["suggestion_id"],
+            actor=actor,
+            reason=reason,
+            mr_id=int(mr_id or suggestion["mr_id"] or 0),
+        )
+    except Exception as e:
+        get_logger().warning(f"telemetry.on_adopt failed: {e}")
+    return "adopted"
+
+
 def _handle_apply_commit(webhook_data: dict) -> None:
     """Detect GitLab's "Apply N suggestion(s)" commit and mark matching open
     suggestions as ``state=applied``.
@@ -277,6 +440,7 @@ def _handle_apply_commit(webhook_data: dict) -> None:
             return
         project_id = ev["project_id"]
         sha = ev["sha"]
+        parent_sha = ev.get("parent_sha")
         msg = ev["msg"]
         mr_id = ev.get("mr_iid")
         files_hint = ev.get("files_hint") or []
@@ -312,10 +476,24 @@ def _handle_apply_commit(webhook_data: dict) -> None:
             import requests
             gl_token = get_settings().get("GITLAB.PERSONAL_ACCESS_TOKEN")
             base = get_settings().get("GITLAB.URL", "http://127.0.0.1:8929").rstrip("/")
+            headers = {"PRIVATE-TOKEN": gl_token}
+            if not parent_sha:
+                commit_resp = requests.get(
+                    f"{base}/api/v4/projects/{project_id}/repository/commits/{sha}",
+                    headers=headers,
+                    timeout=10,
+                )
+                if commit_resp.ok:
+                    parent_ids = commit_resp.json().get("parent_ids") or []
+                    parent_sha = parent_ids[0] if parent_ids else None
+                else:
+                    get_logger().warning(
+                        f"telemetry.on_apply_commit parent lookup status={commit_resp.status_code} sha={sha[:10]}"
+                    )
             url = f"{base}/api/v4/projects/{project_id}/repository/commits/{sha}/diff"
             resp = requests.get(
                 url,
-                headers={"PRIVATE-TOKEN": gl_token},
+                headers=headers,
                 params={"per_page": 50},
                 timeout=10,
             )
@@ -331,48 +509,61 @@ def _handle_apply_commit(webhook_data: dict) -> None:
                 get_logger().warning(
                     f"telemetry.on_apply_commit commit lookup status={resp.status_code} sha={sha[:10]}"
                 )
+                return
         except Exception as e:
             get_logger().warning(f"telemetry.on_apply_commit commit lookup: {e}")
-        if not files:
-            try:
-                recent = telemetry_events.get_default_store().list_suggestions(
-                    mr_id=int(mr_id), project_id=int(project_id)
-                )
-                seen = set()
-                for s in sorted(recent, key=lambda x: x.get("posted_at") or "", reverse=True):
-                    if s.get("state") != "open":
-                        continue
-                    if s.get("file") in seen:
-                        continue
-                    files.append(s["file"])
-                    seen.add(s["file"])
-                    if len(files) >= 1:
-                        break
-            except Exception as e:
-                get_logger().warning(f"telemetry.on_apply_commit fallback: {e}")
+            return
+        if not parent_sha or not line_ranges_by_file:
+            get_logger().warning(
+                f"telemetry.on_apply_commit exact evidence unavailable: sha={sha[:10]} "
+                f"parent={bool(parent_sha)} files={len(line_ranges_by_file)}"
+            )
+            return
         actor = ev.get("actor") or ""
-        for file in files:
-            try:
-                line_ranges = line_ranges_by_file.get(file, [])
-                if not line_ranges:
-                    get_logger().warning(
-                        f"telemetry.on_apply_commit: no changed new-line ranges for {file}; skipping state update"
-                    )
-                    continue
-                updated = telemetry_events.mark_suggestions_applied(
-                    mr_id=int(mr_id),
-                    project_id=int(project_id),
-                    file=file,
-                    actor=actor,
-                    apply_event_sha=sha,
-                    line_ranges=line_ranges,
-                )
-                if updated:
-                    get_logger().info(
-                        f"telemetry.on_apply_commit: marked {len(updated)} suggestion(s) applied on {file}: {updated[:3]}"
-                    )
-            except Exception as e:
-                get_logger().warning(f"telemetry.on_apply_commit per-file: {e}")
+        store = telemetry_events.get_default_store()
+        open_suggestions = store.list_open_suggestion_records(int(mr_id), int(project_id))
+        discussion_ids = {
+            str(suggestion.get("note_id") or "").strip()
+            for suggestion in open_suggestions
+            if suggestion.get("note_id")
+        }
+        notes_by_discussion = _load_suggestion_notes(provider, discussion_ids)
+        evidence_files = list(line_ranges_by_file)
+        parent_files, current_files = _load_apply_commit_files(
+            provider,
+            evidence_files,
+            parent_sha,
+            sha,
+        )
+        candidates = find_applied_suggestion_candidates(
+            open_suggestions=open_suggestions,
+            notes_by_discussion=notes_by_discussion,
+            parent_files=parent_files,
+            current_files=current_files,
+            changed_ranges_by_file=line_ranges_by_file,
+        )
+        expected_count = int(ev.get("suggestion_count") or 0)
+        if expected_count < 1:
+            match = _APPLY_COMMIT_RE.search(msg)
+            expected_count = int(match.group(1)) if match else 0
+        if len(candidates) != expected_count:
+            get_logger().warning(
+                "telemetry.on_apply_commit exact match failed: "
+                f"project={project_id} mr={mr_id} sha={sha[:10]} "
+                f"expected={expected_count} matched={len(candidates)}"
+            )
+            return
+        updated = telemetry_events.mark_suggestion_ids_applied(
+            mr_id=int(mr_id),
+            project_id=int(project_id),
+            suggestion_ids=candidates,
+            actor=actor,
+            apply_event_sha=sha,
+        )
+        if updated:
+            get_logger().info(
+                f"telemetry.on_apply_commit: exactly marked {len(updated)} suggestion(s) applied: {updated[:3]}"
+            )
     except Exception as e:
         get_logger().warning(f"telemetry.on_apply_commit outer: {e}")
 
@@ -491,6 +682,24 @@ async def _perform_commands_gitlab(commands_conf: str, agent: PRAgent, api_url: 
                 await agent.handle_request(api_url, new_command)
         except Exception as e:
             get_logger().error(f"Failed to perform command {command}: {e}")
+
+
+async def _drain_apply_pipeline(initial_job: ApplyPipelineJob) -> None:
+    current_job = initial_job
+    while current_job is not None:
+        try:
+            _resolve_superseded_suggestions(current_job.pr_url)
+            await _perform_commands_gitlab(
+                current_job.commands_conf,
+                PRAgent(),
+                current_job.pr_url,
+                current_job.log_context,
+                current_job.data,
+            )
+        except Exception as e:
+            get_logger().warning(f"Apply pipeline re-run failed: {e}")
+        finally:
+            current_job = _APPLY_PIPELINE_COORDINATOR.complete(current_job)
 
 
 def is_bot_user(data) -> bool:
@@ -745,14 +954,6 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                         status_code=status.HTTP_200_OK,
                         content=jsonable_encoder({"message": "apply-telemetry-only"})
                     )
-                if not _claim_apply_pipeline(apply_event.get("project_id"), apply_event.get("sha")):
-                    get_logger().info(
-                        "apply-pipeline: duplicate webhook for the same Apply commit; skipping commands."
-                    )
-                    return JSONResponse(
-                        status_code=status.HTTP_200_OK,
-                        content=jsonable_encoder({"message": "apply-duplicate-skip"})
-                    )
                 # Also keep the MR activity row in telemetry consistent
                 # with the ``updated`` state the dispatcher would have
                 # emitted had we let control fall through.
@@ -773,27 +974,57 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                         apply_event.get("project_id") or (data.get("project") or {}).get("id"),
                         apply_event.get("ref") or "",
                     )
+                    if lookup_mr_id:
+                        apply_mr_iid = lookup_mr_id
                     if lookup_url:
                         apply_url = lookup_url
                     elif apply_mr_iid:
                         project_web = (data.get("project") or {}).get("web_url", "").rstrip("/")
                         if project_web:
                             apply_url = f"{project_web}/-/merge_requests/{apply_mr_iid}"
-                if apply_url:
-                    _resolve_superseded_suggestions(apply_url)
                 apply_cmds = get_settings().get("gitlab.apply_commands", []) or []
                 push_cmds = get_settings().get("gitlab.push_commands", []) or []
                 pipeline_commands = apply_cmds or push_cmds
                 if pipeline_commands and apply_url:
-                    try:
-                        await _perform_commands_gitlab(
-                            "apply_commands" if apply_cmds else "push_commands",
-                            PRAgent(), apply_url, log_context, data
-                        )
-                    except Exception as _apply_chain_err:
+                    if not apply_mr_iid:
+                        match = re.search(r"/merge_requests/(\d+)(?:$|[/?#])", apply_url)
+                        if match:
+                            apply_mr_iid = int(match.group(1))
+                    if not apply_mr_iid:
                         get_logger().warning(
-                            f"Apply pipeline re-run failed: {_apply_chain_err}"
+                            f"apply-pipeline: unable to resolve MR iid for {apply_url}; skipping commands"
                         )
+                        return JSONResponse(
+                            status_code=status.HTTP_200_OK,
+                            content=jsonable_encoder({"message": "apply-target-unresolved"}),
+                        )
+                    job = ApplyPipelineJob(
+                        project_id=int(apply_event.get("project_id") or 0),
+                        mr_iid=int(apply_mr_iid),
+                        sha=str(apply_event.get("sha") or ""),
+                        pr_url=apply_url,
+                        data=copy.deepcopy(data),
+                        log_context=copy.deepcopy(log_context),
+                        commands_conf="apply_commands" if apply_cmds else "push_commands",
+                    )
+                    decision = _APPLY_PIPELINE_COORDINATOR.enqueue(job)
+                    if decision == "duplicate":
+                        get_logger().info(
+                            "apply-pipeline: duplicate webhook for the same Apply commit; skipping commands."
+                        )
+                        return JSONResponse(
+                            status_code=status.HTTP_200_OK,
+                            content=jsonable_encoder({"message": "apply-duplicate-skip"}),
+                        )
+                    if decision == "queued":
+                        get_logger().info(
+                            f"apply-pipeline: queued latest Apply commit for MR !{apply_mr_iid}: {job.sha[:10]}"
+                        )
+                        return JSONResponse(
+                            status_code=status.HTTP_200_OK,
+                            content=jsonable_encoder({"message": "apply-pipeline-queued"}),
+                        )
+                    await _drain_apply_pipeline(job)
                 return JSONResponse(status_code=status.HTTP_200_OK, content=jsonable_encoder({"message": "apply-handled"}))
         except Exception as e:
             # Catch any unexpected error from the apply-pipeline so we
@@ -1002,27 +1233,19 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                                 content=jsonable_encoder({'message': 'adopt-skipped-state'}),
                             )
                         provider = get_git_provider_with_context(pr_url=url)
-                        ok = provider.resolve_discussion(discussion_id)
-                        if ok:
-                            get_logger().info(
-                                f"/adopt resolved MR discussion {discussion_id}"
-                                + (f" (reason={_reason!r})" if _reason else ""))
-                            try:
-                                author = data.get('user', {}).get('username', '')
-                                mr_iid = data.get('merge_request', {}).get('iid')
-                                telemetry_events.mark_suggestion_adopted(
-                                    suggestion['suggestion_id'],
-                                    actor=author,
-                                    reason=_reason,
-                                    mr_id=int(mr_iid or suggestion['mr_id'] or 0),
-                                )
-                            except Exception as e:
-                                get_logger().warning(f"telemetry.on_adopt failed: {e}")
-                        else:
-                            get_logger().warning(f"/adopt failed to resolve discussion {discussion_id}")
+                        author = data.get('user', {}).get('username', '')
+                        mr_iid = data.get('merge_request', {}).get('iid')
+                        result = _process_adopt_reply(
+                            provider=provider,
+                            discussion_id=discussion_id,
+                            suggestion=suggestion,
+                            actor=author,
+                            reason=_reason,
+                            mr_id=int(mr_iid or suggestion['mr_id'] or 0),
+                        )
                         return JSONResponse(
                             status_code=status.HTTP_200_OK,
-                            content=jsonable_encoder({'message': 'adopted' if ok else 'adopt fail'}),
+                            content=jsonable_encoder({'message': result}),
                         )
 
                 _body_looks_like_explicit_dismiss = (

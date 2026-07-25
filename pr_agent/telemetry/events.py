@@ -182,20 +182,26 @@ def emit_suggestion(
     importance: int,
     one_sentence_summary: str,
     rule_keys: Iterable[str],
+    line_end: Optional[int] = None,
     score: Optional[int] = None,
     note_id=None,
+    fingerprint: Optional[str] = None,
+    posted_head_sha: Optional[str] = None,
 ) -> str:
     suggestion = models.Suggestion(
         mr_id=mr_id,
         project_id=project_id,
         file=file,
         line=line,
+        line_end=line_end,
         label=label,
         importance=importance,
         one_sentence_summary=one_sentence_summary,
         rule_keys=list(rule_keys),
         score=score,
         note_id=note_id,
+        fingerprint=fingerprint,
+        posted_head_sha=posted_head_sha,
     )
     try:
         get_default_store().record_suggestion(suggestion)
@@ -252,6 +258,38 @@ def mark_suggestions_applied(mr_id: int, project_id: int, file: str, *,
             store.record_action(models.ActionEvent(
                 action="applied",
                 suggestion_id=sid,
+                mr_id=mr_id,
+                actor=actor,
+                note=(f"commit {apply_event_sha}" if apply_event_sha else ""),
+            ))
+        except Exception as e:
+            get_logger().warning(f"telemetry.action emit (applied) failed: {e}")
+    return updated
+
+
+def mark_suggestion_ids_applied(mr_id: int, project_id: int, suggestion_ids: list[str], *,
+                                applied_at: Optional[str] = None,
+                                actor: str = "",
+                                apply_event_sha: Optional[str] = None) -> list[str]:
+    store = get_default_store()
+    if applied_at is None:
+        from datetime import datetime, timezone
+        applied_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
+        updated = store.mark_suggestion_ids_applied(
+            mr_id=mr_id,
+            project_id=project_id,
+            suggestion_ids=suggestion_ids,
+            applied_at=applied_at,
+        )
+    except Exception as e:
+        get_logger().warning(f"telemetry.mark_suggestion_ids_applied failed: {e}")
+        return []
+    for suggestion_id in updated:
+        try:
+            store.record_action(models.ActionEvent(
+                action="applied",
+                suggestion_id=suggestion_id,
                 mr_id=mr_id,
                 actor=actor,
                 note=(f"commit {apply_event_sha}" if apply_event_sha else ""),

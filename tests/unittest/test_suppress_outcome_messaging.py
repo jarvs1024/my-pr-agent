@@ -203,5 +203,107 @@ async def test_run_publishes_notice_when_all_suggestions_are_suppressed(monkeypa
     comments = [item for item in tool.git_provider.published if isinstance(item, str)]
     assert len(comments) == 1
     assert "本次 `/improve` 生成 **1** 条建议" in comments[0]
+    # Per-entry state breakdown (1 applied in the fake store); make sure
+    # the breakdown "1 应用" segment is rendered for reviewer clarity.
+    assert "1 应用" in comments[0]
     assert "x.py:L21" in comments[0]
     assert "已自动跳过" in comments[0]
+
+
+# ---------------------------------------------------------------------------
+# State breakdown in the suppression notice
+# ---------------------------------------------------------------------------
+
+
+def test_dismissed_state_is_surfaced_in_breakdown(monkeypatch):
+    """When all suppressed entries are dismissed (not applied), the
+    breakdown text reads "1 忽略" so reviewers know these were user-dismissed
+    not applied suggestions."""
+    from pr_agent.telemetry import events as telemetry_events
+
+    store = type("Store", (), {})()
+    store.list_suggestions = lambda *a, **kw: [
+        {"file": "x.py", "line": 30, "state": "dismissed"},
+    ]
+    monkeypatch.setattr(telemetry_events, "get_default_store", lambda: store)
+
+    tool = _make_tool()
+    data = {"code_suggestions": [
+        {"relevant_file": "x.py", "relevant_lines_start": 31, "relevant_lines_end": 32,
+         "suggestion_content": "x", "label": "best practice", "improved_code": "x", "score": 8},
+    ]}
+
+    import asyncio
+    asyncio.run(tool.push_inline_code_suggestions(data))
+
+    out = tool._last_suggestion_outcome
+    assert out is not None
+    assert out["kept"] == 0
+    assert out["suppressed_count"] == 1
+    sr = out["suppressed_records"]
+    assert len(sr) == 1
+    assert "dismissed" in sr[0][2]
+
+
+def test_mixed_applied_and_dismissed_breakdown(monkeypatch):
+    """A mix of applied and dismissed records is exposed as separate
+    states in suppressed_records so the display logic can show
+    'a 应用 / b 忽略' breakdown."""
+    from pr_agent.telemetry import events as telemetry_events
+
+    store = type("Store", (), {})()
+    store.list_suggestions = lambda *a, **kw: [
+        {"file": "x.py", "line": 10, "state": "applied"},
+        {"file": "y.py", "line": 50, "state": "dismissed"},
+    ]
+    monkeypatch.setattr(telemetry_events, "get_default_store", lambda: store)
+
+    tool = _make_tool()
+    data = {"code_suggestions": [
+        {"relevant_file": "x.py", "relevant_lines_start": 11, "relevant_lines_end": 11,
+         "suggestion_content": "x", "label": "best practice", "improved_code": "x", "score": 8},
+        {"relevant_file": "y.py", "relevant_lines_start": 51, "relevant_lines_end": 51,
+         "suggestion_content": "y", "label": "best practice", "improved_code": "y", "score": 7},
+    ]}
+
+    import asyncio
+    asyncio.run(tool.push_inline_code_suggestions(data))
+
+    sr = tool._last_suggestion_outcome["suppressed_records"]
+    by_file = {entry[0].rsplit("/", 1)[-1]: entry[2] for entry in sr}
+    assert "applied" in by_file["x.py"]
+    assert "dismissed" in by_file["y.py"]
+
+
+def test_fingerprint_existing_state_recorded(monkeypatch):
+    """When suppression happens via fingerprint dedup, the recorded
+    state must be 'fingerprint-existing' so the display can label it
+    'N 已存在建议' if no applied/dismissed entries are present."""
+    from pr_agent.telemetry import events as telemetry_events
+
+    store = type("Store", (), {})()
+    store.list_suggestions = lambda *a, **kw: []
+    store.list_suggestion_fingerprints = lambda *a, **kw: [{
+        "file": "x.py",
+        "line": 10,
+        "line_end": 11,
+        "state": "open",
+        "fingerprint": "abc123",
+    }]
+    monkeypatch.setattr(telemetry_events, "get_default_store", lambda: store)
+
+    tool = _make_tool()
+    candidates = [{
+        "relevant_file": "x.py",
+        "relevant_lines_start": 10,
+        "relevant_lines_end": 11,
+        "fingerprint": "abc123",
+        "body": "fix x",
+        "original_suggestion": {},
+    }]
+
+    kept = tool._suppress_resolved_suggestions(candidates)
+    assert kept == []
+    sr = tool._last_suppressed_records
+    assert len(sr) == 1
+    assert "fingerprint-existing" in sr[0][2]

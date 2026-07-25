@@ -35,6 +35,64 @@ from pr_agent.tools.pr_description import insert_br_after_x_chars
 
 
 class PRCodeSuggestions:
+    @staticmethod
+    def _get_posted_head_sha(provider) -> str:
+        # Sentinel returned when the provider can't tell us the MR's current
+        # HEAD SHA. Distinguishes "no recorded publication metadata" from
+        # "publication metadata is known to be missing".
+        pr = getattr(provider, "pr", None)
+        diff_refs = getattr(pr, "diff_refs", {}) or {} if pr is not None else {}
+        head_sha = ""
+        if pr is not None:
+            head_sha = str(getattr(pr, "sha", None) or diff_refs.get("head_sha") or "").strip()
+        return head_sha or "__unavailable__"
+
+    @staticmethod
+    def _get_suggestion_limit() -> int:
+        section = get_settings().pr_code_suggestions
+        configured = section.get("num_code_suggestions")
+        if configured is None:
+            configured = section.get("num_code_suggestions_per_chunk", 3)
+            get_logger().warning(
+                "pr_code_suggestions.num_code_suggestions is missing; "
+                "falling back to num_code_suggestions_per_chunk"
+            )
+        return max(1, int(configured))
+
+    @staticmethod
+    def _rank_and_limit_suggestions(code_suggestions, limit=None):
+        if limit is None:
+            limit = PRCodeSuggestions._get_suggestion_limit()
+        ranked = sorted(
+            code_suggestions,
+            key=lambda item: int((item.get("original_suggestion") or {}).get("score") or 0),
+            reverse=True,
+        )
+        return ranked[:limit], max(0, len(ranked) - limit)
+
+    @staticmethod
+    def _normalize_fingerprint_code(code: str) -> str:
+        # Normalize code for fingerprint comparison: collapse CRLF / CR to LF,
+        # strip trailing whitespace per line, drop blank lines at the head/
+        # tail (so "fmt the only difference" cases don't collide).
+        normalized = (code or "").replace("\r\n", "\n").replace("\r", "\n")
+        lines = [line.rstrip() for line in normalized.split("\n")]
+        while lines and not lines[0]:
+            lines.pop(0)
+        while lines and not lines[-1]:
+            lines.pop()
+        return "\n".join(lines)
+
+    @classmethod
+    def _suggestion_fingerprint(cls, file, existing_code, improved_code):
+        import hashlib
+        payload = "\0".join([
+            (file or "").strip(),
+            cls._normalize_fingerprint_code(existing_code),
+            cls._normalize_fingerprint_code(improved_code),
+        ])
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
     def __init__(self, pr_url: str, cli_mode=False, args: list = None,
                  ai_handler: partial[BaseAiHandler,] = LiteLLMAIHandler):
 
@@ -242,20 +300,58 @@ class PRCodeSuggestions:
                                 and _outcome.get('kept', 0) == 0
                                 and _outcome.get('suppressed_count', 0) > 0):
                             _sup_lines = _outcome.get('suppressed_lines') or []
-                            _shown = _sup_lines[:5]
-                            _more = len(_sup_lines) - len(_shown)
-                            _lines_str = ", ".join(
+                            # Prefer the per-entry ledger populated by
+                            # _suppress_resolved_suggestions when present; each tuple is
+                            # (file, line, frozenset({state,...})). Dedupe on (file, line)
+                            # so we list each MR line at most once even when both fingerprint
+                            # and line-window matches fire on the same row.
+                            _sup_records_raw = list(_outcome.get('suppressed_records') or [])
+                            _seen = set()
+                            _deduped = []
+                            _total = 0
+                            _applied = 0
+                            _dismissed = 0
+                            for _entry in _sup_records_raw:
+                                _fn, _ln, _states = _entry
+                                _key = ((_fn or '').strip().rsplit('/', 1)[-1], int(_ln or 0))
+                                if _key in _seen:
+                                    continue
+                                _seen.add(_key)
+                                _deduped.append((_fn, _ln, _states))
+                            _total = len(_deduped)
+                            _applied = sum(1 for _, _, st in _deduped if 'applied' in st)
+                            _dismissed = sum(1 for _, _, st in _deduped if 'dismissed' in st)
+                            _count_for_msg = _total if _sup_records_raw else len(_sup_lines)
+                            _shown_records = _deduped[:5] if _sup_records_raw else _sup_lines[:5]
+                            _more_records = (_total - len(_shown_records)) if _sup_records_raw else (len(_sup_lines) - len(_shown_records))
+                            _lines_str = ', '.join(
                                 f"{fn.rsplit('/', 1)[-1]}:L{ln}"
-                                for fn, ln, _ in _shown
+                                for fn, ln, _ in _shown_records
                             )
-                            _more_str = f" 等 {len(_sup_lines)} 处" if _more > 0 else ""
-                            _body = (
-                                "本次 `/improve` 生成 **" + str(len(_sup_lines)) + "** 条建议，"
-                                " 但都匹配到已 resolve 的位置或同规则行号漂移记录，已自动跳过：\n\n"
-                                "- " + _lines_str + _more_str + "\n\n"
-                                "如果这些行仍然有问题，可手动修改源文件后再跑 `/improve`，"
-                                " 或先用 `/suggestion_status` 看 telemetry 状态。"
-                            )
+                            _more_str = f' 等 {_count_for_msg} 处' if _more_records > 0 else ''
+                            if _sup_records_raw:
+                                _parts = []
+                                if _applied:
+                                    _parts.append(f'{_applied} 应用')
+                                if _dismissed:
+                                    _parts.append(f'{_dismissed} 忽略')
+                                _breakdown = f"（{' / '.join(_parts)}）" if _parts else ''
+                                _body = (
+                                    f"本次 `/improve` 生成 **{_count_for_msg}** 条建议{_breakdown}，"
+                                    f" 但都匹配到已 resolve 的位置或同规则行号漂移记录，已自动跳过：\n\n"
+                                    f"- {_lines_str}{_more_str}\n\n"
+                                    f"其中已应用的行表示已通过 Apply 或 /adopt 处理；已忽略的行表示先前"
+                                    f" 用 /dismiss 或 /ignore 关闭过。如这些行仍有问题，可手动修改源文件后"
+                                    f" 再跑 `/improve`，或先用 `/suggestion_status` 看 telemetry 状态。"
+                                )
+                            else:
+                                _body = (
+                                    f"本次 `/improve` 生成 **{_count_for_msg}** 条建议，"
+                                    f" 但都匹配到已 resolve 的位置或同规则行号漂移记录，已自动跳过：\n\n"
+                                    f"- {_lines_str}{_more_str}\n\n"
+                                    f"如果这些行仍然有问题，可手动修改源文件后再跑 `/improve`，"
+                                    f" 或先用 `/suggestion_status` 看 telemetry 状态。"
+                                )
                             self.git_provider.publish_comment(_body)
                         else:
                             _inline_uncovered = compute_uncovered_rules(
@@ -772,6 +868,31 @@ class PRCodeSuggestions:
             get_logger().debug(f"suppress-resolved lookup failed (skip): {e}")
             return code_suggestions
 
+        # Fingerprint dedup: build a set of all fingerprints that exist on
+        # this MR (open / applied / dismissed). When the LLM re-emits a
+        # suggestion whose fingerprint already lives on a non-superseded
+        # record, we drop it here so the MR doesn't collect duplicate
+        # DiffNotes that target the same patch the user already accepted
+        # or explicitly closed.
+        existing_fingerprints = set()
+        try:
+            store = telemetry_events.get_default_store()
+            if hasattr(store, "list_suggestion_fingerprints"):
+                fingerprint_rows = store.list_suggestion_fingerprints(
+                    mr_id=int(mr_id),
+                    project_id=int(project_id) if project_id else None,
+                )
+                existing_fingerprints = {
+                    row.get("fingerprint")
+                    for row in fingerprint_rows
+                    if row.get("state") in ("open", "applied", "dismissed") and row.get("fingerprint")
+                }
+        except Exception as e:
+            get_logger().warning(
+                "suppress-fingerprint lookup failed; continuing with resolved-line matching: %s",
+                format_exception_chain(e),
+            )
+
         # Build (file, line) -> resolved suggestion metadata. A small
         # line-window (3 lines) catches ordinary re-anchoring. Dismissed
         # suggestions with the same repository rule key get a wider window,
@@ -826,9 +947,24 @@ class PRCodeSuggestions:
 
         kept = []
         dropped = 0
+        # Per-entry suppression ledger: each entry is
+        # (file, line, frozenset({state,...})). Populated only when the
+        # entry was *actually* dropped on this pass, so callers can render
+        # a precise per-line breakdown without inventing data.
+        dropped_records = []
         for cs in code_suggestions:
             f = cs.get("relevant_file")
             ln = cs.get("relevant_lines_start")
+            fingerprint = cs.get("fingerprint")
+            if fingerprint and fingerprint in existing_fingerprints:
+                get_logger().info(
+                    f"suppress-fingerprint: skip {f}:{ln} because the patch already exists"
+                )
+                dropped += 1
+                dropped_records.append(
+                    (f or "", int(ln or 0), frozenset({"fingerprint-existing"}))
+                )
+                continue
             original_suggestion = cs.get("original_suggestion") or {}
             rule_text = " ".join([
                 str(cs.get("body") or ""),
@@ -842,12 +978,16 @@ class PRCodeSuggestions:
                     f"suppress-resolved: skip {f}:{ln} (prior state={sorted(states)})"
                 )
                 dropped += 1
+                dropped_records.append(
+                    (f or "", int(ln or 0), frozenset(states))
+                )
                 continue
             kept.append(cs)
         if dropped:
             get_logger().info(
                 f"push_inline_code_suggestions: suppressed {dropped} already-resolved suggestion(s)"
             )
+        self._last_suppressed_records = dropped_records
         return kept
 
     def _dedup_same_round_suggestions(self, code_suggestions):
@@ -958,16 +1098,25 @@ class PRCodeSuggestions:
         ]
         code_suggestions = self._suppress_resolved_suggestions(code_suggestions)
         suppressed_count = pre_suppress_count - len(code_suggestions)
+        code_suggestions, limit_dropped = self._rank_and_limit_suggestions(code_suggestions)
+        # ``suppressed_records`` is the authoritative ledger of what we
+        # actually dropped this pass. ``suppressed_lines`` is preserved
+        # for the older tests / consumers that only need file:line tuples.
+        actual_suppressed_records = list(getattr(self, '_last_suppressed_records', None) or [])
         self._last_suggestion_outcome = {
             'llm_emitted': pre_dedup_count,
             'dedup_dropped': dedup_dropped,
             'suppressed_count': suppressed_count,
+            'limit_dropped': limit_dropped,
             'kept': len(code_suggestions),
             'suppressed_lines': suppressed_lines[:suppressed_count],
+            'suppressed_records': actual_suppressed_records,
         }
         if not code_suggestions:
             get_logger().info('All LLM suggestions were already applied or dismissed.')
-            return
+            self._last_suggestion_outcome['published_count'] = 0
+            return 0
+        published_suggestions = code_suggestions
         is_successful = self.git_provider.publish_code_suggestions(code_suggestions)
         # Emit telemetry events for the suggestions we just attempted to publish.
         try:
@@ -1016,6 +1165,12 @@ class PRCodeSuggestions:
             get_logger().info("Failed to publish code suggestions, trying to publish each suggestion separately")
             for code_suggestion in code_suggestions:
                 self.git_provider.publish_code_suggestions([code_suggestion])
+        # Number of suggestions that were *submitted* to the provider this
+        # round (irrespective of partial-failure fallback). Callers compare
+        # against ``pr_code_suggestions.num_code_suggestions`` to know
+        # whether the inline pipeline published the configured budget.
+        self._last_suggestion_outcome['published_count'] = len(published_suggestions)
+        return len(published_suggestions)
 
     def dedent_code(self, relevant_file, relevant_lines_start, new_code_snippet):
         try:  # dedent code snippet

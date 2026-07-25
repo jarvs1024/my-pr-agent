@@ -165,7 +165,7 @@ extra_instructions = ""
 commitable_code_suggestions = true
 # Cap the number of inline suggestions per /improve invocation so a noisy
 # review cannot blow the prompt budget.
-num_code_suggestions = 5
+num_code_suggestions = 6
 # Ask the LLM to put the new code into the ``improved_code`` field,
 # without nested ```` ``` ```` fences inside that field (they leak into the
 # final suggestion block and confuse GitLab).
@@ -237,6 +237,7 @@ new_score_mechanism_th_high=9
 new_score_mechanism_th_medium=7
 # params for '/improve --extended' mode
 auto_extended_mode=true
+# Legacy fallback used only when num_code_suggestions is absent.
 num_code_suggestions_per_chunk=3
 max_number_of_calls = 3
 parallel_calls = true

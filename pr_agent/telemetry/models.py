@@ -83,6 +83,9 @@ class Suggestion:
     dismissed_by: Optional[str] = None
     dismissed_reason: Optional[str] = None  # user-supplied reason text from the dismiss command
     note_id: Optional[str] = None  # GitLab discussion id (hash str)
+    line_end: Optional[int] = None
+    fingerprint: Optional[str] = None
+    posted_head_sha: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
