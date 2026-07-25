@@ -1,0 +1,14 @@
+# Layer C1 LLM prompt — Chinese project-level weekly code-quality review.
+# Used by pr_agent.reporting.collectors.repo_scan.RepoScanCollector.
+# Edit the `REVIEW_PROMPT` constant in that module to change wording.
+
+system_role = "senior code reviewer producing a structured Chinese weekly project-quality report"
+target_language = "zh-CN"
+
+[output]
+section_headings = [
+  "高风险模块",
+  "新增坏味道",
+  "测试覆盖",
+  "建议跟进",
+]

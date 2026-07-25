@@ -48,6 +48,15 @@ ADD requirements-dev.txt .
 RUN pip install --no-cache-dir -r requirements-dev.txt && rm requirements-dev.txt
 ADD pr_agent pr_agent
 ADD tests tests
+
+FROM base AS reporter
+# Weekly-report scheduler — separate container; reads telemetry DB / writes
+# weekly_reports/ via the shared PR_AGENT_DATA_DIR volume mounted on both
+# the pr-agent webhook container and this one.
+RUN pip install --no-cache-dir apscheduler requests
+ADD pr_agent pr_agent
+# Long-running process (BlockingScheduler); no HTTP port exposed.
+CMD ["python", "-m", "pr_agent.reporting.scheduler"]
 ADD docker/mosaico docker/mosaico
 
 FROM base AS cli

@@ -9,7 +9,9 @@ the routes are open (intended for local dev only).
 """
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -184,6 +186,68 @@ def dismissals_by_rule(
         since=since,
         project_id=project_id,
     )
+
+
+# ----------------------------------------------------------------------
+# Weekly-report endpoints (read-only; written by pr-agent-reporter).
+# Reads JSON artifacts produced by pr_agent.reporting.scheduler. Lives in
+# the telemetry api module so TestMate keeps a single host:port.
+# ----------------------------------------------------------------------
+
+
+def _weekly_reports_dir(project_id: int) -> Path:
+    data_dir = os.environ.get("PR_AGENT_DATA_DIR", "/var/lib/pr-agent")
+    return Path(data_dir) / "weekly_reports" / str(project_id)
+
+
+@router.get("/weekly_reports/latest")
+def weekly_reports_latest(project_id: int) -> dict:
+    """Return the most recent weekly report artifact for project_id.
+
+    The artifact is the JSON document produced by pr_agent.reporting.report
+    and written under /weekly_reports/<pid>/<YYYY-WW>.json.
+    Returns 404 when no artifact exists.
+    """
+    base = _weekly_reports_dir(project_id)
+    if not base.is_dir():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "weekly_reports directory not found")
+    files = sorted(base.glob("*-W*.json"), reverse=True)
+    if not files:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no weekly reports for project")
+    return json.loads(files[0].read_text(encoding="utf-8"))
+
+
+@router.get("/weekly_reports/list")
+def weekly_reports_list(project_id: int, limit: int = 12) -> list[dict]:
+    """Return metadata for the latest limit weekly reports.
+
+    Each row includes week_label, generated_at, has_failures,
+    and per-section status. Does not include the heavy data /
+    markdown fields — callers should fetch the full artifact via
+    /weekly_reports/latest or by file path.
+    """
+    base = _weekly_reports_dir(project_id)
+    if not base.is_dir():
+        return []
+    rows: list[dict] = []
+    for path in sorted(base.glob("*-W*.json"), reverse=True)[:limit]:
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            rows.append({"week_label": path.stem, "path": str(path), "error": "unreadable"})
+            continue
+        sections = doc.get("sections") or {}
+        rows.append({
+            "week_label": doc.get("week_label"),
+            "generated_at": doc.get("generated_at"),
+            "week_start": doc.get("week_start"),
+            "week_end": doc.get("week_end"),
+            "timezone": doc.get("timezone"),
+            "has_failures": any(s.get("status") != "ok" for s in sections.values()),
+            "section_status": {name: s.get("status") for name, s in sections.items()},
+            "path": str(path),
+        })
+    return rows
 
 
 def install_routes(app) -> None:

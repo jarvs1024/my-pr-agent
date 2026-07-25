@@ -557,3 +557,60 @@ high_rule_patterns = [
     "TYPEHINT",        # missing type hints
     "BARE-PRINT",      # print() in production path
 ]
+
+# -----------------------------------------------------------------------------
+# Weekly report (added in this fork). Disabled by default — old users keep
+# zero behaviour change. To enable, set ``[weekly_report].enabled = true`` in
+# ``.pr_agent.toml`` and provision the ``pr-agent-reporter`` container.
+# -----------------------------------------------------------------------------
+[weekly_report]
+enabled = false
+
+# Target GitLab project (id or path-like via collector).
+# Required when enabled.
+target_project_id = 0
+
+# Standard cron expression + timezone.
+cron = "0 9 * * 1"
+timezone = "Asia/Shanghai"
+
+# Which collectors to run (order preserved). Each name corresponds to a
+# class in ``pr_agent.reporting.collectors``.
+collectors = ["telemetry", "master_merges", "repo_scan"]
+
+# Notifier name (currently only "dingtalk" is implemented).
+notifier = "dingtalk"
+
+# Override the LLM model used by the repo-scan collector. Empty string
+# means "follow config.model".
+llm_model = ""
+
+# When true, repo_scan returns a deterministic stub instead of calling
+# the LLM. Useful for local dev / CI without API keys.
+llm_dry_run = false
+
+# Where shallow clones are cached. Mount the host volume that backs
+# ``PR_AGENT_DATA_DIR`` so cache survives container restarts.
+# repo_clone_dir is derived from PR_AGENT_DATA_DIR when unset (see pr_agent.reporting.config)
+
+# DingTalk webhook + optional 加签 secret env var names. The actual
+# URL / secret values come from the env vars (never from this file).
+dingtalk_webhook_env = "DINGTALK_WEEKLY_WEBHOOK_URL"
+dingtalk_secret_env = "DINGTALK_WEEKLY_SECRET"
+
+# When true, DingTalk payloads are logged instead of POSTed. Useful for
+# local dev / debugging.
+dingtalk_dry_run = false
+
+# Number of retry attempts per chunk on transport / 5xx / non-ok errmsg.
+dingtalk_retry_attempts = 3
+
+# C1 layer diff cap (bytes). Larger diffs are truncated before LLM call.
+diff_token_limit = 50000
+
+# Markdown chunk size (bytes). Larger bodies are split at ``## `` headings.
+markdown_chunk_limit = 18000
+
+# Optional: target branch override. Empty -> collector uses project's
+# default_branch (so ``master`` vs ``main`` is automatic).
+target_branch = ""

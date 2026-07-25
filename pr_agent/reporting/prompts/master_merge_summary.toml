@@ -1,0 +1,6 @@
+# Layer B optional LLM prompt — batched one-line summaries for the week's merged MRs.
+# Not yet wired into MasterMergesCollector; titles are passed through verbatim.
+# When enabled, will be a single batched call per spec §6.1.
+
+system_role = "code release-notes editor producing one-line summaries per MR"
+target_language = "zh-CN"

@@ -1,0 +1,56 @@
+# Example docker-compose fragment for the pr-agent weekly-report feature.
+# Drop this into your existing pr-agent compose project, or use as a template.
+#
+# Assumptions:
+#   * The base pr-agent image has been built locally as ``pr-agent:local``
+#     (or use ``build.context: .`` + ``build.dockerfile: docker/Dockerfile``
+#     with target ``reporter``).
+#   * A named volume ``pr-agent-data`` already exists and is mounted into the
+#     ``pr-agent`` webhook container — see docker/mosaico/docker-compose.pr-agent.yml.
+
+services:
+  pr-agent:
+    # existing service, unchanged. Required so the reporter can read the
+    # telemetry DB written by the webhook handler.
+    image: pr-agent:local
+    # ...
+
+  pr-agent-reporter:
+    image: pr-agent:local
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: reporter
+    environment:
+      # Telemetry DB shared with the webhook container via the volume.
+      PR_AGENT_DATA_DIR: /var/lib/pr-agent
+      REVIEW_TELEMETRY_DB_PATH: /var/lib/pr-agent/telemetry.db
+      REVIEW_TELEMETRY_BACKEND: sqlite
+      # Weekly report toggles.
+      PR_AGENT_WEEKLY_ENABLED: "true"
+      PR_AGENT_WEEKLY_TARGET_PROJECT_ID: "${PR_AGENT_WEEKLY_TARGET_PROJECT_ID}"
+      PR_AGENT_WEEKLY_TARGET_BRANCH: "${PR_AGENT_WEEKLY_TARGET_BRANCH:-main}"
+      PR_AGENT_WEEKLY_CRON: "${PR_AGENT_WEEKLY_CRON:-0 9 * * 1}"
+      PR_AGENT_WEEKLY_TIMEZONE: "${PR_AGENT_WEEKLY_TIMEZONE:-Asia/Shanghai}"
+      # Mock modes for local dev:
+      PR_AGENT_WEEKLY_DINGTALK_DRY_RUN: "${PR_AGENT_WEEKLY_DINGTALK_DRY_RUN:-false}"
+      PR_AGENT_WEEKLY_LLM_DRY_RUN: "${PR_AGENT_WEEKLY_LLM_DRY_RUN:-false}"
+      # GitLab access.
+      GITLAB_URL: "${GITLAB_URL:-https://gitlab.com}"
+      GITLAB_PERSONAL_ACCESS_TOKEN: "${GITLAB_PERSONAL_ACCESS_TOKEN}"
+      # DingTalk webhook (custom robot).
+      DINGTALK_WEEKLY_WEBHOOK_URL: "${DINGTALK_WEEKLY_WEBHOOK_URL}"
+      DINGTALK_WEEKLY_SECRET: "${DINGTALK_WEEKLY_SECRET:-}"
+      # LLM (for repo_scan when not in dry_run).
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+    volumes:
+      - pr-agent-data:/var/lib/pr-agent
+    restart: unless-stopped
+    # Cap memory so the LLM call cannot starve the host.
+    mem_limit: 2g
+    cpus: '1.0'
+    # No exposed ports — pure cron worker.
+
+volumes:
+  pr-agent-data:
+    # named volume shared with the pr-agent webhook container

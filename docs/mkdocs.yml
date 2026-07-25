@@ -19,6 +19,7 @@ nav:
     - Changing a Model: 'usage-guide/changing_a_model.md'
     - Additional Configurations: 'usage-guide/additional_configurations.md'
     - Plain-Diff Mode: 'usage-guide/plain_diff_mode.md'
+    - Weekly Report (DingTalk): 'usage-guide/weekly_report.md'
     - Frequently Asked Questions: 'faq/index.md'
   - Tools:
      - 'tools/index.md'

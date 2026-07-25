@@ -433,3 +433,51 @@ docker compose up -d
 内网机器:    docker load + 改 Dockerfile 走 local wheels + docker compose build
                           ↓
             步骤 6~11 同正常流程 (GitLab UI / webhook / 评论)
+
+---
+
+## 周报 reporter (可选)
+
+周报功能是独立容器, 跟 webhook 容器共享 `PR_AGENT_DATA_DIR` 卷, 但跑在另一个
+进程里。完整的配置 / 部署 / 排错文档见
+[usage-guide/weekly_report.md](../usage-guide/weekly_report.md); 这里只贴本地
+compose 片段:
+
+```yaml
+  pr-agent-reporter:
+    image: pr-agent:local
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: reporter
+    environment:
+      PR_AGENT_DATA_DIR: /var/lib/pr-agent
+      REVIEW_TELEMETRY_DB_PATH: /var/lib/pr-agent/telemetry.db
+      PR_AGENT_WEEKLY_ENABLED: "true"
+      PR_AGENT_WEEKLY_TARGET_PROJECT_ID: "${PR_AGENT_WEEKLY_TARGET_PROJECT_ID}"
+      PR_AGENT_WEEKLY_TARGET_BRANCH: "${PR_AGENT_WEEKLY_TARGET_BRANCH:-main}"
+      GITLAB_URL: "${GITLAB_URL}"
+      GITLAB_PERSONAL_ACCESS_TOKEN: "${GITLAB_PERSONAL_ACCESS_TOKEN}"
+      DINGTALK_WEEKLY_WEBHOOK_URL: "${DINGTALK_WEEKLY_WEBHOOK_URL}"
+      DINGTALK_WEEKLY_SECRET: "${DINGTALK_WEEKLY_SECRET:-}"
+    volumes:
+      - pr-agent-data:/var/lib/pr-agent
+    restart: unless-stopped
+    mem_limit: 2g
+```
+
+本地 dry-run 验证 (不发钉钉, 不调真实 LLM):
+
+```bash
+PYTHONPATH=. \
+  PR_AGENT_WEEKLY_ENABLED=true \
+  PR_AGENT_WEEKLY_TARGET_PROJECT_ID=<your_project_id> \
+  PR_AGENT_WEEKLY_DINGTALK_DRY_RUN=true \
+  PR_AGENT_WEEKLY_LLM_DRY_RUN=true \
+  python -m pr_agent.reporting.cli --run-now --since-days 30
+```
+
+产物落在 `${PR_AGENT_DATA_DIR}/weekly_reports/<pid>/<YYYY-WW>.json`, 可用
+`python -m pr_agent.reporting.cli --print-latest <pid>` 看, 也可以走 webhook
+容器的 `/api/v1/telemetry/weekly_reports/latest?project_id=<pid>` 给 TestMate
+读。

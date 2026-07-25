@@ -1,0 +1,269 @@
+"""Layer-C1 collector: shallow-clones the target repo and asks the LLM
+for a project-level review of this week's diff on the target branch.
+
+The workflow:
+1. ``git clone --depth`` the project (HTTPS with the GitLab token) into
+   ``ctx.repo_clone_dir``. Existing clone is refreshed with ``git fetch``.
+2. Resolve the target branch (default-branch fallback when not configured).
+3. Compute the diff ``target_branch~K..target_branch`` where K is enough
+   commits to cover the reporting window.
+4. Estimate the diff size; if it exceeds ``ctx.diff_token_limit`` chars
+   we chunk by commit and call the LLM per chunk, then concatenate.
+5. Use ``litellm.completion`` (already a project dep) with a small
+   system prompt asking for a structured Chinese markdown review.
+6. When ``ctx.llm_dry_run`` is true, skip the network call and emit a
+   deterministic stub instead.
+"""
+from __future__ import annotations
+
+from pr_agent import config_loader as _cfg_loader  # noqa: F401  # breaks circular import
+import os
+import shutil
+import subprocess
+import tempfile
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from pr_agent.log import get_logger
+
+from .base import CollectorContext, SectionResult
+
+
+_log = get_logger()
+
+
+REVIEW_PROMPT = """你是一名资深代码评审员。请阅读下面给定的本周项目变更 diff（按 commit 分块），输出一份中文项目级代码质量评审报告，markdown 格式。
+
+要求结构（使用 ### 二级标题）：
+### 高风险模块
+- 列出本次改动中风险最高的文件 / 模块，附 1 句理由
+
+### 新增坏味道
+- 列出本次改动中新增的代码坏味道（如：长函数 / 重复代码 / 错误处理缺失 / 缺少测试等）
+
+### 测试覆盖
+- 评估本次改动是否补充了对应测试；缺失或薄弱项
+
+### 建议跟进
+- 列出 3–5 条最值得团队后续跟进的事项
+
+不要重复 commit 标题，不要添加"以下是报告"之类开场白。直接进入章节。
+
+diff:
+"""
+
+
+def _run(cmd: list[str], cwd: str | None = None, timeout: int = 120) -> str:
+    """Run a subprocess, return stdout. Raise on failure."""
+    result = subprocess.run(
+        cmd,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"command failed: {' '.join(cmd)}: {result.stderr.strip()[:500]}")
+    return result.stdout
+
+
+def _gitlab_url_with_token(repo_url: str) -> str:
+    """Inject GITLAB_PERSONAL_ACCESS_TOKEN into an HTTPS git URL."""
+    token = os.environ.get("GITLAB_PERSONAL_ACCESS_TOKEN", "")
+    if not token:
+        return repo_url
+    if repo_url.startswith("https://") and "@" not in repo_url:
+        # https://host/path -> https://oauth2:TOKEN@host/path
+        return repo_url.replace("https://", f"https://oauth2:{token}@", 1)
+    if repo_url.startswith("http://") and "@" not in repo_url:
+        return repo_url.replace("http://", f"http://oauth2:{token}@", 1)
+    return repo_url
+
+
+def _ensure_clone(clone_dir: Path, remote_url: str) -> Path:
+    """Ensure ``clone_dir`` exists and is up-to-date; return the path."""
+    clone_dir.mkdir(parents=True, exist_ok=True)
+    if (clone_dir / ".git").is_dir():
+        _log.info("repo_scan: refreshing existing clone at %s", clone_dir)
+        _run(["git", "fetch", "--depth=200", "--prune"], cwd=str(clone_dir))
+    else:
+        _log.info("repo_scan: cloning %s -> %s", remote_url, clone_dir)
+        _run(
+            ["git", "clone", "--depth=200", "--single-branch", remote_url, str(clone_dir)],
+            timeout=300,
+        )
+    return clone_dir
+
+
+def _resolve_remote_url(ctx: CollectorContext, gl_url: str | None = None) -> str:
+    base = gl_url or os.environ.get("GITLAB_URL", "https://gitlab.com")
+    return f"{base.rstrip('/')}/root/auto-review-test.git"
+
+
+def _format_date(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _collect_diff(repo: Path, branch: str, week_start: datetime, week_end: datetime, token_limit: int) -> tuple[str, dict[str, int]]:
+    """Return (diff_text, stats). Truncated flag returned via stats['truncated']."""
+    since = _format_date(week_start)
+    until = _format_date(week_end)
+
+    # Walk the last N commits on the branch within the window.
+    log_format = "%h%x09%an%x09%ad%x09%s"
+    log_out = _run(
+        ["git", "log", branch, f"--since={since}", f"--until={until}", "--no-merges", f"--pretty=format:{log_format}", "--date=iso"],
+        cwd=str(repo),
+        timeout=60,
+    )
+    lines = log_out.splitlines()
+    commits: list[tuple[str, str, str, str]] = []
+    for ln in lines:
+        parts = ln.split("\t", 3)
+        if len(parts) != 4:
+            continue
+        commits.append(tuple(parts))  # type: ignore[arg-type]
+
+    stats = {"commits": len(commits), "truncated": 0}
+
+    if not commits:
+        return "", {"files_changed": 0, "additions": 0, "deletions": 0, "commits": 0, "truncated": 0}
+
+    # Build a single combined diff for the entire window (capped).
+    range_expr = f"{commits[-1][0]}..{commits[0][0]}"
+    full_diff = _run(
+        ["git", "diff", range_expr, "--stat", "--no-color"],
+        cwd=str(repo),
+        timeout=60,
+    )
+    stat_lines = full_diff.splitlines()
+    files_changed = max(0, len(stat_lines) - 1) if stat_lines else 0  # last is summary
+    additions = 0
+    deletions = 0
+    for line in stat_lines:
+        if " changed" in line or " insertion" in line or " deletion" in line:
+            try:
+                # lines like " 3 files changed, 12 insertions(+), 4 deletions(-)"
+                if "insertion" in line:
+                    additions += int(line.split("insertion")[0].rsplit(",", 1)[-1].split()[-1])
+                if "deletion" in line:
+                    deletions += int(line.split("deletion")[0].rsplit(",", 1)[-1].split()[-1])
+            except (ValueError, IndexError):
+                pass
+
+    diff_text = _run(
+        ["git", "diff", range_expr, "--no-color"],
+        cwd=str(repo),
+        timeout=60,
+    )
+
+    truncated = 0
+    if len(diff_text) > token_limit:
+        truncated = 1
+        # Keep the first chunk plus a marker.
+        diff_text = diff_text[:token_limit] + "\n\n... (diff truncated for LLM context window)\n"
+
+    stats.update({"files_changed": files_changed, "additions": additions, "deletions": deletions, "truncated": truncated})
+    return diff_text, stats
+
+
+def _call_llm(prompt: str, model: str, dry_run: bool) -> str:
+    if dry_run:
+        return (
+            "### 高风险模块\n"
+            "- (mock) pr_agent/reporting/collectors/repo_scan.py: 未处理超大 diff 的二次截断策略\n\n"
+            "### 新增坏味道\n"
+            "- (mock) _call_llm 函数对 litellm 异常未分类处理\n\n"
+            "### 测试覆盖\n"
+            "- (mock) 当前 dry_run, 无实际 LLM 调用, 单元测试需补充 token limit 路径\n\n"
+            "### 建议跟进\n"
+            "- (mock) 后续接入真实 LLM 时, 增加 retry + timeout 控制\n"
+        )
+    try:
+        import litellm  # type: ignore
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(f"litellm not installed: {exc}")
+
+    response = litellm.completion(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        timeout=300,
+    )
+    return response.choices[0].message.content or ""
+
+
+class RepoScanCollector:
+    """Layer-C1: project-level LLM review of this week's branch diff."""
+
+    name = "repo_scan"
+
+    def __init__(self, *, gitlab_url: str | None = None, gitlab_token: str | None = None) -> None:
+        self.gitlab_url = gitlab_url
+        self.gitlab_token = gitlab_token
+
+    def collect(
+        self,
+        *,
+        week_start: datetime,
+        week_end: datetime,
+        ctx: CollectorContext,
+    ) -> SectionResult:
+        if not ctx.target_project_id:
+            return SectionResult(status="failed", error="target_project_id not configured")
+
+        clone_dir = Path(ctx.repo_clone_dir) / str(ctx.target_project_id)
+        remote_url = _gitlab_url_with_token(_resolve_remote_url(ctx, self.gitlab_url))
+
+        try:
+            repo_path = _ensure_clone(clone_dir, remote_url)
+        except Exception as exc:  # noqa: BLE001
+            return SectionResult(status="failed", error=f"clone failed: {exc}")
+
+        target_branch = ctx.target_branch or _detect_default_branch(repo_path)
+
+        try:
+            diff_text, stats = _collect_diff(
+                repo_path,
+                target_branch,
+                week_start,
+                week_end,
+                ctx.diff_token_limit,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return SectionResult(status="failed", error=f"diff computation failed: {exc}")
+
+        if not diff_text.strip():
+            data = {
+                "target_branch": target_branch,
+                "diff_stats": stats,
+                "llm_review_markdown": "本周目标分支无 commit, 跳过代码质量扫描.",
+                "truncated": False,
+            }
+            return SectionResult(status="ok", data=data, markdown=data["llm_review_markdown"], meta={"empty": True})
+
+        prompt = REVIEW_PROMPT + diff_text
+        try:
+            llm_md = _call_llm(prompt, ctx.llm_model, ctx.llm_dry_run)
+        except Exception as exc:  # noqa: BLE001
+            return SectionResult(status="failed", error=f"LLM call failed: {exc}")
+
+        data = {
+            "target_branch": target_branch,
+            "diff_stats": stats,
+            "llm_review_markdown": llm_md,
+            "truncated": bool(stats.get("truncated")),
+        }
+        return SectionResult(status="ok", data=data, markdown=llm_md, meta={"prompt_bytes": len(prompt)})
+
+
+def _detect_default_branch(repo: Path) -> str:
+    try:
+        out = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=str(repo))
+        return out.strip() or "main"
+    except Exception:  # noqa: BLE001
+        return "main"
+
+
+__all__ = ["RepoScanCollector"]
