@@ -48,6 +48,24 @@ class TestGitLabProvider:
         mock_project.files.get.assert_called_once_with("CHANGELOG.md", "main")
         mock_file.decode.assert_called_once()
 
+    def test_publish_code_suggestions_uses_inclusive_line_range(self):
+        provider = GitLabProvider.__new__(GitLabProvider)
+        target_file = MagicMock(filename="app.py", old_filename="app.py")
+        target_file.head_file = "\n".join(f"line {line}" for line in range(1, 7))
+        provider.get_diff_files = MagicMock(return_value=[target_file])
+        provider.send_inline_comment = MagicMock(return_value="discussion-id")
+
+        provider.publish_code_suggestions([{
+            "body": "```suggestion\nline 30\nline 31\nline 32\nline 33\nline 34\n```",
+            "relevant_file": "app.py",
+            "relevant_lines_start": 2,
+            "relevant_lines_end": 6,
+            "original_suggestion": {},
+        }])
+
+        body = provider.send_inline_comment.call_args.args[0]
+        assert "```suggestion:-0+5\n" in body
+
     def test_get_pr_file_content_with_bytes(self, gitlab_provider, mock_project):
         mock_file = MagicMock(ProjectFile)
         mock_file.decode.return_value = b"# Changelog\n\n## v1.0.0\n- Initial release"

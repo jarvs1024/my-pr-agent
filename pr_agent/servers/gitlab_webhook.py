@@ -2,6 +2,8 @@ import copy
 import json
 import os
 import re
+import threading
+import time
 from datetime import datetime
 
 import uvicorn
@@ -132,6 +134,26 @@ def _emit_mr_merged(data: dict) -> None:
 import re as _re_apply
 
 _APPLY_COMMIT_RE = _re_apply.compile(r"Apply\s+(\d+)\s+suggestion", _re_apply.IGNORECASE)
+_APPLY_PIPELINE_CLAIMS: dict[tuple[int, str], float] = {}
+_APPLY_PIPELINE_CLAIMS_LOCK = threading.Lock()
+_APPLY_PIPELINE_CLAIM_TTL_SECONDS = 600
+
+
+def _claim_apply_pipeline(project_id, sha: str) -> bool:
+    """Allow one automatic pipeline for an Apply commit across duplicate hooks."""
+    if not sha:
+        return True
+    key = (int(project_id or 0), sha)
+    now = time.monotonic()
+    with _APPLY_PIPELINE_CLAIMS_LOCK:
+        expired = [claim_key for claim_key, claimed_at in _APPLY_PIPELINE_CLAIMS.items()
+                   if now - claimed_at > _APPLY_PIPELINE_CLAIM_TTL_SECONDS]
+        for claim_key in expired:
+            del _APPLY_PIPELINE_CLAIMS[claim_key]
+        if key in _APPLY_PIPELINE_CLAIMS:
+            return False
+        _APPLY_PIPELINE_CLAIMS[key] = now
+        return True
 
 
 def _resolve_apply_event(webhook_data: dict):
@@ -361,11 +383,12 @@ def _changed_new_line_ranges(diff: str) -> list[tuple[int, int]]:
     new_line = None
     range_start = None
     deleted_before_addition = False
+    deleted_lines_blank = False
 
     def close_range() -> None:
         nonlocal range_start
         if range_start is not None and new_line is not None:
-            ranges.append((range_start, new_line - 1))
+            ranges.append((range_start, new_line if not deleted_before_addition else new_line - 1))
             range_start = None
 
     for line in diff.splitlines():
@@ -374,19 +397,27 @@ def _changed_new_line_ranges(diff: str) -> list[tuple[int, int]]:
             close_range()
             new_line = int(hunk.group(1))
             deleted_before_addition = False
+            deleted_lines_blank = False
             continue
         if new_line is None:
             continue
         if line.startswith("+") and not line.startswith("+++"):
             if range_start is None:
-                range_start = new_line if deleted_before_addition else max(1, new_line - 1)
+                if deleted_before_addition and deleted_lines_blank:
+                    range_start = max(1, new_line - 1)
+                else:
+                    range_start = new_line if deleted_before_addition else max(1, new_line - 1)
             new_line += 1
         elif line.startswith("-") and not line.startswith("---"):
             close_range()
+            if not deleted_before_addition:
+                deleted_lines_blank = True
+            deleted_lines_blank = deleted_lines_blank and not line[1:].strip()
             deleted_before_addition = True
         else:
             close_range()
             deleted_before_addition = False
+            deleted_lines_blank = False
             new_line += 1
     close_range()
     return ranges
@@ -714,6 +745,14 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                         status_code=status.HTTP_200_OK,
                         content=jsonable_encoder({"message": "apply-telemetry-only"})
                     )
+                if not _claim_apply_pipeline(apply_event.get("project_id"), apply_event.get("sha")):
+                    get_logger().info(
+                        "apply-pipeline: duplicate webhook for the same Apply commit; skipping commands."
+                    )
+                    return JSONResponse(
+                        status_code=status.HTTP_200_OK,
+                        content=jsonable_encoder({"message": "apply-duplicate-skip"})
+                    )
                 # Also keep the MR activity row in telemetry consistent
                 # with the ``updated`` state the dispatcher would have
                 # emitted had we let control fall through.
@@ -742,76 +781,18 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                             apply_url = f"{project_web}/-/merge_requests/{apply_mr_iid}"
                 if apply_url:
                     _resolve_superseded_suggestions(apply_url)
-                # GitLab fires both a ``push`` hook AND a ``merge_request update``
-                # hook for the same Apply-suggestion commit. The push hook arrives
-                # first and runs ``apply_commands`` below; the merge_request update
-                # arrives second and would otherwise re-run
-                # ``/describe + /review + /improve`` on the same diff, producing
-                # duplicate review comments and duplicate ``/improve`` suggestions.
-                # Stop at the merge_request update branch — telemetry is already
-                # up to date, and the push hook already chained ``apply_commands``.
-                if data.get("object_kind") == "merge_request":
-                    # If the MR update is push-driven (oldrev set), fall through
-                    # so the action=update dispatcher can run push_commands.
-                    # This covers deployments that configure "Merge request events"
-                    # but NOT "Push events" in GitLab webhook settings — the push
-                    # hook never arrives, so we cannot rely on it having chained
-                    # commands. Telemetry is already updated; the action=update
-                    # handler is idempotent for _resolve_superseded_suggestions.
-                    if (data.get("object_attributes") or {}).get("oldrev"):
-                        get_logger().info(
-                            "apply-pipeline: telemetry updated on push-driven "
-                            "MR update; falling through to action=update "
-                            "dispatcher to run push_commands."
-                        )
-                        # Don't return — let the dispatcher handle it.
-                    else:
-                        get_logger().info(
-                            "apply-pipeline: skipping command re-run on "
-                            "non-push-driven MR update (description-only "
-                            "change); telemetry already updated."
-                        )
-                        return JSONResponse(
-                            status_code=status.HTTP_200_OK,
-                            content=jsonable_encoder({"message": "apply-mr-update-noop"})
-                        )
-                # Re-run the user-configured ``apply_commands`` pipeline so
-                # /describe updates the Description, /review refreshes the
-                # parent review guide, and /improve issues any remaining
-                # suggestions against the new diff. ``apply_commands`` is
-                # already declared in the deployment configuration but the
-                # original dispatcher returned before reaching it, leaving
-                # Description / review_guide stale until the next push.
-                # We deliberately do NOT return here — the apply commit must
-                # both update telemetry AND chain into apply_commands.
                 apply_cmds = get_settings().get("gitlab.apply_commands", []) or []
-                if apply_cmds and apply_url:
+                push_cmds = get_settings().get("gitlab.push_commands", []) or []
+                pipeline_commands = apply_cmds or push_cmds
+                if pipeline_commands and apply_url:
                     try:
                         await _perform_commands_gitlab(
-                            "apply_commands", PRAgent(), apply_url, log_context, data
+                            "apply_commands" if apply_cmds else "push_commands",
+                            PRAgent(), apply_url, log_context, data
                         )
                     except Exception as _apply_chain_err:
                         get_logger().warning(
-                            f"apply_commands re-run failed: {_apply_chain_err}"
-                        )
-                # Chain push_commands too so /describe + /review + /improve
-                # re-run against the post-Apply diff. Most deployments only
-                # configure push_commands (not apply_commands), so without
-                # this the reviewer sees no fresh feedback after an Apply
-                # click — the apply-pipeline guard short-circuits before the
-                # normal push dispatcher would have run them.
-                # Guard with handle_push_trigger so deployments that opt out
-                # of push_commands (e.g. gate on reviewers only) stay opted out.
-                push_cmds = get_settings().get("gitlab.push_commands", []) or []
-                handle_push_trigger = get_settings().get("gitlab.handle_push_trigger", False)
-                if push_cmds and handle_push_trigger and apply_url:
-                    try:
-                        await _perform_commands_gitlab(
-                            "push_commands", PRAgent(), apply_url, log_context, data
-                        )
-                    except Exception as _push_chain_err:
-                        get_logger().warning(
-                            f"push_commands re-run (post-apply) failed: {_push_chain_err}"
+                            f"Apply pipeline re-run failed: {_apply_chain_err}"
                         )
                 return JSONResponse(status_code=status.HTTP_200_OK, content=jsonable_encoder({"message": "apply-handled"}))
         except Exception as e:
@@ -1028,10 +1009,12 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                                 + (f" (reason={_reason!r})" if _reason else ""))
                             try:
                                 author = data.get('user', {}).get('username', '')
+                                mr_iid = data.get('merge_request', {}).get('iid')
                                 telemetry_events.mark_suggestion_adopted(
                                     suggestion['suggestion_id'],
                                     actor=author,
                                     reason=_reason,
+                                    mr_id=int(mr_iid or suggestion['mr_id'] or 0),
                                 )
                             except Exception as e:
                                 get_logger().warning(f"telemetry.on_adopt failed: {e}")

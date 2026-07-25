@@ -715,7 +715,8 @@ class GitLabProvider(GitProvider):
                         if file.filename == relevant_file:
                             target_file = file
                             break
-                range = relevant_lines_end - relevant_lines_start # no need to add 1
+                # GitLab's suggestion line count is inclusive: 30-34 replaces 5 lines.
+                range = relevant_lines_end - relevant_lines_start + 1
                 body = body.replace('```suggestion', f'```suggestion:-0+{range}')
                 lines = target_file.head_file.splitlines()
                 relevant_line_in_file = lines[relevant_lines_start - 1]

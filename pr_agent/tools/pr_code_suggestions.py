@@ -1067,14 +1067,15 @@ class PRCodeSuggestions:
                     if delta_spaces > 0:
                         new_code_snippet = textwrap.indent(new_code_snippet, delta_spaces * indent_char)
                     else:
-                        # LLM sometimes emits `improved_code` with extra leading
-                        # whitespace (e.g. a module-level `def` carried over from
-                        # a nested snippet context). Strip the common leading
-                        # whitespace first so the diff lands at the right column.
-                        # textwrap.dedent is a no-op when the snippet has no
-                        # common leading whitespace, so this is safe even when
-                        # the snippet is already at the right indentation.
-                        new_code_snippet = textwrap.dedent(new_code_snippet)
+                        extra_spaces = -delta_spaces
+                        adjusted_lines = []
+                        for line in new_code_snippet.splitlines():
+                            removable = min(
+                                extra_spaces,
+                                len(line) - len(line.lstrip(" \t")),
+                            )
+                            adjusted_lines.append(line[removable:])
+                        new_code_snippet = "\n".join(adjusted_lines)
                     new_code_snippet = new_code_snippet.rstrip('\n')
         except Exception as e:
             get_logger().error("Error when dedenting code snippet for file {relevant_file}, error: %s", format_exception_chain(e))

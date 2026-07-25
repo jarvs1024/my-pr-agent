@@ -70,7 +70,7 @@ def test_gitlab_changed_new_line_ranges_parses_multiple_hunks(gitlab_webhook_mod
 +added_two
 """
 
-    assert gitlab_webhook_module._changed_new_line_ranges(diff) == [(9, 9), (27, 29)]
+    assert gitlab_webhook_module._changed_new_line_ranges(diff) == [(9, 9), (27, 30)]
 
 
 def test_gitlab_changed_new_line_ranges_includes_pure_insertion_anchor(gitlab_webhook_module):
@@ -81,8 +81,20 @@ def test_gitlab_changed_new_line_ranges_includes_pure_insertion_anchor(gitlab_we
  import os
 """
 
-    assert gitlab_webhook_module._changed_new_line_ranges(diff) == [(10, 11)]
+    assert gitlab_webhook_module._changed_new_line_ranges(diff) == [(10, 12)]
 
+
+def test_gitlab_changed_new_line_ranges_includes_anchor_for_blank_line_replacement(gitlab_webhook_module):
+    diff = "\n".join([
+        "@@ -1,4 +1,4 @@",
+        " header",
+        " import sqlite3",
+        "-",
+        "+" + "import logging",
+        " body",
+    ])
+
+    assert gitlab_webhook_module._changed_new_line_ranges(diff) == [(2, 3)]
 
 def test_gitlab_changed_new_line_ranges_ignores_deleted_lines(gitlab_webhook_module):
     diff = """@@ -20,2 +20,0 @@ def removed():

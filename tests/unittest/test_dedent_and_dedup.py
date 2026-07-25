@@ -77,6 +77,22 @@ def test_dedent_code_strips_extra_leading_whitespace():
     assert out.splitlines()[1].startswith('    """')
 
 
+def test_dedent_code_strips_extra_indent_from_first_line_only():
+    """A module-level import must not remain indented when later lines are not."""
+    head = "\n".join([
+        '"""Module."""',
+        "",
+        "import sqlite3",
+        "",
+    ])
+    p = _make_suggestion_tool(head)
+    snippet = "    import sqlite3\nimport logging\n"
+
+    out = p.dedent_code("services/payment_router.py", 3, snippet)
+
+    assert out == "import sqlite3\nimport logging"
+
+
 def test_dedent_code_indent_under_indented_path_still_works():
     """Existing behaviour (delta_spaces > 0) is preserved."""
     head = textwrap.dedent(

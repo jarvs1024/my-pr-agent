@@ -286,7 +286,7 @@ def mark_suggestion_dismissed(suggestion_id: str, actor: str = "", reason: str =
     except Exception as e:
         get_logger().warning(f"telemetry.mark_suggestion_dismissed failed: {e}")
 
-def mark_suggestion_adopted(suggestion_id: str, actor: str = "", reason: str = "") -> None:
+def mark_suggestion_adopted(suggestion_id: str, actor: str = "", reason: str = "", mr_id: int = 0) -> None:
     """State-update helper for /adopt (manual / rewritten adoption).
 
     After simplification, ``/adopt`` and the GitLab ``Apply suggestion``
@@ -302,7 +302,7 @@ def mark_suggestion_adopted(suggestion_id: str, actor: str = "", reason: str = "
             get_default_store().record_action(models.ActionEvent(
                 action="adopted_implicitly",
                 suggestion_id=suggestion_id,
-                mr_id=0,
+                mr_id=mr_id,
                 actor=actor,
                 note=reason or None,
             ))
