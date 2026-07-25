@@ -1158,6 +1158,7 @@ class PRCodeSuggestions:
                     rule_keys=rule_keys,
                     score=original.get("score"),
                     note_id=cs.get("note_id"),
+                    posted_head_sha=PRCodeSuggestions._get_posted_head_sha(self.git_provider),
                 )
         except Exception as e:
             get_logger().warning("telemetry emit on publish_code_suggestions failed: %s", format_exception_chain(e))

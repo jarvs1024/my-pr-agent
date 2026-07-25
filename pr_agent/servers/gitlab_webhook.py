@@ -161,7 +161,14 @@ def _resolve_apply_event(webhook_data: dict):
     object_kind = webhook_data.get("object_kind")
     project = webhook_data.get("project", {}) or {}
     project_id = project.get("id")
-    actor = (webhook_data.get("user") or {}).get("username", "") or ""
+    # push hooks expose the actor via top-level ``user_*`` fields, while
+    # merge_request hooks nest it under ``user``. Fall back so we always
+    # capture the pusher when present.
+    actor = (
+        (webhook_data.get("user") or {}).get("username")
+        or webhook_data.get("user_username")
+        or ""
+    )
 
     if object_kind == "push":
         ref = webhook_data.get("ref") or ""
@@ -546,23 +553,36 @@ def _handle_apply_commit(webhook_data: dict) -> None:
         if expected_count < 1:
             match = _APPLY_COMMIT_RE.search(msg)
             expected_count = int(match.group(1)) if match else 0
-        if len(candidates) != expected_count:
+        # Tolerant match: the user clicked Apply N times, but several
+        # historical /improve rounds may have posted duplicate open
+        # suggestions for the same line. Mark exactly ``expected_count``
+        # of the candidates (oldest first) and leave the duplicates for
+        # the next /improve to retire as superseded.
+        if expected_count < 1:
+            get_logger().warning(
+                "telemetry.on_apply_commit expected count unresolved: "
+                f"project={project_id} mr={mr_id} sha={sha[:10]}"
+            )
+            return
+        if len(candidates) < expected_count:
             get_logger().warning(
                 "telemetry.on_apply_commit exact match failed: "
                 f"project={project_id} mr={mr_id} sha={sha[:10]} "
                 f"expected={expected_count} matched={len(candidates)}"
             )
             return
+        apply_ids = candidates[:expected_count]
         updated = telemetry_events.mark_suggestion_ids_applied(
             mr_id=int(mr_id),
             project_id=int(project_id),
-            suggestion_ids=candidates,
+            suggestion_ids=apply_ids,
             actor=actor,
             apply_event_sha=sha,
         )
         if updated:
             get_logger().info(
-                f"telemetry.on_apply_commit: exactly marked {len(updated)} suggestion(s) applied: {updated[:3]}"
+                f"telemetry.on_apply_commit: marked {len(updated)} suggestion(s) applied "
+                f"(expected={expected_count}, candidates={len(candidates)}): {updated[:3]}"
             )
     except Exception as e:
         get_logger().warning(f"telemetry.on_apply_commit outer: {e}")
@@ -636,7 +656,11 @@ def _resolve_superseded_suggestions(pr_url: str) -> list[str]:
         store = telemetry_events.get_default_store()
         for discussion_id in resolved_discussions:
             suggestion = store.get_suggestion_by_note_id(discussion_id)
-            if suggestion is None or suggestion.get("state") not in ("open", "applied"):
+            # Only resolve supersede for ``open`` rows: applied rows represent
+            # a user action (Apply button or /adopt) and must keep their
+            # attribution even when GitLab auto-resolves the discussion
+            # because the source line is gone.
+            if suggestion is None or suggestion.get("state") != "open":
                 continue
             telemetry_events.mark_suggestion_superseded(suggestion["suggestion_id"])
             telemetry_events.emit_action(

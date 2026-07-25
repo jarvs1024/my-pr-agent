@@ -191,7 +191,13 @@ def average(values):
     assert marked == ["sug-lookup"]
 
 
-def test_handle_apply_commit_keeps_open_when_exact_match_is_ambiguous(gitlab_webhook_module, monkeypatch):
+def test_handle_apply_commit_marks_expected_count_when_duplicate_candidates(gitlab_webhook_module, monkeypatch):
+    """When several open suggestions match the same Apply commit
+    (e.g. duplicates posted by different /improve rounds), only the
+    oldest ``expected_count`` candidates are marked applied; the rest
+    stay open and are expected to be retired by the next /improve as
+    superseded.
+    """
     patch = "return 2"
     provider = _Provider(
         discussions=[
@@ -223,7 +229,10 @@ def test_handle_apply_commit_keeps_open_when_exact_match_is_ambiguous(gitlab_web
 
     gitlab_webhook_module._handle_apply_commit({"object_kind": "push"})
 
-    assert marked == []
+    # Commit message is "Apply 1 suggestion" → only the oldest candidate
+    # (sug-1) is attributed; the duplicate (sug-2) stays open and will be
+    # retired as superseded by the next /improve.
+    assert marked == ["sug-1"]
 
 
 def test_handle_apply_commit_keeps_open_when_diff_api_fails(gitlab_webhook_module, monkeypatch):

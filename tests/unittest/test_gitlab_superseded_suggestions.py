@@ -172,3 +172,39 @@ def test_webhook_does_not_overwrite_user_dismissed_state(monkeypatch):
     assert resolved == ["discussion-1"]
     mark_superseded.assert_not_called()
     emit_action.assert_not_called()
+
+
+def test_webhook_does_not_overwrite_applied_state(monkeypatch):
+    """Applied suggestions keep their attribution even when the source line
+    is auto-resolved by GitLab. Otherwise a successful Apply would be
+    silently re-classified as superseded by the next /improve run.
+    """
+    provider = MagicMock()
+    provider.resolve_superseded_suggestion_discussions.return_value = ["discussion-1"]
+    monkeypatch.setattr(gitlab_webhook, "get_git_provider_with_context", lambda pr_url: provider)
+    settings = MagicMock()
+    settings.get.side_effect = lambda key, default=None: {
+        "gitlab.user": "review-bot",
+        "config.allowed_bot_usernames": ["review-bot"],
+    }.get(key, default)
+    monkeypatch.setattr(gitlab_webhook, "get_settings", lambda: settings)
+
+    store = MagicMock()
+    store.get_suggestion_by_note_id.return_value = {
+        "suggestion_id": "suggestion-1",
+        "mr_id": 80,
+        "state": "applied",
+    }
+    monkeypatch.setattr(gitlab_webhook.telemetry_events, "get_default_store", lambda: store)
+    mark_superseded = MagicMock()
+    emit_action = MagicMock()
+    monkeypatch.setattr(gitlab_webhook.telemetry_events, "mark_suggestion_superseded", mark_superseded)
+    monkeypatch.setattr(gitlab_webhook.telemetry_events, "emit_action", emit_action)
+
+    resolved = gitlab_webhook._resolve_superseded_suggestions(
+        "http://127.0.0.1:8929/root/auto-review-test/-/merge_requests/80"
+    )
+
+    assert resolved == ["discussion-1"]
+    mark_superseded.assert_not_called()
+    emit_action.assert_not_called()
