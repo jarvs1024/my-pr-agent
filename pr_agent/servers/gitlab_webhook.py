@@ -694,23 +694,56 @@ def _process_apply_commit_event(ev: dict, webhook_data: dict) -> None:
 
 
 def _changed_new_line_ranges(diff: str) -> list[tuple[int, int]]:
-    """Return inclusive ranges for added/replaced lines in a unified diff."""
+    """Return inclusive ranges for changed lines in a unified diff (new-file
+    numbering, 1-based).
+
+    Handles three cases:
+      * additions (``+``) and replacements (-/+) -> range covers the added
+        block in new-file coordinates (legacy behaviour).
+      * pure-deletion hunks (``-`` only, no ``+``) -> emit a fallback
+        range covering the deletion area so downstream commit-evidence
+        matching (e.g. :func:`on_apply_commit`) does not bail out with
+        "exact evidence unavailable" when the user clicked Apply on a
+        suggestion whose fix was to delete the offending lines. Without
+        this, an Apply commit that only removes lines leaves every
+        touched suggestion in state ``open`` even though the change is
+        on the branch.
+    """
     ranges: list[tuple[int, int]] = []
     new_line = None
     range_start = None
     deleted_before_addition = False
     deleted_lines_blank = False
+    # Track the new-file line position at the start of a pure-deletion
+    # block. We flush it at the next context line or hunk boundary as a
+    # fallback range, so hunks with no ``+`` lines still produce one.
+    pending_deletion_start: int | None = None
 
     def close_range() -> None:
         nonlocal range_start
         if range_start is not None and new_line is not None:
-            ranges.append((range_start, new_line if not deleted_before_addition else new_line - 1))
+            end = new_line if not deleted_before_addition else new_line - 1
+            if end >= range_start:
+                ranges.append((range_start, end))
             range_start = None
+
+    def flush_pending_deletion() -> None:
+        nonlocal pending_deletion_start
+        if pending_deletion_start is not None and new_line is not None:
+            # new_line is now positioned AT the first context line after
+            # the deletion block (or at the next hunk header). Emit a
+            # range whose end is that context line, covering the deleted
+            # area. Clamp to at least the start to avoid degenerate
+            # empty ranges when the deletion abuts a hunk boundary.
+            end = max(pending_deletion_start, new_line - 1)
+            ranges.append((pending_deletion_start, end))
+            pending_deletion_start = None
 
     for line in diff.splitlines():
         hunk = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
         if hunk:
             close_range()
+            flush_pending_deletion()
             new_line = int(hunk.group(1))
             deleted_before_addition = False
             deleted_lines_blank = False
@@ -718,6 +751,7 @@ def _changed_new_line_ranges(diff: str) -> list[tuple[int, int]]:
         if new_line is None:
             continue
         if line.startswith("+") and not line.startswith("+++"):
+            flush_pending_deletion()
             if range_start is None:
                 if deleted_before_addition and deleted_lines_blank:
                     range_start = max(1, new_line - 1)
@@ -730,12 +764,16 @@ def _changed_new_line_ranges(diff: str) -> list[tuple[int, int]]:
                 deleted_lines_blank = True
             deleted_lines_blank = deleted_lines_blank and not line[1:].strip()
             deleted_before_addition = True
+            if pending_deletion_start is None:
+                pending_deletion_start = new_line
         else:
             close_range()
+            flush_pending_deletion()
             deleted_before_addition = False
             deleted_lines_blank = False
             new_line += 1
     close_range()
+    flush_pending_deletion()
     return ranges
 
 

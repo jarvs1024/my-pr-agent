@@ -98,16 +98,88 @@ def find_applied_suggestion_candidates(
                 autojunk=False,
             ).get_opcodes()
             file_cache[file_path] = parent_lines, current_lines, opcodes
-        _, current_lines, opcodes = file_cache[file_path]
+        parent_lines, current_lines, opcodes = file_cache[file_path]
         patch_lines = _normalize_patch_lines(patch)
+        # Path 1: replacement match. The patch content exists in the
+        # post-commit file at a span that overlaps a changed range and is
+        # not byte-equal to the parent's corresponding region. Handles
+        # ``-``/``+`` hunks.
+        current_spans = _find_spans(current_lines, patch_lines)
         applied = any(
             any(_ranges_overlap(span, changed_range) for changed_range in changed_ranges)
             and not _span_is_unchanged(span, opcodes)
-            for span in _find_spans(current_lines, patch_lines)
+            for span in current_spans
         )
+        # Path 2: deletion match. The patch content was removed from the
+        # file in this commit (e.g. the suggestion was "delete this
+        # redundant update"). ``_find_spans`` over current_lines finds
+        # nothing because the patch is gone, so the replacement path
+        # alone misses pure-deletion Apply commits and leaves the
+        # suggestion in state ``open`` even though the user clicked
+        # Apply. Fall back to searching parent_lines: if the patch was
+        # there and the SequenceMatcher opcodes show the parent's patch
+        # region was deleted or shrunk, AND a changed_range covers the
+        # approximate current position of that region, treat as applied.
+        if not applied:
+            applied = any(
+                _patch_region_deleted(
+                    parent_span, opcodes, changed_ranges, parent_lines, current_lines
+                )
+                for parent_span in _find_spans(parent_lines, patch_lines)
+            )
         if applied:
             candidates.append(suggestion_id)
     return candidates
+
+
+def _patch_region_deleted(
+    parent_span: tuple[int, int],
+    opcodes: list[tuple[str, int, int, int, int]],
+    changed_ranges: list[tuple[int, int]],
+    parent_lines: list[str],
+    current_lines: list[str],
+) -> bool:
+    """Return True when the suggestion's patch was deleted (or shrunk) by
+    the commit whose opcodes we have, and a changed_range from the
+    commit covers the approximate current position.
+
+    ``parent_span`` is 1-based (start, end) inclusive of end, matching
+    :func:`_find_spans`. ``opcodes`` are 0-based SequenceMatcher
+    opcodes on ``parent_lines`` / ``current_lines``.
+    """
+    pi1_1based, pi2_1based = parent_span
+    # Convert to 0-based half-open [start, end).
+    p_start = pi1_1based - 1
+    p_end = pi2_1based  # _find_spans returns inclusive end; convert.
+    for tag, i1, i2, j1, j2 in opcodes:
+        if i2 <= p_start:
+            continue
+        if i1 >= p_end:
+            break
+        # Overlap test in 0-based half-open intervals.
+        if max(i1, p_start) >= min(i2, p_end):
+            continue
+        if tag == "delete":
+            # The patch was removed entirely; current position is j1
+            # (0-based) which corresponds to 1-based line (j1 + 1).
+            current_pos = j1 + 1
+            return any(
+                _ranges_overlap((current_pos, current_pos + 1), cr)
+                or _ranges_overlap((max(1, current_pos - 1), current_pos + 1), cr)
+                for cr in changed_ranges
+            )
+        if tag == "replace":
+            # Content shrunk (deletion happened as part of the replace).
+            parent_size = i2 - i1
+            current_size = j2 - j1
+            if current_size < parent_size:
+                current_pos = j1 + 1
+                return any(
+                    _ranges_overlap((current_pos, current_pos + 1), cr)
+                    for cr in changed_ranges
+                )
+            return False
+    return False
 
 
 def target_region_changed(
