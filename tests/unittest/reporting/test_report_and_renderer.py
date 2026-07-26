@@ -104,3 +104,53 @@ def test_wrap_helper_inserts_br_at_word_boundaries():
     assert _wrap("") == ""
     assert _wrap(None) == ""  # type: ignore[arg-type]
 # (appended via previous call)
+
+
+def test_render_telemetry_uses_single_three_col_table():
+    """The three sub-blocks must fold into ONE table so column widths line up
+    in DingTalk (multiple tables render with inconsistent widths)."""
+    from datetime import datetime, timezone
+    from pr_agent.reporting.collectors.base import SectionResult
+    from pr_agent.reporting.report import build_artifact
+    from pr_agent.reporting.renderer import render_markdown
+
+    start = datetime(2026, 7, 20, tzinfo=timezone.utc)
+    end = datetime(2026, 7, 26, 23, 59, 59, tzinfo=timezone.utc)
+    art = build_artifact(
+        project_id=42,
+        week_start=start,
+        week_end=end,
+        timezone="UTC",
+        sections={
+            "telemetry": SectionResult(
+                status="ok",
+                data={
+                    "mr_count": 38,
+                    "mr_total": 75,
+                    "suggestion_count": 886,
+                    "adoption_rate": 0.4458,
+                    "severity_breakdown": {"critical": 436, "high": 402},
+                    "top_rules": [
+                        ["SSD-RULE-DOCSTRING-REQUIRED", 112],
+                        ["SSD-RULE-FORBIDDEN-COMMENT", 1],
+                    ],
+                },
+            ),
+            "master_merges": SectionResult(status="ok", data={"target_branch": "main", "merge_count": 0, "author_count": 0, "additions": 0, "deletions": 0, "mr_list": []}),
+            "repo_scan": SectionResult(status="ok", markdown="### x\n- ok"),
+        },
+    )
+    body = render_markdown(art)
+
+    # Exactly one 3-col header row, no separate 2-col tables.
+    assert "| 类别 | 项 | 数值 |" in body
+    # Rendered values come from the corrected (cumulative) fields.
+    assert "| 75 |" in body, "项目累计 MR 数 should be 75 (all-time), not windowed"
+    assert "| 886 |" in body, "累计 suggestion should be all-time 886, not windowed"
+    assert "| 44.6% |" in body, "采纳率 should be all-time 44.6%, not 17.7%"
+    assert "| SSD-RULE-DOCSTRING-REQUIRED | 112 |" in body
+    assert "| critical | 436 |" in body
+    # No leftover headings from the old sub-block format.
+    assert "**本周指标**" not in body
+    assert "**severity 分布**" not in body
+    assert "**触发最多的规则**" not in body

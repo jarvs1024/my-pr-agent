@@ -114,13 +114,14 @@ def _render_section(name: str, section: SectionResult) -> str:
 
 
 def _render_telemetry(data: dict[str, Any]) -> str:
-    """Render the telemetry section as a table of tables.
+    """Render the telemetry section as ONE unified 3-column table.
 
-    Each sub-block is its own compact markdown table so DingTalk clients
-    keep the layout tidy; long strings inside a cell are broken at word
-    boundaries with ``<br>`` (DingTalk does not auto-wrap table cells).
-    Backticks are stripped from rule keys because inline code with long
-    bodies does not wrap.
+    DingTalk markdown renders each ``| table |`` block with column widths
+    driven by its own content; rendering several tables back to back makes
+    them visually uncoordinated. We collapse the three sub-blocks
+    (``本周指标`` / ``severity 分布`` / ``触发最多的规则``) into a single
+    3-column table ``| 类别 | 项 | 数值 |`` so every row sits in the same
+    column widths. Long rule keys get ``<br>`` at word boundaries.
     """
     mr_count = data.get("mr_count", 0)
     mr_total = data.get("mr_total", 0)
@@ -129,41 +130,32 @@ def _render_telemetry(data: dict[str, Any]) -> str:
     sev = data.get("severity_breakdown") or {}
     rules = data.get("top_rules") or []
 
-    out: list[str] = [
-        "**本周指标**",
-        "",
-        "| 指标 | 数值 |",
-        "|---|---|",
-        f"| 本周窗口 MR 数 | {mr_count} |",
-        f"| 项目累计 MR 数 | {mr_total} |",
-        f"| 累计 suggestion 数 | {suggestion_count} |",
-        f"| 采纳率 | {adoption_pct}% |",
-        "",
-        "**severity 分布**",
-        "",
+    rows: list[tuple[str, str, str]] = [
+        ("本周指标", "本周窗口 MR 数", str(mr_count)),
+        ("本周指标", "项目累计 MR 数", str(mr_total)),
+        ("本周指标", "累计 suggestion 数", str(suggestion_count)),
+        ("本周指标", "采纳率", f"{adoption_pct}%"),
     ]
+
     if sev:
-        out.append("| severity | count |")
-        out.append("|---|---|")
         for k, v in sev.items():
-            out.append(f"| {k} | {v} |")
+            rows.append(("severity", k, str(v)))
     else:
-        out.append("_(无)_")
+        rows.append(("severity", "—", "(无)"))
 
-    out.append("")
-    out.append("**触发最多的规则**")
-    out.append("")
     if rules:
-        out.append("| 规则 | 触发次数 |")
-        out.append("|---|---|")
         for rk, n in rules[:5]:
-            # Strip backticks: long inline-code strings do not wrap in
-            # DingTalk. _wrap() inserts <br> for rule names > width.
-            out.append(f"| {_wrap(rk, width=24)} | {n} |")
+            rows.append(("触发最多规则", _wrap(rk, width=24), str(n)))
     else:
-        out.append("_(无)_")
+        rows.append(("触发最多规则", "—", "(无)"))
 
-    return "\n".join(out)
+    lines: list[str] = [
+        "| 类别 | 项 | 数值 |",
+        "|---|---|---|",
+    ]
+    for cat, item, value in rows:
+        lines.append(f"| {cat} | {item} | {value} |")
+    return "\n".join(lines)
 
 
 def _render_master_merges(data: dict[str, Any]) -> str:

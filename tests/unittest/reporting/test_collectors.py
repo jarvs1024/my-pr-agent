@@ -52,3 +52,85 @@ def test_master_merges_handles_api_failure(monkeypatch):
     )
     assert result.status == "failed"
     assert "boom" in (result.error or "")
+
+
+def test_telemetry_overview_reads_total_field_and_separates_windowed_from_alltime(monkeypatch):
+    """Regression: earlier versions read per_rule_stats().count (which never
+    existed) so all top_rules silently rendered as 0. They also pulled
+    mr_total / suggestion_count from the windowed overview, so they always
+    equalled the weekly counter. This test pins the corrected behavior."""
+    from datetime import datetime, timezone
+    from pr_agent.reporting.collectors.telemetry_overview import TelemetryOverviewCollector
+
+    # All-time overview (no since) gives the "项目累计" values.
+    all_overview = {
+        "mrs": {"total": 75, "merged": 6, "open": 44},
+        "suggestions": {"total": 886, "applied": 395, "dismissed": 63, "open": 406, "adoption_rate": 0.4458},
+    }
+    # Windowed overview (with since) had been misused for cumulative fields.
+    windowed_overview = {
+        "mrs": {"total": 38, "merged": 2, "open": 28},
+        "suggestions": {"total": 491, "applied": 87, "dismissed": 26, "open": 360, "adoption_rate": 0.1772},
+    }
+
+    class _FakeStore:
+        def __init__(self):
+            self.calls = {"overview_since": 0, "overview_alltime": 0}
+
+        def overview(self, since=None):
+            if since:
+                self.calls["overview_since"] += 1
+                return windowed_overview
+            self.calls["overview_alltime"] += 1
+            return all_overview
+
+        def per_author_stats(self, since=None):
+            return [{"author": "review-bot", "mr_count": 38}]
+
+        def per_rule_stats(self, since=None):
+            return [
+                {"rule_key": "SSD-RULE-DOCSTRING-REQUIRED", "total": 112, "applied": 27},
+                {"rule_key": "SSD-RULE-NO-BARE-PRINT", "total": 99, "applied": 17},
+            ]
+
+        def severity_breakdown(self, since=None):
+            return [
+                {"severity": "critical", "total": 269},
+                {"severity": "high", "total": 183},
+            ]
+
+        def list_mrs(self, limit=2000, project_id=None, state=None, since=None):
+            # 38 MRs seen "this week" within the window, all at the same ts.
+            from datetime import datetime, timezone
+            ts = datetime(2026, 7, 26, 10, 0, tzinfo=timezone.utc).isoformat()
+            return [{"mr_id": i, "last_seen_at": ts} for i in range(38)]
+
+    fake = _FakeStore()
+    monkeypatch.setattr(
+        "pr_agent.reporting.collectors.telemetry_overview.get_default_store",
+        lambda: fake,
+    )
+
+    c = TelemetryOverviewCollector()
+    result = c.collect(
+        week_start=datetime(2026, 7, 20, tzinfo=timezone.utc),
+        week_end=datetime(2026, 7, 26, 23, 59, 59, tzinfo=timezone.utc),
+        ctx=_ctx(),
+    )
+    assert result.status == "ok", result.error
+    data = result.data
+
+    # Windowed counters stay windowed.
+    assert data["mr_count"] == 38
+    # Cumulative fields now read the all-time overview.
+    assert data["mr_total"] == 75, f"expected all-time 75, got {data['mr_total']}"
+    assert data["suggestion_count"] == 886
+    assert abs(data["adoption_rate"] - 0.4458) < 1e-3
+    # top_rules now uses the real 'total' field, not the non-existent 'count'.
+    assert data["top_rules"][0] == ["SSD-RULE-DOCSTRING-REQUIRED", 112]
+    assert data["top_rules"][1] == ["SSD-RULE-NO-BARE-PRINT", 99]
+    # Windowed values for severity / top_rules still come through correctly.
+    assert data["severity_breakdown"]["critical"] == 269
+    # Both overview() variants were queried.
+    assert fake.calls["overview_since"] >= 1
+    assert fake.calls["overview_alltime"] >= 1

@@ -52,10 +52,16 @@ class TelemetryOverviewCollector:
         since = week_start.isoformat()
         until = week_end.isoformat()
 
+        # Windowed aggregates — used for "this week" metrics.
         overview: dict[str, Any] = store.overview(since=since)
         per_author: list[dict[str, Any]] = store.per_author_stats(since=since)
         per_rule: list[dict[str, Any]] = store.per_rule_stats(since=since)
         severity_rows: list[dict[str, Any]] = store.severity_breakdown(since=since)
+        # All-time aggregates — used for "项目累计" / "累计" labels
+        # so they differ from the windowed counters in a weekly report.
+        all_overview: dict[str, Any] = store.overview()
+        all_mrs_block: dict[str, Any] = all_overview.get("mrs", {}) or {}
+        all_sugs_block: dict[str, Any] = all_overview.get("suggestions", {}) or {}
 
         # Count MRs whose last_seen_at falls inside the reporting window.
         mr_list = store.list_mrs(limit=2000, since=since)
@@ -76,18 +82,22 @@ class TelemetryOverviewCollector:
             cnt = int(row.get("total", 0) or 0)
             severity_breakdown[sev] = severity_breakdown.get(sev, 0) + cnt
 
+        # per_rule_stats() returns rows with ``rule_key`` + ``total`` (NOT
+        # ``count``). Earlier versions read the non-existent "count" key,
+        # which silently produced zeros for every rule.
         top_rules = [
-            [str(r.get("rule_key", "unknown")), int(r.get("count", 0) or 0)]
+            [str(r.get("rule_key", "unknown")), int(r.get("total", 0) or 0)]
             for r in per_rule[:5]
             if r.get("rule_key")
         ]
 
-        adoption_rate = float(sugs_block.get("adoption_rate", 0.0) or 0.0)
+        # All-time cumulative metrics — labels say 项目累计 / 累计.
+        adoption_rate = float(all_sugs_block.get("adoption_rate", 0.0) or 0.0)
 
         data: dict[str, Any] = {
             "mr_count": mr_count_window,
-            "mr_total": int(mrs_block.get("total", 0) or 0),
-            "suggestion_count": int(sugs_block.get("total", 0) or 0),
+            "mr_total": int(all_mrs_block.get("total", 0) or 0),
+            "suggestion_count": int(all_sugs_block.get("total", 0) or 0),
             "adoption_rate": round(adoption_rate, 4),
             "severity_breakdown": severity_breakdown,
             "top_rules": top_rules,
@@ -102,7 +112,7 @@ class TelemetryOverviewCollector:
         }
 
         _log.info(
-            "telemetry_overview: mr_window=%s mr_total=%s suggestions=%s adoption_rate=%.3f",
+            "telemetry_overview: mr_window=%s mr_total_alltime=%s suggestions_alltime=%s adoption_rate_alltime=%.3f",
             mr_count_window,
             data["mr_total"],
             data["suggestion_count"],
