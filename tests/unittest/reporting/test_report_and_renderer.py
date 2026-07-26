@@ -242,3 +242,31 @@ def test_render_master_merges_falls_back_when_no_llm():
     body = render_markdown(art)
     assert "### 变更摘要" not in body
     assert "| MR | 标题 | 作者 | 合并时间 |" in body
+
+
+def test_render_header_drops_timezone_and_wraps_range():
+    """The header should drop `(Asia/Shanghai)` and force 数据范围 onto
+    its own line via <br> so it doesn't trail into the 生成时间 line."""
+    from datetime import datetime, timezone
+    from pr_agent.reporting.collectors.base import SectionResult
+    from pr_agent.reporting.report import build_artifact
+    from pr_agent.reporting.renderer import render_markdown
+
+    start = datetime(2026, 7, 20, tzinfo=timezone.utc)
+    end = datetime(2026, 7, 26, 23, 59, 59, tzinfo=timezone.utc)
+    art = build_artifact(
+        project_id=42,
+        week_start=start,
+        week_end=end,
+        timezone="Asia/Shanghai",
+        sections={
+            "telemetry": SectionResult(status="ok", data={"mr_count": 1, "mr_total": 1, "suggestion_count": 0, "adoption_rate": 0, "severity_breakdown": {}, "top_rules": []}),
+            "master_merges": SectionResult(status="ok", data={"target_branch": "main", "merge_count": 0, "author_count": 0, "additions": 0, "deletions": 0, "mr_list": []}),
+            "repo_scan": SectionResult(status="ok", markdown="### x"),
+        },
+    )
+    body = render_markdown(art)
+    assert "(Asia/Shanghai)" not in body, "timezone tag should not appear in the header"
+    # The 范围 part must be preceded by a <br> so it lands on its own line.
+    assert "<br>> 数据范围:" in body or "<br>\n> 数据范围:" in body
+    assert "> 生成时间:" in body

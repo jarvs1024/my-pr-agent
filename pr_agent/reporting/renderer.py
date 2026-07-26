@@ -78,8 +78,12 @@ def render_markdown(artifact: WeeklyArtifact, *, project_name: str | None = None
     parts.append(
         title
         + "\n"
-        + f"> 生成: {_short(artifact.generated_at.isoformat() if artifact.generated_at else '')} ({artifact.timezone})\n"
-        + f"> 范围: {_short(artifact.week_start.isoformat())} ~ {_short(artifact.week_end.isoformat())}\n"
+        # Drop the timezone tag from the header (no longer useful in the
+        # DingTalk panel — the artifact JSON still carries it). Use a
+        # <br> inside the blockquote so the 范围 part always lands on its
+        # own line regardless of how DingTalk wraps the preceding text.
+        + f"> 生成时间: {_short(artifact.generated_at.isoformat() if artifact.generated_at else '')}"
+        + f"<br>> 数据范围: {_short(artifact.week_start.isoformat())} ~ {_short(artifact.week_end.isoformat())}\n"
     )
 
     failures: list[str] = []
