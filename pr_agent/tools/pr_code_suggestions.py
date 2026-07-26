@@ -101,7 +101,7 @@ class PRCodeSuggestions:
             self.git_provider.get_languages(), self.git_provider.get_files()
         )
 
-        num_code_suggestions = int(get_settings().pr_code_suggestions.num_code_suggestions_per_chunk)
+        num_code_suggestions = PRCodeSuggestions._get_suggestion_limit()
 
         self.ai_handler = ai_handler()
         self.ai_handler.main_pr_language = self.main_language
