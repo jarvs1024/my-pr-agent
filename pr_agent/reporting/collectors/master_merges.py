@@ -25,6 +25,36 @@ from .base import CollectorContext, SectionResult
 
 _log = get_logger()
 
+import textwrap
+
+from pr_agent.reporting.collectors.repo_scan import _call_llm  # shared litellm wrapper
+
+_log = get_logger()
+
+
+DESCRIBE_PROMPT_TEMPLATE = textwrap.dedent("""\
+你是一名代码审查经理。下面是本周 ({since} ~ {until}) 合并到目标分支 `{target_branch}` 的 MR 列表。
+请你基于每个 MR 的标题、描述(detail)和源分支名,撰写一段**项目层** Description 摘要。
+
+要求 (markdown 格式, 中文):
+- 一段概述 (1-3 句): 本周变更主题、涉及的主要模块、整体方向。
+- 分类要点 (bullet),按需给出,空类别省略:
+  - 新增: 新文件 / 新模块 / 新接口
+  - 修改: 既有功能调整
+  - 删除: 移除的文件 / 代码 / 逻辑
+  - 测试: 测试相关变更
+  - 重构: 结构 / 命名调整
+  - 文档: 文档 / 标记文件
+- 每条 bullet 含文件路径或符号,不超过 60 字。
+- 不要原样复制单个 MR 标题;语义相近的条目合并一条。
+
+若列表为空,只输出 `本周无 MR 合并`。若只有 1 条 MR,简要复述即可。
+
+输入 MR 列表:
+{mr_block}
+
+直接输出 markdown,不要加开场白。
+""")
 
 def _gitlab_client(url: str | None = None, token: str | None = None) -> gitlab.Gitlab:
     base = url or os.environ.get("GITLAB_URL", "https://gitlab.com")
@@ -103,10 +133,13 @@ class MasterMergesCollector:
                 continue
             author = mr.author.get("username", "") if mr.author else ""
             author_set.add(author)
+            per_add = per_del = 0
             try:
                 changes = mr.changes()  # noqa: SLF001 — python-gitlab detail API
-                additions += int(getattr(changes, "additions", 0) or 0)
-                deletions += int(getattr(changes, "deletions", 0) or 0)
+                per_add = int(getattr(changes, "additions", 0) or 0)
+                per_del = int(getattr(changes, "deletions", 0) or 0)
+                additions += per_add
+                deletions += per_del
             except Exception:
                 pass
             mr_list.append(
@@ -118,7 +151,9 @@ class MasterMergesCollector:
                     "url": mr.web_url,
                     "source_branch": mr.source_branch,
                     "target_branch": mr.target_branch,
-                    "summary": "",
+                    "description": (mr.description or "").strip(),
+                    "additions": per_add,
+                    "deletions": per_del,
                 }
             )
 
@@ -133,13 +168,45 @@ class MasterMergesCollector:
             "window": {"since": week_start.isoformat(), "until": week_end.isoformat()},
         }
 
+        # Optional LLM Description block. Builds a per-MR markdown block
+        # (title + description body + branch + author) and asks the LLM to
+        # synthesize a project-level summary in PR-/describe style.
+        llm_md = ""
+        if mr_list:
+            ctx_model = getattr(ctx, "llm_model", "") or ""
+            ctx_dry = bool(getattr(ctx, "llm_dry_run", True))
+            if ctx_model:
+                try:
+                    mr_block_lines = []
+                    for mr_item in mr_list:
+                        body = (mr_item.get("description") or "").strip()
+                        body = body if len(body) <= 800 else (body[:800] + "\n... (truncated)")
+                        mr_block_lines.append(
+                            f"### !{mr_item['iid']} {mr_item['author']} merged {mr_item['merged_at'][:10]}\n"
+                            f"- title: {mr_item['title']}\n"
+                            f"- source_branch: {mr_item['source_branch']}\n"
+                            f"- description:\n{body or '(空)'}"
+                        )
+                    prompt = DESCRIBE_PROMPT_TEMPLATE.format(
+                        since=week_start_iso[:10],
+                        until=week_end.isoformat()[:10],
+                        target_branch=target_branch,
+                        mr_block="\n\n".join(mr_block_lines),
+                    )
+                    llm_md = _call_llm(prompt, ctx_model, ctx_dry)
+                except Exception as exc:  # noqa: BLE001
+                    _log.warning("master_merges LLM description failed: %s", exc)
+                    llm_md = ""
+        data["llm_description_markdown"] = llm_md.strip() if llm_md else ""
+
         _log.info(
-            "master_merges: target=%s mr_count=%s authors=%s +%s/-%s",
+            "master_merges: target=%s mr_count=%s authors=%s +%s/-%s llm_desc=%d_chars",
             target_branch,
             data["merge_count"],
             data["author_count"],
             additions,
             deletions,
+            len(data["llm_description_markdown"]),
         )
 
         return SectionResult(status="ok", data=data, meta={"project_default_branch": project.default_branch})

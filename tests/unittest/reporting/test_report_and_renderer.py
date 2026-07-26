@@ -154,3 +154,91 @@ def test_render_telemetry_uses_single_three_col_table():
     assert "SSD-RULE-DOCSTRING-REQUIRED ×112<br>SSD-RULE-FORBIDDEN-COMMENT ×1 |" in body
     # The 触发最多规则 value cell is one row, not 5 separate rows.
     assert body.count("SSD-RULE-DOCSTRING-REQUIRED") == 1
+
+
+def test_render_master_merges_includes_llm_description_above_table():
+    """When the collector set ``llm_description_markdown``, the renderer
+    must put it above the MR table under a ``### Description`` heading."""
+    from datetime import datetime, timezone
+    from pr_agent.reporting.collectors.base import SectionResult
+    from pr_agent.reporting.report import build_artifact
+    from pr_agent.reporting.renderer import render_markdown
+
+    start = datetime(2026, 7, 20, tzinfo=timezone.utc)
+    end = datetime(2026, 7, 26, 23, 59, 59, tzinfo=timezone.utc)
+    art = build_artifact(
+        project_id=42,
+        week_start=start,
+        week_end=end,
+        timezone="UTC",
+        sections={
+            "telemetry": SectionResult(status="ok", data={"mr_count": 1, "mr_total": 1, "suggestion_count": 0, "adoption_rate": 0, "severity_breakdown": {}, "top_rules": []}),
+            "master_merges": SectionResult(
+                status="ok",
+                data={
+                    "target_branch": "main",
+                    "merge_count": 2,
+                    "author_count": 1,
+                    "additions": 12,
+                    "deletions": 4,
+                    "mr_list": [
+                        {"iid": 116, "title": "B: verify — class + nested function", "author": "review-bot", "merged_at": "2026-07-26T07:12:51Z", "url": "http://x/!116", "source_branch": "codex/B", "target_branch": "main"},
+                        {"iid": 115, "title": "A: verify mirror", "author": "review-bot", "merged_at": "2026-07-26T07:12:49Z", "url": "http://x/!115", "source_branch": "codex/A", "target_branch": "main"},
+                    ],
+                    "llm_description_markdown": "**概述**: 本周 2 个 MR 集中在 marker fix 回归验证。\n\n- 新增 `services/manual_observe_class_nested.py` 验证夹具\n- 新增 `services/manual_observe_v48_natural.py` 镜像回归用例",
+                },
+            ),
+            "repo_scan": SectionResult(status="ok", markdown="### x\n- y"),
+        },
+    )
+    body = render_markdown(art)
+    desc_idx = body.index("### Description")
+    table_idx = body.index("| MR | 标题 | 作者 | 合并时间 |")
+    mrlist_idx = body.index("#### 涉及 MR 列表")
+    # Description block precedes both the table heading and the MR list sub-section.
+    assert desc_idx < mrlist_idx < table_idx
+    # LLM output preserved verbatim.
+    assert "marker fix 回归验证" in body
+    assert "新增 `services/manual_observe_class_nested.py` 验证夹具" in body
+    # Existing headline stats still appear.
+    assert "**2** 个" in body
+    assert "12** 行" in body
+
+
+def test_render_master_merges_falls_back_when_no_llm():
+    """When ``llm_description_markdown`` is missing/empty, the headline + table
+    are emitted without the Description section."""
+    from datetime import datetime, timezone
+    from pr_agent.reporting.collectors.base import SectionResult
+    from pr_agent.reporting.report import build_artifact
+    from pr_agent.reporting.renderer import render_markdown
+
+    start = datetime(2026, 7, 20, tzinfo=timezone.utc)
+    end = datetime(2026, 7, 26, 23, 59, 59, tzinfo=timezone.utc)
+    art = build_artifact(
+        project_id=42,
+        week_start=start,
+        week_end=end,
+        timezone="UTC",
+        sections={
+            "telemetry": SectionResult(status="ok", data={"mr_count": 0, "mr_total": 0, "suggestion_count": 0, "adoption_rate": 0, "severity_breakdown": {}, "top_rules": []}),
+            "master_merges": SectionResult(
+                status="ok",
+                data={
+                    "target_branch": "main",
+                    "merge_count": 1,
+                    "author_count": 1,
+                    "additions": 0,
+                    "deletions": 0,
+                    "mr_list": [
+                        {"iid": 10, "title": "fix: foo", "author": "alice", "merged_at": "2026-07-25T00:00:00Z", "url": "http://x/!10", "source_branch": "x", "target_branch": "main"},
+                    ],
+                    "llm_description_markdown": "",
+                },
+            ),
+            "repo_scan": SectionResult(status="ok", markdown="### x"),
+        },
+    )
+    body = render_markdown(art)
+    assert "### Description" not in body
+    assert "| MR | 标题 | 作者 | 合并时间 |" in body

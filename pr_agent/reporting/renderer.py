@@ -162,11 +162,8 @@ def _render_master_merges(data: dict[str, Any]) -> str:
         )
 
     mr_list = data.get("mr_list") or []
-    head = (
-        f"本周合并到 `{data.get('target_branch', '?')}` 的 MR 共 **{merge_count}** 个, "
-        f"涉及作者 **{data.get('author_count', 0)}** 位, "
-        f"新增代码 **{data.get('additions', 0)}** 行, "
-        f"删除 **{data.get('deletions', 0)}** 行。\n\n"
+    summary = data.get("llm_description_markdown") or ""
+    table = (
         "| MR | 标题 | 作者 | 合并时间 |\n"
         "|---|---|---|---|"
     )
@@ -183,7 +180,31 @@ def _render_master_merges(data: dict[str, Any]) -> str:
         # horizontally truncating it. The full title is preserved in the
         # JSON artifact for TestMate.
         rows.append(f"| {cell} | {_wrap(title, width=22)} | {author} | {merged_at} |")
-    return head + "\n" + "\n".join(rows)
+    table_md = table + "\n" + "\n".join(rows)
+
+    if summary:
+        # LLM-generated project-level Description block first, then MR list.
+        head_line = (
+            f"本周合并到 `{data.get('target_branch', '?')}` 的 MR 共 **{merge_count}** 个, "
+            f"涉及作者 **{data.get('author_count', 0)}** 位, "
+            f"新增代码 **{data.get('additions', 0)}** 行, "
+            f"删除 **{data.get('deletions', 0)}** 行。"
+        )
+        return (
+            head_line
+            + "\n\n### Description\n\n"
+            + summary.strip()
+            + "\n\n#### 涉及 MR 列表\n\n"
+            + table_md
+        )
+    # Fall back: LLM was disabled or failed — just the headline + table.
+    head_line = (
+        f"本周合并到 `{data.get('target_branch', '?')}` 的 MR 共 **{merge_count}** 个, "
+        f"涉及作者 **{data.get('author_count', 0)}** 位, "
+        f"新增代码 **{data.get('additions', 0)}** 行, "
+        f"删除 **{data.get('deletions', 0)}** 行。"
+    )
+    return head_line + "\n\n" + table_md
 
 
 def split_markdown(body: str, chunk_limit: int = 18000) -> list[str]:

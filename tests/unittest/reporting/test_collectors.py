@@ -134,3 +134,54 @@ def test_telemetry_overview_reads_total_field_and_separates_windowed_from_alltim
     # Both overview() variants were queried.
     assert fake.calls["overview_since"] >= 1
     assert fake.calls["overview_alltime"] >= 1
+
+
+def test_master_merges_records_llm_description_markdown_when_dry_run(monkeypatch):
+    """The collector should populate ``llm_description_markdown`` even when
+    ``llm_dry_run`` is True (mock LLM returns a deterministic stub) so the
+    renderer can be exercised end-to-end without a real API call."""
+    from datetime import datetime, timezone
+    from pr_agent.reporting.collectors.master_merges import MasterMergesCollector
+    from unittest.mock import MagicMock
+
+    # Fake GitLab: one merged MR with a small description body.
+    fake_mr = MagicMock()
+    fake_mr.iid = 7
+    fake_mr.title = "feat: add ComplianceOrchestrator fixture"
+    fake_mr.description = "### Description\n- 新增 fixture 覆盖 class + nested function"
+    fake_mr.author = {"username": "review-bot"}
+    fake_mr.merged_at = "2026-07-26T07:12:51Z"
+    fake_mr.web_url = "http://127.0.0.1:8929/root/auto-review-test/-/merge_requests/7"
+    fake_mr.source_branch = "codex/fixture-class-nested"
+    fake_mr.target_branch = "main"
+    fake_changes = MagicMock()
+    fake_changes.additions = 30
+    fake_changes.deletions = 5
+    fake_mr.changes.return_value = fake_changes
+
+    fake_project = MagicMock()
+    fake_project.default_branch = "main"
+    fake_project.mergerequests.list.return_value = [fake_mr]
+
+    fake_gl = MagicMock()
+    fake_gl.projects.get.return_value = fake_project
+    monkeypatch.setattr(
+        "pr_agent.reporting.collectors.master_merges._gitlab_client",
+        lambda url=None, token=None: fake_gl,
+    )
+
+    ctx = _ctx(llm_model="gpt-test", llm_dry_run=True)
+    result = MasterMergesCollector().collect(
+        week_start=datetime(2026, 7, 20, tzinfo=timezone.utc),
+        week_end=datetime(2026, 7, 26, 23, 59, 59, tzinfo=timezone.utc),
+        ctx=ctx,
+    )
+    assert result.status == "ok", result.error
+    data = result.data
+    # Per-MR description + stats propagated.
+    assert data["mr_list"][0]["description"].startswith("### Description")
+    assert data["mr_list"][0]["additions"] == 30
+    assert data["mr_list"][0]["deletions"] == 5
+    # LLM path was exercised (dry-run returns a deterministic stub).
+    assert isinstance(data["llm_description_markdown"], str)
+    assert data["llm_description_markdown"], "dry-run stub should be non-empty"
