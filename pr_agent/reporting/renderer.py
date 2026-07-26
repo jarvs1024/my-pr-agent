@@ -32,11 +32,15 @@ def render_markdown(artifact: WeeklyArtifact, *, project_name: str | None = None
         title += f" — {project_name}"
     title += f" — {artifact.week_label}\n"
 
+    # Trim the date strings inside blockquotes so they wrap cleanly.
+    def _short(iso: str) -> str:
+        return iso[:16].replace("T", " ") if iso else ""
+
     parts.append(
         title
         + "\n"
-        + f"> 生成时间: {artifact.generated_at.isoformat() if artifact.generated_at else ''} ({artifact.timezone})\n"
-        + f"> 数据范围: {artifact.week_start.isoformat()} ~ {artifact.week_end.isoformat()}\n"
+        + f"> 生成: {_short(artifact.generated_at.isoformat() if artifact.generated_at else '')} ({artifact.timezone})\n"
+        + f"> 范围: {_short(artifact.week_start.isoformat())} ~ {_short(artifact.week_end.isoformat())}\n"
     )
 
     failures: list[str] = []
@@ -74,20 +78,48 @@ def _render_section(name: str, section: SectionResult) -> str:
 
 
 def _render_telemetry(data: dict[str, Any]) -> str:
-    lines: list[str] = []
-    sev = data.get("severity_breakdown") or {}
-    sev_str = " / ".join(f"{k}={v}" for k, v in sev.items()) if sev else "无"
-    rules = data.get("top_rules") or []
-    rules_str = ", ".join(f"`{rk}` ×{n}" for rk, n in rules[:3]) if rules else "无"
+    """Compact, narrow-column friendly rendering for DingTalk markdown.
 
-    lines.append("| 指标 | 数值 |")
-    lines.append("|---|---|")
-    lines.append(f"| 本周窗口 MR 数 | {data.get('mr_count', 0)} |")
-    lines.append(f"| 项目累计 MR 数 | {data.get('mr_total', 0)} |")
-    lines.append(f"| 累计 suggestion 数 | {data.get('suggestion_count', 0)} |")
-    lines.append(f"| 采纳率 | {round(float(data.get('adoption_rate', 0)) * 100, 1)}% |")
-    lines.append(f"| severity 分布 | {sev_str} |")
-    lines.append(f"| 触发最多的规则 | {rules_str} |")
+    DingTalk markdown panels truncate wide cells. We:
+    * put each metric on its own line (no wide tables with inline code)
+    * render severity / rules as vertical sub-lists (no /-separators)
+    * strip backticks so long rule keys wrap
+    """
+    mr_count = data.get("mr_count", 0)
+    mr_total = data.get("mr_total", 0)
+    suggestion_count = data.get("suggestion_count", 0)
+    adoption_pct = round(float(data.get("adoption_rate", 0)) * 100, 1)
+
+    sev = data.get("severity_breakdown") or {}
+    rules = data.get("top_rules") or []
+
+    lines: list[str] = [
+        f"- 本周窗口 MR 数: **{mr_count}**",
+        f"- 项目累计 MR 数: **{mr_total}**",
+        f"- 累计 suggestion 数: **{suggestion_count}**",
+        f"- 采纳率: **{adoption_pct}%**",
+        "",
+        "**severity 分布**",
+    ]
+    if sev:
+        # Two-column sub-table (severity / count) — fits even narrow panels.
+        lines.append("")
+        lines.append("| severity | count |")
+        lines.append("|---|---|")
+        for k, v in sev.items():
+            lines.append(f"| {k} | {v} |")
+    else:
+        lines.append("- (无)")
+
+    lines.append("")
+    lines.append("**触发最多的规则**")
+    if rules:
+        for rk, n in rules[:5]:
+            # No backticks — they break wrapping in DingTalk
+            lines.append(f"- {rk} ×{n}")
+    else:
+        lines.append("- (无)")
+
     return "\n".join(lines)
 
 
@@ -115,7 +147,12 @@ def _render_master_merges(data: dict[str, Any]) -> str:
         merged_at = (mr.get("merged_at") or "")[:16].replace("T", " ")
         url = mr.get("url") or ""
         cell = f"[!{iid}]({url})" if url else f"!{iid}"
-        rows.append(f"| {cell} | {title[:60]} | {author} | {merged_at} |")
+        # DingTalk truncates wide cells; trim title to fit. The full
+        # title is preserved in the JSON artifact for TestMate.
+        title_short = (title or "").replace("|", "\\|").replace("\n", " ")
+        if len(title_short) > 32:
+            title_short = title_short[:31] + "…"
+        rows.append(f"| {cell} | {title_short} | {author} | {merged_at} |")
     return head + "\n" + "\n".join(rows)
 
 
