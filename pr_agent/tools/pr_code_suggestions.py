@@ -275,7 +275,7 @@ class PRCodeSuggestions:
 
                     # dual publishing mode
                     if int(get_settings().pr_code_suggestions.dual_publishing_score_threshold) > 0:
-                        await self.dual_publishing(data)
+                        await self.dual_publishing(data, _run_status)
                 else:
                     await self.push_inline_code_suggestions(data)
                     if self.progress_response:
@@ -460,7 +460,7 @@ class PRCodeSuggestions:
         else:
             get_settings().data = {"artifact": ""}
 
-    async def dual_publishing(self, data):
+    async def dual_publishing(self, data, _run_status):
         data_above_threshold = {'code_suggestions': []}
         try:
             for suggestion in data['code_suggestions']:
@@ -1075,9 +1075,9 @@ class PRCodeSuggestions:
                     new_code_snippet = self.dedent_code(relevant_file, relevant_lines_start, new_code_snippet)
 
                 if d.get('score'):
-                    body = f"""**Suggestion:** {content} [{label}, importance: {d.get('score')}]\n```suggestion\n{new_code_snippet}\n```\n\n✅ 接受建议\n   • 直接用：点上方「应用建议」按钮\n   • 自己改：请先提交修改，再回复 /adopt [理由]\n\n❌ 关闭建议\n   • 回复 `/dismiss` [理由]\n\n理由会被记录，用于改进后续建议。"""
+                    body = f"""**Suggestion:** {content} [{label}, importance: {d.get('score')}]\n```suggestion\n{new_code_snippet}\n```\n\n✅ 接受建议\n   • 直接用：点上方「应用建议」按钮\n   • 自己改：请先提交修改，再回复 ` /adopt [理由] `\n\n❌ 关闭建议\n   • 回复 ` /dismiss [理由] `\n\n理由会被记录，用于改进后续建议。"""
                 else:
-                    body = f"""**Suggestion:** {content} [{label}]\n```suggestion\n{new_code_snippet}\n```\n\n✅ 接受建议\n   • 直接用：点上方「应用建议」按钮\n   • 自己改：请先提交修改，再回复 /adopt [理由]\n\n❌ 关闭建议\n   • 回复 `/dismiss` [理由]\n\n理由会被记录，用于改进后续建议。"""
+                    body = f"""**Suggestion:** {content} [{label}]\n```suggestion\n{new_code_snippet}\n```\n\n✅ 接受建议\n   • 直接用：点上方「应用建议」按钮\n   • 自己改：请先提交修改，再回复 ` /adopt [理由] `\n\n❌ 关闭建议\n   • 回复 ` /dismiss [理由] `\n\n理由会被记录，用于改进后续建议。"""
                 # Compute a content fingerprint so subsequent /improve rounds
                 # can suppress suggestions that re-emit the same patch via
                 # ``_suppress_resolved_suggestions``'s fingerprint dedup.
