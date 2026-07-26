@@ -715,33 +715,9 @@ class GitLabProvider(GitProvider):
                         if file.filename == relevant_file:
                             target_file = file
                             break
-                # GitLab's `:-N+M` marker encodes the diff size: ``-N`` lines
-                # of the ORIGINAL block removed starting at the comment anchor,
-                # ``+M`` lines of the NEW block inserted. Trust the LLM's
-                # ``existing_code``/``improved_code`` instead of the inclusive
-                # ``relevant_lines_end - relevant_lines_start + 1`` — that span
-                # is the LLM's *claim* of the source lines that belong to its
-                # suggestion and routinely over-shoots the inner function. The
-                # classic failure is anchoring at line 53 of an inner ``def``
-                # while ``relevant_lines_end`` lands on the outer function's
-                # body line 55 (``return nested()``) — the ``+3`` then wipes
-                # the caller. Deriving ``N``/``M`` from the actual code the
-                # LLM emitted keeps the marker honest.
-                _suggestion_re = re.compile(r'```suggestion[^\n]*\n(.*?)\n```', re.DOTALL)
-                _m = _suggestion_re.search(body)
-                if _m:
-                    _suggestion_body = _m.group(1)
-                    _body_lines = [ln for ln in _suggestion_body.splitlines() if ln.strip() != ""]
-                    _added = max(1, len(_body_lines))
-                else:
-                    _added = max(1, relevant_lines_end - relevant_lines_start + 1)
-                _orig_snip = (suggestion.get("original_suggestion") or {}).get("existing_code") or ""
-                if _orig_snip.strip():
-                    _orig_lines = [ln for ln in _orig_snip.rstrip().splitlines() if ln.strip() != ""]
-                    _removed = max(1, len(_orig_lines))
-                else:
-                    _removed = max(1, relevant_lines_end - relevant_lines_start + 1)
-                body = body.replace('```suggestion', f'```suggestion:-{_removed}+{_added}')
+                # GitLab's suggestion line count is inclusive: 30-34 replaces 5 lines.
+                range = relevant_lines_end - relevant_lines_start + 1
+                body = body.replace('```suggestion', f'```suggestion:-0+{range}')
                 lines = target_file.head_file.splitlines()
                 relevant_line_in_file = lines[relevant_lines_start - 1]
 
