@@ -185,3 +185,85 @@ def test_master_merges_records_llm_description_markdown_when_dry_run(monkeypatch
     # LLM path was exercised (dry-run returns a deterministic stub).
     assert isinstance(data["llm_description_markdown"], str)
     assert data["llm_description_markdown"], "dry-run stub should be non-empty"
+
+
+def test_diff_line_counts_excludes_header_markers():
+    """_diff_line_counts should skip '+++'/'---' file header lines and the
+    hunk header, but count every other +/- content line."""
+    from pr_agent.reporting.collectors.master_merges import _diff_line_counts
+    diff = (
+        "diff --git a/foo.py b/foo.py\n"
+        "--- a/foo.py\n"
+        "+++ b/foo.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        " keep_unchanged\n"
+        "-removed\n"
+        "+added1\n"
+        "+added2\n"
+        "+added3\n"
+    )
+    adds, dels = _diff_line_counts(diff)
+    assert adds == 3
+    assert dels == 1
+    # Diff without anything
+    assert _diff_line_counts(None) == (0, 0)
+    assert _diff_line_counts("") == (0, 0)
+
+
+def test_master_merges_aggregates_real_diff_lines(monkeypatch):
+    """Regression: mr.changes() in python-gitlab 4.x returns a dict; the old
+    code used getattr(..., "additions") which always returned 0, so the
+    weekly report showed '新增代码 0 行, 删除 0 行' even when MRs brought
+    real lines in. This test verifies the diff-line aggregator picks up
+    the per-file + and - counts from the dict payload."""
+    from datetime import datetime, timezone
+    from pr_agent.reporting.collectors.master_merges import MasterMergesCollector
+    from unittest.mock import MagicMock
+
+    fake_mr = MagicMock()
+    fake_mr.iid = 11
+    fake_mr.title = "add a new helper"
+    fake_mr.description = ""
+    fake_mr.author = {"username": "alice"}
+    fake_mr.merged_at = "2026-07-26T03:00:00Z"
+    fake_mr.web_url = "http://x/!11"
+    fake_mr.source_branch = "x"
+    fake_mr.target_branch = "main"
+    fake_mr.changes.return_value = {
+        "changes": [
+            {
+                "new_path": "services/helper.py",
+                "old_path": "services/helper.py",
+                "diff": (
+                    "--- a/services/helper.py\n"
+                    "+++ b/services/helper.py\n"
+                    "@@ -0,0 +1,4 @@\n"
+                    "+def f():\n"
+                    "+    return 1\n"
+                    "+def g():\n"
+                    "+    return 2\n"
+                ),
+            }
+        ]
+    }
+
+    fake_project = MagicMock()
+    fake_project.default_branch = "main"
+    fake_project.mergerequests.list.return_value = [fake_mr]
+
+    fake_gl = MagicMock()
+    fake_gl.projects.get.return_value = fake_project
+    monkeypatch.setattr(
+        "pr_agent.reporting.collectors.master_merges._gitlab_client",
+        lambda url=None, token=None: fake_gl,
+    )
+
+    result = MasterMergesCollector().collect(
+        week_start=datetime(2026, 7, 20, tzinfo=timezone.utc),
+        week_end=datetime(2026, 7, 26, 23, 59, 59, tzinfo=timezone.utc),
+        ctx=_ctx(llm_model="", llm_dry_run=True),
+    )
+    assert result.status == "ok", result.error
+    # 4 added, 0 deleted from the bundled diff.
+    assert result.data["additions"] == 4
+    assert result.data["deletions"] == 0

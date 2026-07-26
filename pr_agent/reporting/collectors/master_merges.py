@@ -79,6 +79,29 @@ def _parse_iso(value: str | None) -> datetime | None:
         return None
 
 
+def _diff_line_counts(diff_text: str | None) -> tuple[int, int]:
+    """Count ``+``/``-`` lines in a unified-diff blob.
+
+    Excludes the ``+++``/``---`` file markers (header lines starting with
+    3 signs so they don't count as content additions/deletions). Used
+    because python-gitlab's ``mr.changes()`` returns a dict with raw diffs
+    rather than aggregated ``additions``/``deletions`` fields.
+    """
+    if not diff_text:
+        return 0, 0
+    adds = dels = 0
+    for line in diff_text.splitlines():
+        if not line:
+            continue
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("+"):
+            adds += 1
+        elif line.startswith("-"):
+            dels += 1
+    return adds, dels
+
+
 class MasterMergesCollector:
     """Collect MRs merged into the target branch during the reporting window."""
 
@@ -136,12 +159,20 @@ class MasterMergesCollector:
             per_add = per_del = 0
             try:
                 changes = mr.changes()  # noqa: SLF001 — python-gitlab detail API
-                per_add = int(getattr(changes, "additions", 0) or 0)
-                per_del = int(getattr(changes, "deletions", 0) or 0)
+                # python-gitlab 4.x returns a dict: {'changes': [{'diff': '...'}], ...}
+                if isinstance(changes, dict):
+                    for entry in changes.get("changes") or []:
+                        a, d = _diff_line_counts(entry.get("diff"))
+                        per_add += a
+                        per_del += d
+                elif changes is not None:
+                    # Fallback for older python-gitlab attribute-based API.
+                    per_add = int(getattr(changes, "additions", 0) or 0)
+                    per_del = int(getattr(changes, "deletions", 0) or 0)
                 additions += per_add
                 deletions += per_del
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                _log.debug("master_merges: changes() failed for !%s: %s", mr.iid, exc)
             mr_list.append(
                 {
                     "iid": mr.iid,

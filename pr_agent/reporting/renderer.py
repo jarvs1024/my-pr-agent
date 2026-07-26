@@ -20,7 +20,10 @@ from .report import WeeklyArtifact
 
 SECTION_TITLES = {
     "telemetry": "一、本周检视概况",
-    "master_merges": "二、本周 master 变更汇总",
+    # ``{branch}`` is substituted at render time with the section's
+    # ``target_branch`` (e.g. "main" / "master") so the heading tracks
+    # whatever branch the project actually merged into.
+    "master_merges": "二、本周 {branch} 变更汇总",
     "repo_scan": "三、本周代码质量扫描",
 }
 
@@ -86,7 +89,11 @@ def render_markdown(artifact: WeeklyArtifact, *, project_name: str | None = None
             parts.append(f"\n## {SECTION_TITLES.get(name, name)}\n\n> 本节未启用\n")
             continue
 
-        parts.append(f"\n## {SECTION_TITLES.get(name, name)}\n")
+        title = SECTION_TITLES.get(name, name)
+        if name == "master_merges":
+            branch = (section.data or {}).get("target_branch") or "main"
+            title = title.format(branch=branch)
+        parts.append(f"\n## {title}\n")
         if section.status != "ok":
             failures.append(name)
             parts.append(f"\n⚠️ 数据缺失: {section.error or '未知原因'}\n")
@@ -183,7 +190,7 @@ def _render_master_merges(data: dict[str, Any]) -> str:
     table_md = table + "\n" + "\n".join(rows)
 
     if summary:
-        # LLM-generated project-level Description block first, then MR list.
+        # LLM-generated project-level 变更摘要 block, then MR list.
         head_line = (
             f"本周合并到 `{data.get('target_branch', '?')}` 的 MR 共 **{merge_count}** 个, "
             f"涉及作者 **{data.get('author_count', 0)}** 位, "
@@ -192,7 +199,7 @@ def _render_master_merges(data: dict[str, Any]) -> str:
         )
         return (
             head_line
-            + "\n\n### Description\n\n"
+            + "\n\n### 变更摘要\n\n"
             + summary.strip()
             + "\n\n#### 涉及 MR 列表\n\n"
             + table_md

@@ -53,7 +53,7 @@ def test_render_markdown_includes_failure_warning():
     assert "项目代码检视周报 — demo" in body
     assert "GitLab 429" in body
     assert "本周检视概况" in body
-    assert "master 变更汇总" in body
+    assert "## 二、本周 main 变更汇总" in body, "section heading must show real target_branch"
 
 
 def test_split_markdown_short_body_is_single_chunk():
@@ -158,7 +158,7 @@ def test_render_telemetry_uses_single_three_col_table():
 
 def test_render_master_merges_includes_llm_description_above_table():
     """When the collector set ``llm_description_markdown``, the renderer
-    must put it above the MR table under a ``### Description`` heading."""
+    must put it above the MR table under a ``### 变更摘要`` heading."""
     from datetime import datetime, timezone
     from pr_agent.reporting.collectors.base import SectionResult
     from pr_agent.reporting.report import build_artifact
@@ -192,10 +192,10 @@ def test_render_master_merges_includes_llm_description_above_table():
         },
     )
     body = render_markdown(art)
-    desc_idx = body.index("### Description")
+    desc_idx = body.index("### 变更摘要")
     table_idx = body.index("| MR | 标题 | 作者 | 合并时间 |")
     mrlist_idx = body.index("#### 涉及 MR 列表")
-    # Description block precedes both the table heading and the MR list sub-section.
+    # 变更摘要 block precedes both the table heading and the MR list sub-section.
     assert desc_idx < mrlist_idx < table_idx
     # LLM output preserved verbatim.
     assert "marker fix 回归验证" in body
@@ -240,5 +240,5 @@ def test_render_master_merges_falls_back_when_no_llm():
         },
     )
     body = render_markdown(art)
-    assert "### Description" not in body
+    assert "### 变更摘要" not in body
     assert "| MR | 标题 | 作者 | 合并时间 |" in body
