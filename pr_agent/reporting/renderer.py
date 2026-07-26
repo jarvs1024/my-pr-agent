@@ -248,7 +248,10 @@ def _render_master_merges(data: dict[str, Any]) -> str:
             head_line
             + "\n\n### 变更摘要\n\n"
             + summary.strip()
-            + "\n\n#### 涉及 MR 列表\n\n"
+            # Use **bold** instead of `#### 涉及 MR 列表` because DingTalk
+            # renders ``#### `` headings with a coloured background that
+            # breaks the visual rhythm of the surrounding bold sub-headers.
+            + "\n\n**涉及 MR 列表**\n\n"
             + table_md
         )
     # Fall back: LLM was disabled or failed — just the headline + table.

@@ -194,7 +194,7 @@ def test_render_master_merges_includes_llm_description_above_table():
     body = render_markdown(art)
     desc_idx = body.index("### 变更摘要")
     table_idx = body.index("| MR | 标题 | 作者 | 合并时间 |")
-    mrlist_idx = body.index("#### 涉及 MR 列表")
+    mrlist_idx = body.index("**涉及 MR 列表**")
     # 变更摘要 block precedes both the table heading and the MR list sub-section.
     assert desc_idx < mrlist_idx < table_idx
     # LLM output preserved verbatim.

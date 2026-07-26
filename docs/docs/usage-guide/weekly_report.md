@@ -62,11 +62,15 @@ is at `${PR_AGENT_DATA_DIR}/weekly_reports/<project_id>/<YYYY-WW>.json`.
 The report has three sections. Each is produced by an independent
 collector; one collector failing does not stop the others.
 
-| Section | Source | Mockable |
+| Section heading | Source | Mockable |
 |---|---|---|
 | 一、本周检视概况 | `pr_agent.telemetry.store` aggregates | n/a (real telemetry) |
-| 二、本周 master 变更汇总 | GitLab API (`project.mergerequests.list`) | n/a (real GitLab) |
+| 二、本周 *\<branch\>* 变更汇总 | GitLab API (`project.mergerequests.list`) | n/a (real GitLab) |
 | 三、本周代码质量扫描 | shallow clone + `litellm.completion` | `PR_AGENT_WEEKLY_LLM_DRY_RUN=true` |
+
+The branch placeholder in section 二's title resolves at render time
+from the section's `target_branch` (e.g. "本周 main 变更汇总" for a
+project merged into `main`).
 
 The shallow clone lives at `${PR_AGENT_DATA_DIR}/repo_scan_cache/<project_id>/`
 and is refreshed each run (`git fetch --depth=200 --prune`). Mount
@@ -123,6 +127,20 @@ All settings can be overridden by environment variables prefixed
 | `dingtalk_retry_attempts` | `PR_AGENT_WEEKLY_DINGTALK_RETRY` | `3` | per chunk |
 | `diff_token_limit` | `PR_AGENT_WEEKLY_DIFF_TOKEN_LIMIT` | `50000` | bytes; larger diffs are truncated |
 | `markdown_chunk_limit` | `PR_AGENT_WEEKLY_MARKDOWN_CHUNK_LIMIT` | `18000` | bytes; bodies split at `## ` headings |
+| `report_title` | `PR_AGENT_WEEKLY_REPORT_TITLE` | `项目代码检视周报` | top-level title in the report header |
+| `report_emoji` | `PR_AGENT_WEEKLY_REPORT_EMOJI` | `📊` | emoji prefix for the title (e.g. set to `🛠️`) |
+
+The reporter container also needs OpenAI-compatible LLM credentials so
+the `master_merges` / `repo_scan` collectors can call the model:
+
+| Env | Purpose |
+|---|---|
+| `OPENAI_API_KEY` | forwarded straight to `litellm.completion` |
+| `OPENAI_API_BASE` | e.g. `https://api.minimaxi.com/v1` (any OpenAI-compatible endpoint) |
+
+If those are empty the report falls back to deterministic stubs
+(`(mock)` markers in the rendered markdown + warning in the artifact)
+rather than failing the whole run.
 
 ## Local development
 
