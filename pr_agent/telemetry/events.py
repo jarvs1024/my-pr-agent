@@ -173,6 +173,25 @@ def emit_run_finished(
         get_logger().warning(f"telemetry.emit_run_finished failed: {e}")
 
 
+def _compute_cohort_key(file: str, line: Optional[int], rule_keys) -> str:
+    """Stable identifier for "same suggestion site" across LLM non-determinism.
+
+    The fingerprint is byte-equal, so two LLM runs that produce
+    semantically identical patches with different wording generate
+    distinct fingerprints and survive dedup. The cohort key collapses
+    those into one identity, anchored on (file, line, sorted-rule-keys)
+    — which is the smallest semantic unit the LLM emits consistently
+    across re-runs.
+    """
+    payload = "\0".join([
+        (file or "").strip(),
+        str(int(line or 0)),
+        ",".join(sorted(str(k) for k in (rule_keys or []))),
+    ])
+    import hashlib
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def emit_suggestion(
     mr_id: int,
     project_id: int,
@@ -188,6 +207,8 @@ def emit_suggestion(
     fingerprint: Optional[str] = None,
     posted_head_sha: Optional[str] = None,
 ) -> str:
+    rule_keys_list = list(rule_keys)
+    cohort_key = _compute_cohort_key(file, line, rule_keys_list)
     suggestion = models.Suggestion(
         mr_id=mr_id,
         project_id=project_id,
@@ -197,11 +218,12 @@ def emit_suggestion(
         label=label,
         importance=importance,
         one_sentence_summary=one_sentence_summary,
-        rule_keys=list(rule_keys),
+        rule_keys=rule_keys_list,
         score=score,
         note_id=note_id,
         fingerprint=fingerprint,
         posted_head_sha=posted_head_sha,
+        cohort_key=cohort_key,
     )
     try:
         get_default_store().record_suggestion(suggestion)

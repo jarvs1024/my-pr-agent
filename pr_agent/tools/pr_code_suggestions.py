@@ -93,6 +93,25 @@ class PRCodeSuggestions:
         ])
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def _cohort_key_for(file, line, rule_keys):
+        """Site-level identity that survives LLM non-determinism.
+
+        Distinct from ``_suggestion_fingerprint``: fingerprint is byte-equal,
+        so two LLM runs that target the same (file, line, rule) but emit
+        slightly different ``improved_code`` produce different fingerprints
+        and slip past dedup. Cohort key collapses those to one bucket,
+        so duplicate DiffNotes at the same site are caught even when the
+        LLM varies its wording.
+        """
+        import hashlib
+        payload = "\0".join([
+            (file or "").strip(),
+            str(int(line or 0)),
+            ",".join(sorted(str(k) for k in (rule_keys or []))),
+        ])
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
     def __init__(self, pr_url: str, cli_mode=False, args: list = None,
                  ai_handler: partial[BaseAiHandler,] = LiteLLMAIHandler):
 
@@ -894,6 +913,38 @@ class PRCodeSuggestions:
                 format_exception_chain(e),
             )
 
+        # Cohort dedup: same (file, line, sorted-rule-keys) site already
+        # has an open/applied/dismissed suggestion on this MR. The LLM
+        # can re-emit that patch with slightly different wording each
+        # round, so byte-equal fingerprint misses it. Cohort key is
+        # stable across that variation. We only collapse same-site hits
+        # that share the same head_sha (concurrent /improve runs on
+        # the same commit) — different head_sha means the LLM is
+        # legitimately re-targeting the post-fix source and should be
+        # allowed to post.
+        existing_cohort = {}
+        try:
+            store = telemetry_events.get_default_store()
+            if hasattr(store, "list_suggestion_fingerprints"):
+                cohort_rows = store.list_suggestion_fingerprints(
+                    mr_id=int(mr_id),
+                    project_id=int(project_id) if project_id else None,
+                )
+                for row in cohort_rows:
+                    ck = row.get("cohort_key")
+                    if not ck:
+                        continue
+                    if row.get("state") not in ("open", "applied", "dismissed"):
+                        continue
+                    key = (ck, row.get("posted_head_sha") or "")
+                    if key not in existing_cohort:
+                        existing_cohort[key] = row
+        except Exception as e:
+            get_logger().warning(
+                "suppress-cohort lookup failed; continuing without cohort dedup: %s",
+                format_exception_chain(e),
+            )
+
         # Build (file, line) -> resolved suggestion metadata. A small
         # line-window (3 lines) catches ordinary re-anchoring. Dismissed
         # suggestions with the same repository rule key get a wider window,
@@ -957,6 +1008,7 @@ class PRCodeSuggestions:
             f = cs.get("relevant_file")
             ln = cs.get("relevant_lines_start")
             fingerprint = cs.get("fingerprint")
+            cs_head_sha = cs.get("posted_head_sha") or ""
             if fingerprint and fingerprint in existing_fingerprints:
                 get_logger().info(
                     f"suppress-fingerprint: skip {f}:{ln} because the patch already exists"
@@ -964,6 +1016,27 @@ class PRCodeSuggestions:
                 dropped += 1
                 dropped_records.append(
                     (f or "", int(ln or 0), frozenset({"fingerprint-existing"}))
+                )
+                continue
+            original_suggestion = cs.get("original_suggestion") or {}
+            rule_text = " ".join([
+                str(cs.get("body") or ""),
+                str(original_suggestion.get("suggestion_content") or ""),
+                str(original_suggestion.get("one_sentence_summary") or ""),
+            ])
+            rule_keys = set(telemetry_events.extract_rule_keys_from_text(rule_text))
+            cohort_k = cs.get("cohort_key") or PRCodeSuggestions._cohort_key_for(
+                f, ln, rule_keys
+            )
+            if cohort_k and (cohort_k, cs_head_sha) in existing_cohort:
+                prior = existing_cohort[(cohort_k, cs_head_sha)]
+                get_logger().info(
+                    f"suppress-cohort: skip {f}:{ln} cohort={cohort_k[:12]} "
+                    f"prior={prior.get('suggestion_id')[:12]} state={prior.get('state')}"
+                )
+                dropped += 1
+                dropped_records.append(
+                    (f or "", int(ln or 0), frozenset({f"cohort-existing:{prior.get('state')}"}))
                 )
                 continue
             original_suggestion = cs.get("original_suggestion") or {}
@@ -1089,11 +1162,25 @@ class PRCodeSuggestions:
                     existing_code=str(d.get('existing_code') or ''),
                     improved_code=str(d.get('improved_code') or new_code_snippet or ''),
                 )
+                cs_rule_keys = sorted(set(
+                    telemetry_events.extract_rule_keys_from_text(
+                        (content or "") + " " + (d.get("suggestion_content") or "")
+                    )
+                ))
+                cs_cohort = PRCodeSuggestions._cohort_key_for(
+                    file=relevant_file,
+                    line=relevant_lines_start,
+                    rule_keys=cs_rule_keys,
+                )
+                cs_posted_head_sha = PRCodeSuggestions._get_posted_head_sha(self.git_provider)
                 code_suggestions.append({'body': body, 'relevant_file': relevant_file,
                                          'relevant_lines_start': relevant_lines_start,
                                          'relevant_lines_end': relevant_lines_end,
                                          'label': label,
                                          'fingerprint': cs_fingerprint,
+                                         'cohort_key': cs_cohort,
+                                         'posted_head_sha': cs_posted_head_sha,
+                                         'rule_keys': cs_rule_keys,
                                          'original_suggestion': d})
             except Exception:
                 get_logger().info(f"Could not parse suggestion: {d}")

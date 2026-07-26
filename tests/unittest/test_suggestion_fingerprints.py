@@ -75,7 +75,7 @@ def test_store_migrates_legacy_suggestions_table(tmp_path):
     store = TelemetryStore("sqlite", sqlite_path=str(path))
     columns = {row[1] for row in store._db.execute("PRAGMA table_info(suggestions)")}
 
-    assert {"fingerprint", "line_end", "posted_head_sha"}.issubset(columns)
+    assert {"fingerprint", "line_end", "posted_head_sha", "cohort_key"}.issubset(columns)
 
 
 def test_internal_fingerprint_fields_are_not_exposed_by_public_list(tmp_path):

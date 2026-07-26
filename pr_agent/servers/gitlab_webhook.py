@@ -137,7 +137,56 @@ def _emit_mr_merged(data: dict) -> None:
         get_logger().warning(f"_emit_mr_merged failed: {e}")
 
 
+import asyncio
 import re as _re_apply
+import time as _time_mrlock
+
+# Per-MR concurrency guard: each (project_id, mr_iid) holds an asyncio.Lock
+# so that overlapping webhooks cannot kick off more than one /improve run
+# at a time. A post-run cooldown further blunts LLM non-determinism — the
+# next /improve run is allowed to start only after the previous cohort's
+# fingerprints + source-update supersede classifications have been written
+# to telemetry, so the dedup path can take effect.
+_MR_RUN_LOCKS: "dict[tuple[str, str], asyncio.Lock]" = {}
+_MR_LAST_RUN_FINISHED: "dict[tuple[str, str], float]" = {}
+_MR_RUN_COOLDOWN_S = 30.0
+
+
+def _mr_lock_key(project_id, mr_iid) -> tuple[str, str]:
+    return (str(project_id or ""), str(mr_iid or ""))
+
+
+def _get_mr_lock(key) -> asyncio.Lock:
+    lock = _MR_RUN_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _MR_RUN_LOCKS[key] = lock
+    return lock
+
+
+def _acquire_mr_run_slot(key) -> tuple[bool, str]:
+    """Try to claim a per-MR /improve slot.
+
+    Returns ``(True, "")`` if the caller may proceed, or
+    ``(False, reason)`` to signal the run should be skipped. The
+    cooldown check uses the module-level finished-timestamp so that even
+    after a run releases the lock, an immediately-following webhook
+    request is rejected for ``_MR_RUN_COOLDOWN_S`` seconds.
+    """
+    lock = _get_mr_lock(key)
+    if lock.locked():
+        return False, "improve-already-running"
+    last = _MR_LAST_RUN_FINISHED.get(key)
+    now = _time_mrlock.monotonic()
+    if last is not None and (now - last) < _MR_RUN_COOLDOWN_S:
+        wait = _MR_RUN_COOLDOWN_S - (now - last)
+        return False, f"improve-cooldown-{wait:.1f}s"
+    return True, ""
+
+
+def _release_mr_run_slot(key) -> None:
+    _MR_LAST_RUN_FINISHED[key] = _time_mrlock.monotonic()
+
 
 _APPLY_COMMIT_RE = _re_apply.compile(r"Apply\s+(\d+)\s+suggestion", _re_apply.IGNORECASE)
 _APPLY_PIPELINE_COORDINATOR = ApplyPipelineCoordinator()
@@ -225,6 +274,36 @@ def _resolve_apply_event(webhook_data: dict):
         }
 
     return None
+
+
+
+def _iter_apply_events(webhook_data: dict):
+    """Yield one normalized event per "Apply N suggestion(s)" commit.
+
+    GitLab pushes a single ``push`` (or ``merge_request update``) hook
+    carrying the entire ``commits[]`` array, even when the user clicked
+    Apply multiple times in rapid succession. The old single-event
+    resolver picked the last commit and silently dropped the rest, which
+    caused those suggestions to stay ``open`` until the next /improve
+    cohort. Yielding a generator lets the caller process each commit
+    independently against the live suggestion table.
+    """
+    commits = (webhook_data or {}).get("commits") or []
+    if not commits:
+        single = _resolve_apply_event(webhook_data)
+        if single is not None:
+            yield single
+        return
+    for commit in commits:
+        msg = (commit.get("message") or "").strip()
+        if not _APPLY_COMMIT_RE.search(msg):
+            continue
+        synthetic = dict(webhook_data)
+        synthetic["commits"] = [commit]
+        ev = _resolve_apply_event(synthetic)
+        if ev is not None:
+            yield ev
+
 
 
 def _lookup_mr_for_push(project_id, ref):
@@ -433,16 +512,42 @@ def _process_adopt_reply(provider, discussion_id: str, suggestion: dict,
 
 
 def _handle_apply_commit(webhook_data: dict) -> None:
-    """Detect GitLab's "Apply N suggestion(s)" commit and mark matching open
-    suggestions as ``state=applied``.
+    """Process every Apply-suggestion commit in the webhook payload.
 
-    GitLab sends either a ``push`` hook or a ``merge_request update`` hook
-    when a user clicks "Apply suggestion" on an MR thread. The commit title
-    carries "Apply N suggestion(s) to N file(s)" — match that, then resolve
-    the touched file(s) and flip the matching ``open`` rows to ``applied``.
+    GitLab's WebIDE "Apply suggestion" click produces a commit whose title
+    matches ``Apply N suggestion(s) to N file(s)``. A single push event can
+    carry several of these in ``commits[]`` when the user clicks Apply
+    multiple times in quick succession. The previous implementation picked
+    only the last commit, silently dropping the rest. We now iterate via
+    :func:`_iter_apply_events` so every Apply commit gets its evidence
+    check + state transition against the live suggestion table, which
+    keeps MR rounds consistent when multiple suggestions are acted on
+    inside one push.
+    """
+    handled = 0
+    for ev in _iter_apply_events(webhook_data):
+        try:
+            _process_apply_commit_event(ev, webhook_data)
+            handled += 1
+        except Exception as _inner_err:
+            get_logger().warning(
+                f"telemetry.on_apply_commit per-event failed: {_inner_err}"
+            )
+    if handled:
+        get_logger().info(
+            f"telemetry.on_apply_commit: processed {handled} Apply commit(s) in single push"
+        )
+
+
+def _process_apply_commit_event(ev: dict, webhook_data: dict) -> None:
+    """Mark one Apply-suggestion commit's matches as ``state=applied``.
+
+    Split out from :func:`_handle_apply_commit` so the outer wrapper can
+    iterate over every Apply commit in a multi-commit push and still keep
+    per-commit evidence lookup semantics (each commit's parent + diff is
+    re-pulled against its own sha, not the event's last commit).
     """
     try:
-        ev = _resolve_apply_event(webhook_data)
         if ev is None:
             return
         project_id = ev["project_id"]
@@ -687,25 +792,49 @@ async def handle_request(api_url: str, body: str, log_context: dict, sender_id: 
 async def _perform_commands_gitlab(commands_conf: str, agent: PRAgent, api_url: str,
                                    log_context: dict, data: dict):
     apply_repo_settings(api_url)
-    if commands_conf == "pr_commands" and get_settings().config.disable_auto_feedback:  # auto commands for PR, and auto feedback is disabled
+    if commands_conf == "pr_commands" and get_settings().config.disable_auto_feedback:
         get_logger().info(f"Auto feedback is disabled, skipping auto commands for PR {api_url=}", **log_context)
         return
-    if not should_process_pr_logic(data): # Here we already updated the configurations
+    if not should_process_pr_logic(data):
         return
-    commands = get_settings().get(f"gitlab.{commands_conf}", {})
-    get_settings().set("config.is_auto_command", True)
-    for command in commands:
-        try:
-            split_command = command.split(" ")
-            command = split_command[0]
-            args = split_command[1:]
-            other_args = update_settings_from_args(args)
-            new_command = ' '.join([command] + other_args)
-            get_logger().info(f"Performing command: {new_command}")
-            with get_logger().contextualize(**log_context):
-                await agent.handle_request(api_url, new_command)
-        except Exception as e:
-            get_logger().error(f"Failed to perform command {command}: {e}")
+    # Per-MR concurrency guard: when pr_commands includes /improve, run
+    # only one instance per (project_id, mr_iid) at a time. The lock is
+    # keyed per-MR so two PRs in parallel are unaffected. Cooldown after
+    # release prevents LLM-non-deterministic duplicate suggestions from
+    # piling up across sub-second webhook bursts.
+    mr_key = _mr_lock_key(
+        (data.get("project") or {}).get("id"),
+        (data.get("merge_request") or {}).get("iid")
+        or (data.get("object_attributes") or {}).get("iid"),
+    )
+    _slot_lock = _get_mr_lock(mr_key)
+    slot_ok, slot_reason = _acquire_mr_run_slot(mr_key)
+    if not slot_ok:
+        get_logger().info(
+            f"cohort-skip: {commands_conf} for MR key={mr_key} "
+            f"reason={slot_reason} — deferring to in-flight/cooled cohort"
+        )
+        return
+    await _slot_lock.acquire()
+    try:
+        commands = get_settings().get(f"gitlab.{commands_conf}", {})
+        get_settings().set("config.is_auto_command", True)
+        for command in commands:
+            try:
+                split_command = command.split(" ")
+                command = split_command[0]
+                args = split_command[1:]
+                other_args = update_settings_from_args(args)
+                new_command = ' '.join([command] + other_args)
+                get_logger().info(f"Performing command: {new_command}")
+                with get_logger().contextualize(**log_context):
+                    await agent.handle_request(api_url, new_command)
+            except Exception as e:
+                get_logger().error(f"Failed to perform command {command}: {e}")
+    finally:
+        _release_mr_run_slot(mr_key)
+        if _slot_lock.locked():
+            _slot_lock.release()
 
 
 async def _drain_apply_pipeline(initial_job: ApplyPipelineJob) -> None:

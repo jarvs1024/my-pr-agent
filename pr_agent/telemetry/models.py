@@ -86,6 +86,7 @@ class Suggestion:
     line_end: Optional[int] = None
     fingerprint: Optional[str] = None
     posted_head_sha: Optional[str] = None
+    cohort_key: Optional[str] = None  # (file, line, sorted(rule_keys)) hash
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

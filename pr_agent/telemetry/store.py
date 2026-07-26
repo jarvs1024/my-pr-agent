@@ -149,10 +149,13 @@ CREATE TABLE IF NOT EXISTS suggestions (
     note_id TEXT,
     line_end INTEGER,
     fingerprint TEXT,
-    posted_head_sha TEXT
+    posted_head_sha TEXT,
+    cohort_key TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sug_mr ON suggestions(mr_id);
 CREATE INDEX IF NOT EXISTS idx_sug_state ON suggestions(state);
+-- idx_sug_cohort is created in TelemetryStore.__init__ after the
+-- cohort_key column has been migrated onto legacy databases.
 
 CREATE TABLE IF NOT EXISTS action_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -232,6 +235,7 @@ class TelemetryStore:
                     ("line_end", "INTEGER"),
                     ("fingerprint", "TEXT"),
                     ("posted_head_sha", "TEXT"),
+                    ("cohort_key", "TEXT"),
                 ):
                     if column not in cur_cols:
                         self._db.execute(
@@ -241,6 +245,18 @@ class TelemetryStore:
                 self._db.commit()
             except Exception as e:
                 get_logger().warning(f"telemetry fingerprint migration skipped: {e}")
+            # Add the cohort_key lookup index AFTER the column migration
+            # so legacy databases that predate cohort_key still get the
+            # index once the column exists. CREATE INDEX IF NOT EXISTS
+            # is a no-op when the index is already in place.
+            try:
+                self._db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_sug_cohort "
+                    "ON suggestions(mr_id, cohort_key)"
+                )
+                self._db.commit()
+            except Exception as e:
+                get_logger().warning(f"telemetry cohort index skipped: {e}")
             self._db.commit()
         elif backend == "jsonl":
             _jsonl_env = os.environ.get("REVIEW_TELEMETRY_JSONL_PATH")
@@ -331,14 +347,14 @@ class TelemetryStore:
                     "INSERT OR REPLACE INTO suggestions "
                     "(suggestion_id, mr_id, project_id, file, line, label, importance, one_sentence_summary, "
                     "rule_keys, score, posted_at, state, applied_at, dismissed_at, dismissed_by, dismissed_reason, "
-                    "note_id, line_end, fingerprint, posted_head_sha) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "note_id, line_end, fingerprint, posted_head_sha, cohort_key) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         d["suggestion_id"], d["mr_id"], d["project_id"], d["file"], d["line"], d["label"],
                         d["importance"], d["one_sentence_summary"], json.dumps(d["rule_keys"], ensure_ascii=False),
                         d["score"], d["posted_at"], d["state"], d["applied_at"], d["dismissed_at"],
                         d["dismissed_by"], d.get("dismissed_reason"), d["note_id"], d.get("line_end"),
-                        d.get("fingerprint"), d.get("posted_head_sha"),
+                        d.get("fingerprint"), d.get("posted_head_sha"), d.get("cohort_key"),
                     ),
                 )
                 self._db.commit()
@@ -660,21 +676,44 @@ class TelemetryStore:
         return [_row_to_suggestion(row, _SUGGESTION_INTERNAL_COLUMNS) for row in rows]
 
     def list_suggestion_fingerprints(self, mr_id: int, project_id: Optional[int] = None):
+        """Return rows carrying (cohort_key, fingerprint) for dedup lookups.
+
+        Cohort key was added in the fix123+cohort migration; older rows
+        predate it so we fall back to deriving a (file, line, rule_keys)
+        cohort identifier on the fly for back-compat. The fingerprint
+        columns are kept so the byte-level dedup path still works.
+        """
         if self.backend != "sqlite" or self._db is None:
             return []
-        clauses = ["mr_id=?", "fingerprint IS NOT NULL", "fingerprint != ''"]
+        clauses = ["mr_id=?"]
         params = [mr_id]
         if project_id is not None:
             clauses.append("project_id=?")
             params.append(project_id)
         with self._lock:
             rows = self._db.execute(
-                "SELECT suggestion_id, file, line, line_end, state, fingerprint "
+                "SELECT suggestion_id, file, line, line_end, state, fingerprint, "
+                "rule_keys, cohort_key, posted_head_sha "
                 f"FROM suggestions WHERE {' AND '.join(clauses)}",
                 params,
             ).fetchall()
-        columns = ("suggestion_id", "file", "line", "line_end", "state", "fingerprint")
-        return [dict(zip(columns, row)) for row in rows]
+        columns = ("suggestion_id", "file", "line", "line_end", "state", "fingerprint",
+                   "rule_keys", "cohort_key", "posted_head_sha")
+        out = [dict(zip(columns, row)) for row in rows]
+        for row in out:
+            if not row.get("cohort_key"):
+                import hashlib, json
+                try:
+                    rule_keys = json.loads(row.get("rule_keys") or "[]")
+                except Exception:
+                    rule_keys = []
+                payload = "\0".join([
+                    (row.get("file") or "").strip(),
+                    str(int(row.get("line") or 0)),
+                    ",".join(sorted(str(k) for k in rule_keys)),
+                ])
+                row["cohort_key"] = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return out
 
     def list_runs(self, mr_id: int, limit: int = 20):
         if self.backend != "sqlite" or self._db is None:
