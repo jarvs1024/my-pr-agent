@@ -30,6 +30,7 @@ from .collectors.telemetry_overview import TelemetryOverviewCollector
 from .config import WeeklyReportConfig, load_config
 from .notifiers.base import DeliveryResult, Notifier
 from .notifiers.dingtalk import DingTalkNotifier
+from .notifiers.dingtalk_openapi import DingTalkOpenAPINotifier
 from .renderer import render_markdown, split_markdown
 from .report import (
     WeeklyArtifact,
@@ -63,6 +64,17 @@ def _build_notifier(cfg: WeeklyReportConfig) -> Notifier:
         return DingTalkNotifier(
             webhook_url=cfg.dingtalk_webhook_url,
             secret=cfg.dingtalk_secret,
+            retry_attempts=cfg.dingtalk_retry_attempts,
+            dry_run=cfg.dingtalk_dry_run,
+        )
+    if cfg.notifier == "dingtalk_openapi":
+        return DingTalkOpenAPINotifier(
+            app_key=os.environ.get("DINGTALK_OPENAPI_APP_KEY", ""),
+            app_secret=os.environ.get("DINGTALK_OPENAPI_APP_SECRET", ""),
+            robot_code=os.environ.get("DINGTALK_OPENAPI_ROBOT_CODE", ""),
+            open_conversation_id=os.environ.get(
+                "DINGTALK_OPENAPI_OPEN_CONVERSATION_ID", ""
+            ),
             retry_attempts=cfg.dingtalk_retry_attempts,
             dry_run=cfg.dingtalk_dry_run,
         )

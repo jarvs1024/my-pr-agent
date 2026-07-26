@@ -581,6 +581,12 @@ collectors = ["telemetry", "master_merges", "repo_scan"]
 # Notifier name (currently only "dingtalk" is implemented).
 notifier = "dingtalk"
 
+# Notifier name. Supported values:
+#   "dingtalk"          - custom robot webhook (current default; needs URL only)
+#   "dingtalk_openapi"  - enterprise-app OpenAPI (AppKey + AppSecret + robotCode +
+#                         openConversationId; same auth model as dingtalk-stream SDK)
+# notifier = "dingtalk"
+
 # Override the LLM model used by the repo-scan collector. Empty string
 # means "follow config.model".
 llm_model = ""
