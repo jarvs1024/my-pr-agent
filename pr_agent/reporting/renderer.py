@@ -114,14 +114,13 @@ def _render_section(name: str, section: SectionResult) -> str:
 
 
 def _render_telemetry(data: dict[str, Any]) -> str:
-    """Render the telemetry section as ONE unified 3-column table.
+    """Render the telemetry section as a single 2-column ``| 指标 | 数值 |`` table.
 
-    DingTalk markdown renders each ``| table |`` block with column widths
-    driven by its own content; rendering several tables back to back makes
-    them visually uncoordinated. We collapse the three sub-blocks
-    (``本周指标`` / ``severity 分布`` / ``触发最多的规则``) into a single
-    3-column table ``| 类别 | 项 | 数值 |`` so every row sits in the same
-    column widths. Long rule keys get ``<br>`` at word boundaries.
+    Severity and ``触发最多规则`` are multi-entry blocks — render each
+    entry on its own line inside the ``数值`` cell by joining with
+    ``<br>`` (DingTalk does not auto-wrap table cells; ``<br>`` forces
+    the line break and shows the full content without horizontal
+    truncation).
     """
     mr_count = data.get("mr_count", 0)
     mr_total = data.get("mr_total", 0)
@@ -130,31 +129,28 @@ def _render_telemetry(data: dict[str, Any]) -> str:
     sev = data.get("severity_breakdown") or {}
     rules = data.get("top_rules") or []
 
-    rows: list[tuple[str, str, str]] = [
-        ("本周指标", "本周窗口 MR 数", str(mr_count)),
-        ("本周指标", "项目累计 MR 数", str(mr_total)),
-        ("本周指标", "累计 suggestion 数", str(suggestion_count)),
-        ("本周指标", "采纳率", f"{adoption_pct}%"),
-    ]
-
-    if sev:
-        for k, v in sev.items():
-            rows.append(("severity", k, str(v)))
-    else:
-        rows.append(("severity", "—", "(无)"))
+    sev_value = "<br>".join(f"{k}={v}" for k, v in sev.items()) if sev else "(无)"
 
     if rules:
-        for rk, n in rules[:5]:
-            rows.append(("触发最多规则", _wrap(rk, width=24), str(n)))
+        rules_value = "<br>".join(f"{rk} ×{n}" for rk, n in rules[:5])
     else:
-        rows.append(("触发最多规则", "—", "(无)"))
+        rules_value = "(无)"
+
+    rows: list[tuple[str, str]] = [
+        ("本周窗口 MR 数", str(mr_count)),
+        ("项目累计 MR 数", str(mr_total)),
+        ("累计 suggestion 数", str(suggestion_count)),
+        ("采纳率", f"{adoption_pct}%"),
+        ("severity 分布", sev_value),
+        ("触发最多规则", rules_value),
+    ]
 
     lines: list[str] = [
-        "| 类别 | 项 | 数值 |",
-        "|---|---|---|",
+        "| 指标 | 数值 |",
+        "|---|---|",
     ]
-    for cat, item, value in rows:
-        lines.append(f"| {cat} | {item} | {value} |")
+    for label, value in rows:
+        lines.append(f"| {label} | {value} |")
     return "\n".join(lines)
 
 

@@ -142,15 +142,15 @@ def test_render_telemetry_uses_single_three_col_table():
     )
     body = render_markdown(art)
 
-    # Exactly one 3-col header row, no separate 2-col tables.
-    assert "| 类别 | 项 | 数值 |" in body
-    # Rendered values come from the corrected (cumulative) fields.
-    assert "| 75 |" in body, "项目累计 MR 数 should be 75 (all-time), not windowed"
-    assert "| 886 |" in body, "累计 suggestion should be all-time 886, not windowed"
-    assert "| 44.6% |" in body, "采纳率 should be all-time 44.6%, not 17.7%"
-    assert "| SSD-RULE-DOCSTRING-REQUIRED | 112 |" in body
-    assert "| critical | 436 |" in body
-    # No leftover headings from the old sub-block format.
-    assert "**本周指标**" not in body
-    assert "**severity 分布**" not in body
-    assert "**触发最多的规则**" not in body
+    # Single 2-col header row.
+    assert "| 指标 | 数值 |" in body
+    assert "| 类别 | 项 | 数值 |" not in body, "must not regress to 3-col layout"
+    # Rendered cumulative values.
+    assert "| 75 |" in body, "项目累计 MR 数 should be all-time 75"
+    assert "| 886 |" in body, "累计 suggestion should be all-time 886"
+    assert "| 44.6% |" in body, "采纳率 should be all-time 44.6%"
+    # Severity + rules are single rows with multi-line value cells using <br>.
+    assert "| critical=436<br>high=402 |" in body
+    assert "SSD-RULE-DOCSTRING-REQUIRED ×112<br>SSD-RULE-FORBIDDEN-COMMENT ×1 |" in body
+    # The 触发最多规则 value cell is one row, not 5 separate rows.
+    assert body.count("SSD-RULE-DOCSTRING-REQUIRED") == 1
