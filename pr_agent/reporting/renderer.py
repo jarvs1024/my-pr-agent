@@ -91,7 +91,7 @@ def _wrap(s: str, width: int = 22) -> str:
 
 def render_markdown(artifact: WeeklyArtifact, *, project_name: str | None = None) -> str:
     parts: list[str] = []
-    title = "# 📊 项目代码检视周报"
+    title = "# 📊 SSD自动化代码检视周报"
     if project_name:
         title += f" — {project_name}"
     title += f" — {artifact.week_label}\n"
@@ -113,7 +113,7 @@ def render_markdown(artifact: WeeklyArtifact, *, project_name: str | None = None
         + f"> 生成时间: {_short(artifact.generated_at.isoformat() if artifact.generated_at else '')}"
         # Drop the redundant time-of-day portion of week_start/week_end
         # (always 00:00 / 23:59) so the 数据范围 line fits on a single row.
-        + f"<br>> 数据范围: {_date_only(artifact.week_start.isoformat())} ~ {_date_only(artifact.week_end.isoformat())}\n"
+        + f"<br>数据范围: {_date_only(artifact.week_start.isoformat())} ~ {_date_only(artifact.week_end.isoformat())}\n"
     )
 
     failures: list[str] = []
@@ -218,7 +218,7 @@ def _render_master_merges(data: dict[str, Any]) -> str:
         iid = mr.get("iid", "?")
         title = (mr.get("title") or "").replace("|", "\\|").replace("\n", " ")
         author = mr.get("author") or "?"
-        merged_at = (mr.get("merged_at") or "")[:16].replace("T", " ")
+        merged_at = (mr.get("merged_at") or "")[:10].replace("-", "/")
         url = mr.get("url") or ""
         cell = f"[!{iid}]({url})" if url else f"!{iid}"
         # Wrap the full title with <br> at word boundaries so DingTalk
