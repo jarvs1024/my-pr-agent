@@ -1078,10 +1078,22 @@ class PRCodeSuggestions:
                     body = f"""**Suggestion:** {content} [{label}, importance: {d.get('score')}]\n```suggestion\n{new_code_snippet}\n```\n\n✅ 接受建议\n   • 直接用：点上方「应用建议」按钮\n   • 自己改：请先提交修改，再回复 /adopt [理由]\n\n❌ 关闭建议\n   • 回复 `/dismiss` [理由]\n\n理由会被记录，用于改进后续建议。"""
                 else:
                     body = f"""**Suggestion:** {content} [{label}]\n```suggestion\n{new_code_snippet}\n```\n\n✅ 接受建议\n   • 直接用：点上方「应用建议」按钮\n   • 自己改：请先提交修改，再回复 /adopt [理由]\n\n❌ 关闭建议\n   • 回复 `/dismiss` [理由]\n\n理由会被记录，用于改进后续建议。"""
+                # Compute a content fingerprint so subsequent /improve rounds
+                # can suppress suggestions that re-emit the same patch via
+                # ``_suppress_resolved_suggestions``'s fingerprint dedup.
+                # Without this, line drift across pushes would otherwise
+                # produce a fresh suggestion_id every round and the old
+                # record gets superseded instead of recognised as duplicate.
+                cs_fingerprint = PRCodeSuggestions._suggestion_fingerprint(
+                    file=relevant_file,
+                    existing_code=str(d.get('existing_code') or ''),
+                    improved_code=str(d.get('improved_code') or new_code_snippet or ''),
+                )
                 code_suggestions.append({'body': body, 'relevant_file': relevant_file,
                                          'relevant_lines_start': relevant_lines_start,
                                          'relevant_lines_end': relevant_lines_end,
                                          'label': label,
+                                         'fingerprint': cs_fingerprint,
                                          'original_suggestion': d})
             except Exception:
                 get_logger().info(f"Could not parse suggestion: {d}")
@@ -1159,6 +1171,7 @@ class PRCodeSuggestions:
                     rule_keys=rule_keys,
                     score=original.get("score"),
                     note_id=cs.get("note_id"),
+                    fingerprint=cs.get("fingerprint"),
                     posted_head_sha=PRCodeSuggestions._get_posted_head_sha(self.git_provider),
                 )
         except Exception as e:

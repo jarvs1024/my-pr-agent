@@ -299,32 +299,44 @@ def mark_suggestion_ids_applied(mr_id: int, project_id: int, suggestion_ids: lis
     return updated
 
 
-def mark_suggestion_applied(suggestion_id: str) -> None:
+def mark_suggestion_applied(suggestion_id: str) -> bool:
     try:
         from datetime import datetime, timezone
-        get_default_store().update_suggestion_state(
+        updated = get_default_store().update_suggestion_state(
             suggestion_id,
             "applied",
+            allowed_from=("open",),
             applied_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         )
+        if not updated:
+            get_logger().info(
+                f"telemetry.mark_suggestion_applied: no-op for {suggestion_id} (state precondition failed)"
+            )
+        return bool(updated)
     except Exception as e:
         get_logger().warning(f"telemetry.mark_suggestion_applied failed: {e}")
+        return False
 
 
 def mark_suggestion_dismissed(suggestion_id: str, actor: str = "", reason: str = "") -> None:
     try:
         from datetime import datetime, timezone
-        get_default_store().update_suggestion_state(
+        updated = get_default_store().update_suggestion_state(
             suggestion_id,
             "dismissed",
+            allowed_from=("open", "applied"),
             dismissed_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
             dismissed_by=actor,
             dismissed_reason=reason or None,
         )
+        if not updated:
+            get_logger().info(
+                f"telemetry.mark_suggestion_dismissed: no-op for {suggestion_id} (state precondition failed)"
+            )
     except Exception as e:
         get_logger().warning(f"telemetry.mark_suggestion_dismissed failed: {e}")
 
-def mark_suggestion_adopted(suggestion_id: str, actor: str = "", reason: str = "", mr_id: int = 0) -> None:
+def mark_suggestion_adopted(suggestion_id: str, actor: str = "", reason: str = "", mr_id: int = 0) -> int:
     """State-update helper for /adopt (manual / rewritten adoption).
 
     After simplification, ``/adopt`` and the GitLab ``Apply suggestion``
@@ -334,7 +346,11 @@ def mark_suggestion_adopted(suggestion_id: str, actor: str = "", reason: str = "
     ``action_events.action`` (``applied`` vs ``adopted_implicitly``) for
     future analysis but is NOT surfaced via the stats API.
     """
-    mark_suggestion_applied(suggestion_id)
+    if not mark_suggestion_applied(suggestion_id):
+        # State precondition failed (e.g. already superseded or dismissed);
+        # do NOT emit the adopted_implicitly action because nothing actually
+        # transitioned.
+        return False
     if actor or reason:
         try:
             get_default_store().record_action(models.ActionEvent(
@@ -346,10 +362,17 @@ def mark_suggestion_adopted(suggestion_id: str, actor: str = "", reason: str = "
             ))
         except Exception as e:
             get_logger().warning(f"telemetry.adopt_action emit failed: {e}")
+    return True
 
 
 def mark_suggestion_superseded(suggestion_id: str) -> None:
     try:
-        get_default_store().update_suggestion_state(suggestion_id, "superseded")
+        updated = get_default_store().update_suggestion_state(
+            suggestion_id, "superseded", allowed_from=("open", "applied")
+        )
+        if not updated:
+            get_logger().info(
+                f"telemetry.mark_suggestion_superseded: no-op for {suggestion_id} (state precondition failed)"
+            )
     except Exception as e:
         get_logger().warning(f"telemetry.mark_suggestion_superseded failed: {e}")

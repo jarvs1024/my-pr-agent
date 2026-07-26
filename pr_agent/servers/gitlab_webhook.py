@@ -1319,6 +1319,28 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                     _reason = _wrapper_strip.sub('', _reason).strip()
                     discussion_id = obj_attrs.get('discussion_id')
                     if discussion_id:
+                        # Mirror /adopt's state guard: skip /dismiss when the
+                        # suggestion is already in a terminal state (dismissed
+                        # or superseded). Otherwise a late /dismiss can
+                        # clobber an already-recorded superseded transition
+                        # (the GitLab resolve_discussion call is idempotent
+                        # and would still return ok=True).
+                        try:
+                            _dismiss_suggestion = telemetry_events.get_default_store().get_suggestion_by_note_id(discussion_id)
+                        except Exception as _dismiss_lookup_err:
+                            _dismiss_suggestion = None
+                            get_logger().warning(
+                                f"/dismiss state lookup failed: {_dismiss_lookup_err}"
+                            )
+                        if _dismiss_suggestion is not None and _dismiss_suggestion.get('state') not in ('open', 'applied'):
+                            get_logger().info(
+                                f"Ignoring /dismiss for non-open suggestion {discussion_id} "
+                                f"(state={_dismiss_suggestion.get('state')})"
+                            )
+                            return JSONResponse(
+                                status_code=status.HTTP_200_OK,
+                                content=jsonable_encoder({'message': 'dismiss-skipped-state'}),
+                            )
                         provider = get_git_provider_with_context(pr_url=url)
                         ok = provider.resolve_discussion(discussion_id)
                         if ok:

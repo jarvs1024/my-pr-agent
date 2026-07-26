@@ -449,17 +449,40 @@ class TelemetryStore:
             applied_at=applied_at,
         )
 
-    def update_suggestion_state(self, suggestion_id: str, state: str, **fields) -> None:
+    def update_suggestion_state(
+        self,
+        suggestion_id: str,
+        state: str,
+        *,
+        allowed_from: Optional[Iterable[str]] = None,
+        **fields,
+    ) -> int:
+        """Transition ``suggestion_id`` to ``state``.
+
+        When ``allowed_from`` is provided, the UPDATE only fires when the
+        current ``state`` is in that set — preventing late events from
+        clobbering a more recent transition. Returns the number of rows
+        updated (0 when the precondition fails or the row is missing).
+        """
         if self.backend != "sqlite" or self._db is None:
-            return
+            return 0
         sets = ["state=?", "applied_at=?", "dismissed_at=?", "dismissed_by=?", "dismissed_reason=?"]
         params = [state, fields.get("applied_at"), fields.get("dismissed_at"), fields.get("dismissed_by"), fields.get("dismissed_reason")]
+        where_clauses = ["suggestion_id=?"]
+        where_params: list = [suggestion_id]
+        if allowed_from is not None:
+            allowed_list = list(allowed_from)
+            if not allowed_list:
+                return 0
+            where_clauses.append(f"state IN ({','.join('?' * len(allowed_list))})")
+            where_params.extend(allowed_list)
         with self._lock:
-            self._db.execute(
-                f"UPDATE suggestions SET {', '.join(sets)} WHERE suggestion_id=?",
-                (*params, suggestion_id),
+            cur = self._db.execute(
+                f"UPDATE suggestions SET {', '.join(sets)} WHERE {' AND '.join(where_clauses)}",
+                (*params, *where_params),
             )
             self._db.commit()
+            return cur.rowcount
 
     def get_suggestion_by_note_id(self, note_id):
         if self.backend != "sqlite" or self._db is None:
