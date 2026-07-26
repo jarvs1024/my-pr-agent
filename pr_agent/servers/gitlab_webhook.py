@@ -1269,6 +1269,18 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                             content=jsonable_encoder({"message": "apply-mr-update-push-owned"}),
                         )
                     apply_repo_settings(url)
+                    # Seed/refresh the telemetry mr_activity row. An MR created
+                    # by a bot account (e.g. review-bot) has its open webhook
+                    # skipped by is_bot_user, so no opened-state emit ever ran;
+                    # without this upsert the MR stays invisible in the
+                    # dashboard (review_runs exist, mr_activity does not).
+                    # record_mr uses INSERT OR REPLACE with a sticky author.
+                    try:
+                        _emit_mr_activity(data, state='updated')
+                    except Exception as _emit_push_err:
+                        get_logger().warning(
+                            f"push-path _emit_mr_activity failed: {_emit_push_err}"
+                        )
                     _resolve_superseded_suggestions(url)
                     commands_on_push = get_settings().get(f"gitlab.push_commands", {})
                     handle_push_trigger = get_settings().get(f"gitlab.handle_push_trigger", False)
