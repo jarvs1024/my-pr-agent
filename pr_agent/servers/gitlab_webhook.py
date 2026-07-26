@@ -1120,6 +1120,25 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                 # Real push (oldrev set) — apply repo settings before checking
                 # push commands or handle_push_trigger.
                 if object_attributes.get('oldrev'):
+                    # Detect Apply-suggestion commits: GitLab sends both a
+                    # push hook AND a parallel merge_request update hook for
+                    # the same commit. The push hook already runs the apply
+                    # pipeline (which chains apply_commands ending in
+                    # /improve). If we also dispatch push_commands here, we
+                    # double-fire /improve for the same Apply commit — the
+                    # exact "applied once, /improve ran N times" symptom.
+                    apply_event = _resolve_apply_event(data)
+                    if apply_event is not None:
+                        get_logger().info(
+                            f"apply-pipeline: MR update for Apply commit "
+                            f"{apply_event['sha'][:10]} — push hook owns "
+                            "commands; skipping push_commands to avoid "
+                            "duplicate /improve."
+                        )
+                        return JSONResponse(
+                            status_code=status.HTTP_200_OK,
+                            content=jsonable_encoder({"message": "apply-mr-update-push-owned"}),
+                        )
                     apply_repo_settings(url)
                     _resolve_superseded_suggestions(url)
                     commands_on_push = get_settings().get(f"gitlab.push_commands", {})

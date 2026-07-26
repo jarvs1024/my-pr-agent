@@ -169,3 +169,38 @@ def test_rejected_adopt_replies_without_resolving_or_recording(
     assert provider.resolved == []
     assert recorded == []
     assert provider.replies and "请先提交修改" in provider.replies[0][1]
+
+
+def test_adopt_rejects_line_drift_when_target_appears_verbatim(gitlab_webhook_module):
+    """Scenario D: user pushed an unrelated commit that adds a header line
+    at the top of the file. The suggestion's line=1 now points to the
+    header (was 'import sqlite3' before), but the actual target content
+    'import sqlite3' is still present at line 2. The user did NOT modify
+    the suggestion's target code, so /adopt must be rejected."""
+    provider = _Provider(contents={
+        ("service.py", "posted-sha"): "import sqlite3\n\n\ndef run():\n    return 1\n",
+        ("service.py", "current-sha"): "# header\nimport sqlite3\n\n\ndef run():\n    return 1\n",
+    })
+
+    allowed, reason = gitlab_webhook_module._validate_adopt_target_change(provider, _suggestion())
+
+    assert allowed is False
+    assert reason == "target-unchanged"
+
+
+def test_adopt_accepts_real_edit_in_target_region_with_drift(gitlab_webhook_module):
+    """Sanity: user adds a header AND edits the target. The verbatim drift
+    check must NOT mask the real edit — the target content no longer
+    matches verbatim, so /adopt is accepted."""
+    provider = _Provider(contents={
+        ("service.py", "posted-sha"): "import sqlite3\n\n\ndef run():\n    return 1\n",
+        ("service.py", "current-sha"): "# header\nimport sqlite3\n\n\ndef run():\n    return 2\n",
+    })
+
+    allowed, reason = gitlab_webhook_module._validate_adopt_target_change(
+        provider,
+        _suggestion(line=5, line_end=5),  # target = "    return 1"
+    )
+
+    assert allowed is True
+    assert reason == "changed"

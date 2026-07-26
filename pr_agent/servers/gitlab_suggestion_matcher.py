@@ -117,6 +117,27 @@ def target_region_changed(
     line_end: int | None,
     context_lines: int = 1,
 ) -> bool:
+    """Return True when the suggestion's target region has been touched by
+    the user. False when the target code is byte-identical in the current
+    file (modulo line drift / unrelated deletions elsewhere).
+
+    Three-stage check:
+
+      1. **Context window** (legacy): ``difflib.SequenceMatcher`` on the
+         whole file; if the [start-context, end+context] window is fully
+         covered by a single ``equal`` opcode, treat as unchanged. This
+         preserves the original "user edited anywhere in the +/-1 line
+         neighborhood of the suggestion" signal.
+      2. **Length sanity**: if the current file is shorter than the
+         target's last line, the target region was deleted — unchanged.
+      3. **Verbatim drift check**: even when the context window shows a
+         change (e.g. user added a header that shifted every line down),
+         the target content may still appear verbatim elsewhere in the
+         current file. If the longest contiguous equal slice of
+         ``target_posted`` in ``current_lines`` covers the whole target,
+         the user only shifted lines — the suggestion's target code is
+         intact, so we still return False.
+    """
     posted_lines = _normalize_file_lines(posted_content)
     current_lines = _normalize_file_lines(current_content)
     start_line = int(line or 0)
@@ -134,8 +155,42 @@ def target_region_changed(
         current_lines,
         autojunk=False,
     ).get_opcodes()
-    target_is_unchanged = any(
-        tag == "equal" and equal_start <= old_start and old_end <= equal_end
+    # equal_start <= old_start AND equal_end >= old_end
+    # i.e. an equal opcode CONTAINS the [old_start, old_end) window.
+    # The previous shape (``equal_end <= old_end``) required the equal
+    # opcode to fit *inside* the window, which false-positives as soon
+    # as an edit lives in the +/-context area but the target itself is
+    # untouched (the equal opcode straddles the window boundary).
+    primary_unchanged = any(
+        tag == "equal" and equal_start <= old_start and equal_end >= old_end
         for tag, equal_start, equal_end, _, _ in opcodes
     )
-    return not target_is_unchanged
+    if not primary_unchanged:
+        # The +/-1 context window has a real edit (replace / insert /
+        # delete) — accept /adopt.
+        return True
+    # Stage 2: length sanity. If the current file is too short to hold
+    # the target's last line, the target was deleted.
+    if len(current_lines) < end_line:
+        return False
+    # Stage 3: verbatim drift check. The context window was unchanged
+    # in the LCS sense, but verify that the target itself is still
+    # present verbatim — if yes, the user only shifted lines around
+    # without touching the suggestion's target code.
+    target_posted = posted_lines[start_line - 1:end_line]
+    if not target_posted:
+        return False
+    matcher = difflib.SequenceMatcher(a=target_posted, b=current_lines, autojunk=False)
+    longest = 0
+    for tag, i1, i2, _, _ in matcher.get_opcodes():
+        if tag == "equal":
+            longest = max(longest, i2 - i1)
+    if longest >= len(target_posted):
+        # Target content fully present verbatim somewhere in current;
+        # user only added/removed unrelated lines.
+        return False
+    if longest == 0:
+        # Target content entirely missing from current — user replaced
+        # or deleted it without keeping the suggestion's code anywhere.
+        return False
+    return True
