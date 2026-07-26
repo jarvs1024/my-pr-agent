@@ -98,6 +98,17 @@ Repository rule hints (project-specific AGENTS.md rule keys that should be cited
 {%- endif %}
 
 
+{%- if extra_categories %}
+
+
+General bug categories to actively scan for (even when no project rule cites them):
+======
+{% for cat in extra_categories %}- **{{ cat.name }}**: {{ cat.description }} {% if cat.example %}Example: {{ cat.example }}{% endif %}
+{% endfor %}When the new code in the PR diff exhibits any of the above categories, emit a `code_suggestions` entry whose `label` is `{{ '{{ cat.label }}' }}` and whose `suggestion_content` describes the concrete fix. These categories override the upstream default that suppresses suggestions for "non-rule" issues — emit them when you actually see them in the diff, not based on assumed coverage.
+======
+{%- endif %}
+
+
 {%- if repo_context %}
 
 
@@ -113,9 +124,9 @@ The output must be a YAML object equivalent to type $PRCodeSuggestions, accordin
 class CodeSuggestion(BaseModel):
     relevant_file: str = Field(description="Full path of the relevant file")
     language: str = Field(description="Programming language used by the relevant file")
-    existing_code: str = Field(description="A short code snippet, from a '__new hunk__' section after the PR changes, that the suggestion aims to enhance or fix. Include only complete code lines. Use ellipsis (...) for brevity if needed. This snippet should represent the specific PR code targeted for improvement.")
+    existing_code: str = Field(description="A short code snippet, from a '__new hunk__' section after the PR changes, that the suggestion aims to enhance or fix. Include only complete code lines. Use ellipsis (...) for brevity if needed. This snippet should represent the specific PR code targeted for improvement. CRITICAL: existing_code MUST be copied character-for-character from the diff (only line-prefix stripping allowed). Any invented identifier, name, or string literal will cause the suggestion to be rejected by the auto-validator.")
     suggestion_content: str = Field(description="An actionable suggestion to enhance, improve or fix the new code introduced in the PR. Don't present here actual code snippets, just the suggestion. Be short and concise")
-    improved_code: str = Field(description="A refined code snippet that replaces the 'existing_code' snippet after implementing the suggestion.")
+    improved_code: str = Field(description="A refined code snippet that replaces the 'existing_code' snippet after implementing the suggestion. CRITICAL: improved_code MUST be a drop-in replacement for existing_code — only the lines you actually want to change may differ. Identifiers, string literals, table names, and column names must be identical to the original (copy them verbatim).")
     one_sentence_summary: str = Field(description="A concise, single-sentence overview (up to 6 words) of the suggested improvement. Focus on the 'what'. Be general, and avoid method or variable names.")
 {%- if not focus_only_on_problems %}
     label: str = Field(description="A single, descriptive label that best characterizes the suggestion type. Possible labels include 'security', 'possible bug', 'possible issue', 'performance', 'enhancement', 'best practice', 'maintainability', 'typo'. Other relevant labels are also acceptable.")

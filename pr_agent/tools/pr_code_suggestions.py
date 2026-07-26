@@ -132,6 +132,7 @@ class PRCodeSuggestions:
             "extra_instructions": get_settings().pr_code_suggestions.extra_instructions,
             "repo_context": _repo_context_for_vars,
             "agents_md_rules": extract_rule_keys(_repo_context_for_vars),
+            "extra_categories": get_settings().get("pr_code_suggestions.extra_categories", []),
             "commit_messages_str": self.git_provider.get_commit_messages(),
             "relevant_best_practices": "",
             "is_ai_metadata": get_settings().get("config.enable_ai_metadata", False),
