@@ -268,7 +268,8 @@ def test_render_header_drops_timezone_and_wraps_range():
     body = render_markdown(art)
     assert "(Asia/Shanghai)" not in body, "timezone tag should not appear in the header"
     # The 范围 part must be preceded by a <br> so it lands on its own line.
-    assert "<br>> 数据范围:" in body or "<br>\n> 数据范围:" in body
+    # No `>` after the <br> (that would open a new blockquote).
+    assert "<br>数据范围:" in body or "<br>\n数据范围:" in body
     assert "> 生成时间:" in body
 
 
@@ -320,11 +321,13 @@ def test_render_header_drops_time_and_shortens_range():
         },
     )
     body = render_markdown(art)
-    # 数据范围 should be compact: date-only, no time-of-day.
-    assert "> 数据范围: 2026-07-20 ~ 2026-07-26" in body, "数据范围 must be date-only"
+    # 数据范围 uses YYYY/MM/DD slash-separated (matches merged_at column).
+    assert "数据范围: 2026/07/20 ~ 2026/07/26" in body, (
+        "数据范围 must use YYYY/MM/DD slash format"
+    )
     # Time-of-day should not appear next to either side of the range.
-    assert "00:00 ~ 2026-07-26" not in body
-    assert "~ 2026-07-26 23:59" not in body
+    assert "00:00" not in body.split("数据范围:")[1].split("\n")[0]
+    assert "23:59" not in body
     assert "(Asia/Shanghai)" not in body
 
 
@@ -400,3 +403,48 @@ def test_render_master_merges_demotes_llm_description_headings():
     assert "**新增**" in body
     assert "## 本周变更概览" not in body
     assert "### 新增" not in body
+
+
+def test_render_uses_artifact_report_title_and_emoji():
+    """The report title and emoji come from the artifact (which carries
+    the [weekly_report].report_title / .report_emoji resolved at build
+    time), so the same module is reusable across teams."""
+    from datetime import datetime, timezone
+    from pr_agent.reporting.collectors.base import SectionResult
+    from pr_agent.reporting.report import build_artifact, WeeklyArtifact
+    from pr_agent.reporting.renderer import render_markdown
+
+    start = datetime(2026, 7, 20, tzinfo=timezone.utc)
+    end = datetime(2026, 7, 26, 23, 59, 59, tzinfo=timezone.utc)
+    # Caller-supplied artifact with custom title and emoji.
+    art = WeeklyArtifact(
+        project_id=42,
+        week_label="2026-W30",
+        week_start=start,
+        week_end=end,
+        timezone="UTC",
+        sections={
+            "telemetry": SectionResult(status="ok", data={"mr_count": 0, "mr_total": 0, "suggestion_count": 0, "adoption_rate": 0, "severity_breakdown": {}, "top_rules": []}),
+            "master_merges": SectionResult(status="ok", data={"target_branch": "main", "merge_count": 0, "author_count": 0, "additions": 0, "deletions": 0, "mr_list": []}),
+            "repo_scan": SectionResult(status="ok", markdown="### x"),
+        },
+        report_title="SSD自动化代码检视周报",
+        report_emoji="🛠️",
+    )
+    body = render_markdown(art)
+    assert "# 🛠️ SSD自动化代码检视周报" in body
+
+    # build_artifact forwards its kwargs into the artifact, so callers
+    # don't have to construct WeeklyArtifact by hand.
+    art2 = build_artifact(
+        project_id=42, week_start=start, week_end=end, timezone="UTC",
+        sections={"telemetry": SectionResult(status="ok", data={"mr_count": 0, "mr_total": 0, "suggestion_count": 0, "adoption_rate": 0, "severity_breakdown": {}, "top_rules": []})},
+        report_title="通用项目周报",
+    )
+    body2 = render_markdown(art2)
+    assert "# 📊 通用项目周报" in body2
+    # And the JSON-serialised artifact must carry the same fields so
+    # TestMate / DingTalk re-renders downstream stay consistent.
+    d = art2.to_dict()
+    assert d["report_title"] == "通用项目周报"
+    assert d["report_emoji"] == "📊"

@@ -148,6 +148,8 @@ def run_weekly_job(
         week_end=week_end,
         timezone=cfg.timezone,
         sections=sections,
+        report_title=cfg.report_title,
+        report_emoji=cfg.report_emoji,
     )
 
     artifact_path: Path | None = None

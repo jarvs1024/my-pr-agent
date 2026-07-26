@@ -51,6 +51,8 @@ class WeeklyArtifact:
     timezone: str
     sections: dict[str, SectionResult]
     generated_at: datetime | None = None
+    report_title: str = "项目代码检视周报"
+    report_emoji: str = "📊"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -61,6 +63,8 @@ class WeeklyArtifact:
             "week_end": self.week_end.isoformat(),
             "generated_at": (self.generated_at or datetime.now().astimezone()).isoformat(),
             "timezone": self.timezone,
+            "report_title": self.report_title,
+            "report_emoji": self.report_emoji,
             "sections": {name: sr.to_dict() for name, sr in self.sections.items()},
         }
 
@@ -81,6 +85,8 @@ def build_artifact(
     week_end: datetime,
     timezone: str,
     sections: Mapping[str, SectionResult],
+    report_title: str = "项目代码检视周报",
+    report_emoji: str = "📊",
 ) -> WeeklyArtifact:
     return WeeklyArtifact(
         project_id=project_id,
@@ -90,6 +96,8 @@ def build_artifact(
         timezone=timezone,
         sections=dict(sections),
         generated_at=datetime.now().astimezone(),
+        report_title=report_title,
+        report_emoji=report_emoji,
     )
 
 

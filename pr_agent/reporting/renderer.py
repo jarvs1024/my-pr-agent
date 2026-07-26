@@ -91,29 +91,37 @@ def _wrap(s: str, width: int = 22) -> str:
 
 def render_markdown(artifact: WeeklyArtifact, *, project_name: str | None = None) -> str:
     parts: list[str] = []
-    title = "# 📊 SSD自动化代码检视周报"
+    # Title text + emoji come from the artifact (driven by
+    # [weekly_report].report_title / report_emoji in settings, or the
+    # PR_AGENT_WEEKLY_REPORT_TITLE / _EMOJI env vars). Same module is
+    # therefore reusable across teams (e.g. an "SSD自动化代码检视周报"
+    # deployment vs a generic "项目代码检视周报" deployment).
+    emoji = (artifact.report_emoji or "").strip() or "📊"
+    title = f"# {emoji} {artifact.report_title}"
     if project_name:
         title += f" — {project_name}"
     title += f" — {artifact.week_label}\n"
 
     # Trim the date strings inside blockquotes so they wrap cleanly.
     def _short(iso: str) -> str:
+        # "YYYY-MM-DDTHH:MM" -> "YYYY-MM-DD HH:MM" (16 chars, dash-separated)
         return iso[:16].replace("T", " ") if iso else ""
 
-    def _date_only(iso: str) -> str:
-        return iso[:10] if iso else ""
+    def _slashy(iso: str) -> str:
+        # "YYYY-MM-DD" -> "YYYY/MM/DD" so the 数据范围 line matches the
+        # merged_at column format downstream. Time-of-day portion is
+        # discarded (always 00:00 / 23:59 in weekly reports anyway).
+        return iso[:10].replace("-", "/") if iso else ""
 
     parts.append(
         title
         + "\n"
-        # Drop the timezone tag from the header (no longer useful in the
-        # DingTalk panel — the artifact JSON still carries it). Use a
-        # <br> inside the blockquote so the 范围 part always lands on its
-        # own line regardless of how DingTalk wraps the preceding text.
+        # Drop the timezone tag from the header (artifact JSON still
+        # carries it). Use a <br> inside the blockquote so the 数据范围
+        # part always lands on its own line regardless of how DingTalk
+        # wraps the preceding 生成时间 line.
         + f"> 生成时间: {_short(artifact.generated_at.isoformat() if artifact.generated_at else '')}"
-        # Drop the redundant time-of-day portion of week_start/week_end
-        # (always 00:00 / 23:59) so the 数据范围 line fits on a single row.
-        + f"<br>数据范围: {_date_only(artifact.week_start.isoformat())} ~ {_date_only(artifact.week_end.isoformat())}\n"
+        + f"<br>数据范围: {_slashy(artifact.week_start.isoformat())} ~ {_slashy(artifact.week_end.isoformat())}\n"
     )
 
     failures: list[str] = []

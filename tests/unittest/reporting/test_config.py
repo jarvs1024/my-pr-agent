@@ -50,3 +50,19 @@ def test_repo_clone_dir_derives_from_pr_agent_data_dir(monkeypatch, tmp_path):
     monkeypatch.delenv("PR_AGENT_WEEKLY_REPO_CLONE_DIR", raising=False)
     cfg = load_config()
     assert cfg.repo_clone_dir == str(tmp_path) + "/repo_scan_cache"
+
+
+def test_report_title_and_emoji_have_sensible_defaults(monkeypatch):
+    """Title and emoji defaults keep the report usable out of the box
+    without forcing every project to configure them."""
+    cfg = load_config()
+    assert cfg.report_title == "项目代码检视周报"
+    assert cfg.report_emoji == "📊"
+
+
+def test_report_title_and_emoji_take_env_overrides(monkeypatch):
+    monkeypatch.setenv("PR_AGENT_WEEKLY_REPORT_TITLE", "SSD自动化代码检视周报")
+    monkeypatch.setenv("PR_AGENT_WEEKLY_REPORT_EMOJI", "🛠️")
+    cfg = load_config()
+    assert cfg.report_title == "SSD自动化代码检视周报"
+    assert cfg.report_emoji == "🛠️"

@@ -57,6 +57,8 @@ class WeeklyReportConfig:
     dingtalk_retry_attempts: int = 3
     diff_token_limit: int = 50000
     markdown_chunk_limit: int = 18000
+    report_title: str = "项目代码检视周报"
+    report_emoji: str = "📊"
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -157,10 +159,19 @@ def load_config() -> WeeklyReportConfig:
             "PR_AGENT_WEEKLY_MARKDOWN_CHUNK_LIMIT",
             int(block.get("markdown_chunk_limit", 18000)),
         ),
+        report_title=_env_str(
+            "PR_AGENT_WEEKLY_REPORT_TITLE",
+            str(block.get("report_title", "项目代码检视周报")),
+        ),
+        report_emoji=_env_str(
+            "PR_AGENT_WEEKLY_REPORT_EMOJI",
+            str(block.get("report_emoji", "📊")),
+        ),
         extra={k: v for k, v in block.items() if k not in {
             "enabled", "target_project_id", "cron", "timezone", "collectors",
             "notifier", "llm_model", "llm_dry_run", "repo_clone_dir",
             "dingtalk_webhook_env", "dingtalk_secret_env", "dingtalk_dry_run",
             "dingtalk_retry_attempts", "diff_token_limit", "markdown_chunk_limit",
+            "report_title", "report_emoji",
         }},
     )
