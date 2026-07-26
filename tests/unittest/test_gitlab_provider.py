@@ -48,7 +48,11 @@ class TestGitLabProvider:
         mock_project.files.get.assert_called_once_with("CHANGELOG.md", "main")
         mock_file.decode.assert_called_once()
 
-    def test_publish_code_suggestions_uses_inclusive_line_range(self):
+    def test_publish_code_suggestions_falls_back_to_inclusive_line_range(self):
+        """Without existing_code / unknown body, fall back to the
+        inclusive ``relevant_lines_end - start + 1`` for both ``-N``
+        and ``+M`` so the suggestion still anchors correctly.
+        """
         provider = GitLabProvider.__new__(GitLabProvider)
         target_file = MagicMock(filename="app.py", old_filename="app.py")
         target_file.head_file = "\n".join(f"line {line}" for line in range(1, 7))
@@ -56,7 +60,7 @@ class TestGitLabProvider:
         provider.send_inline_comment = MagicMock(return_value="discussion-id")
 
         provider.publish_code_suggestions([{
-            "body": "```suggestion\nline 30\nline 31\nline 32\nline 33\nline 34\n```",
+            "body": "**Suggestion:** x [L]\n```suggestion\nline 30\nline 31\nline 32\nline 33\nline 34\n```\n\n✅ ...",
             "relevant_file": "app.py",
             "relevant_lines_start": 2,
             "relevant_lines_end": 6,
@@ -64,7 +68,61 @@ class TestGitLabProvider:
         }])
 
         body = provider.send_inline_comment.call_args.args[0]
-        assert "```suggestion:-0+5\n" in body
+        assert "```suggestion:-5+5\n" in body
+
+    def test_publish_code_suggestions_uses_existing_code_line_count(self):
+        """The ``-N`` half of the GitLab ``:-N+M`` marker must mirror the
+        LLM's ``existing_code`` rather than the inclusive line range,
+        otherwise the marker overwrites lines outside the LLM's actual
+        target. The ``+M`` half mirrors the body block beneath
+        ``\`\`\`suggestion``. Both halves are derived from the actual
+        code the LLM emitted so the marker stays honest when the LLM
+        anchors at an inner function but ``relevant_lines_end`` lands
+        on the outer body line.
+        """
+        provider = GitLabProvider.__new__(GitLabProvider)
+        # Pad to >= 55 lines so the relevant_lines_start=53 index lookup inside
+        # publish_code_suggestions succeeds; only the marker logic is asserted below.
+        _head_lines = [
+            f"def outer_helper_line_{i}(): pass" for i in range(1, 56)
+        ]
+        target_file = MagicMock(filename="nested.py", old_filename="nested.py")
+        target_file.head_file = "\n".join(_head_lines)
+        provider.get_diff_files = MagicMock(return_value=[target_file])
+        provider.send_inline_comment = MagicMock(return_value="discussion-id")
+
+        existing_code = (
+            "def nested():\n"
+            "        return sum(range(8))\n"
+        )
+        new_code = (
+            "def nested() -> int:\n"
+            '    \"\"\"Compute the sum of the first eight integers.\"\"\"\n'
+            "        return sum(range(8))\n"
+        )
+        body = (
+            "**Suggestion:** x [L]\n"
+            "```suggestion\n"
+            f"{new_code}\n"
+            "```\n\n✅ ..."
+        )
+
+        provider.publish_code_suggestions([{
+            "body": body,
+            "relevant_file": "nested.py",
+            "relevant_lines_start": 53,
+            "relevant_lines_end": 55,
+            "original_suggestion": {
+                "existing_code": existing_code,
+                "improved_code": new_code,
+            },
+        }])
+
+        rendered = provider.send_inline_comment.call_args.args[0]
+        # The bug guard: the marker must NOT cover 3 source lines, only the
+        # 2 lines the LLM explicitly intended to replace.
+        assert "```suggestion:-2+3\n" in rendered
+        assert "```suggestion:-3+3\n" not in rendered
 
     def test_get_pr_file_content_with_bytes(self, gitlab_provider, mock_project):
         mock_file = MagicMock(ProjectFile)
