@@ -80,3 +80,27 @@ def test_write_artifact_round_trip(tmp_path):
     assert path.exists()
     assert path.parent.name == "42"
     assert path.name.startswith("2026-W")
+
+
+def test_wrap_helper_inserts_br_at_word_boundaries():
+    from pr_agent.reporting.renderer import _wrap
+    # short string returns as-is
+    assert _wrap("short title", width=22) == "short title"
+    # exactly at threshold: unchanged
+    assert _wrap("a" * 22, width=22) == "a" * 22
+    # long single word: returned untouched (no whitespace to break on)
+    word = "verylongwordwithoutspaces" * 3
+    assert _wrap(word, width=10) == word
+    # multi-word long string: gets <br> and respects pipe escaping
+    out = _wrap("B: marker-fix verify - class + nested function", width=18)
+    # All words must survive (just in different chunks)
+    for word in ("B:", "marker-fix", "verify", "class", "+", "nested", "function"):
+        assert word in out
+    assert out.count("<br>") >= 1
+    # pipe in input escaped so markdown table is not broken
+    out2 = _wrap("foo | bar baz qux quux", width=10)
+    assert "\\|" in out2
+    # empty / falsy inputs return empty
+    assert _wrap("") == ""
+    assert _wrap(None) == ""  # type: ignore[arg-type]
+# (appended via previous call)

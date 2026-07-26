@@ -25,6 +25,42 @@ SECTION_TITLES = {
 }
 
 
+def _wrap(s: str, width: int = 22) -> str:
+    """Wrap a long string at word boundaries, joining lines with ``<br>``.
+
+    DingTalk markdown tables don't auto-wrap long cells in the rendered panel,
+    so a 60-char title in one cell looks horizontally truncated. Inserting
+    ``<br>`` between roughly ``width``-char chunks forces the cell to break
+    across multiple lines and show the full string.
+    """
+    if not s:
+        return ""
+    s = s.replace("|", "\\|").replace("\n", " ")
+    if len(s) <= width:
+        return s
+    words = s.split(" ")
+    out: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
+    for w in words:
+        if not cur:
+            cur = [w]
+            cur_len = len(w)
+            continue
+        if cur_len + 1 + len(w) > width:
+            out.append(" ".join(cur))
+            cur = [w]
+            cur_len = len(w)
+        else:
+            cur.append(w)
+            cur_len += 1 + len(w)
+    if cur:
+        out.append(" ".join(cur))
+    return "<br>".join(out)
+
+
+
+
 def render_markdown(artifact: WeeklyArtifact, *, project_name: str | None = None) -> str:
     parts: list[str] = []
     title = "# 📊 项目代码检视周报"
@@ -78,49 +114,56 @@ def _render_section(name: str, section: SectionResult) -> str:
 
 
 def _render_telemetry(data: dict[str, Any]) -> str:
-    """Compact, narrow-column friendly rendering for DingTalk markdown.
+    """Render the telemetry section as a table of tables.
 
-    DingTalk markdown panels truncate wide cells. We:
-    * put each metric on its own line (no wide tables with inline code)
-    * render severity / rules as vertical sub-lists (no /-separators)
-    * strip backticks so long rule keys wrap
+    Each sub-block is its own compact markdown table so DingTalk clients
+    keep the layout tidy; long strings inside a cell are broken at word
+    boundaries with ``<br>`` (DingTalk does not auto-wrap table cells).
+    Backticks are stripped from rule keys because inline code with long
+    bodies does not wrap.
     """
     mr_count = data.get("mr_count", 0)
     mr_total = data.get("mr_total", 0)
     suggestion_count = data.get("suggestion_count", 0)
     adoption_pct = round(float(data.get("adoption_rate", 0)) * 100, 1)
-
     sev = data.get("severity_breakdown") or {}
     rules = data.get("top_rules") or []
 
-    lines: list[str] = [
-        f"- 本周窗口 MR 数: **{mr_count}**",
-        f"- 项目累计 MR 数: **{mr_total}**",
-        f"- 累计 suggestion 数: **{suggestion_count}**",
-        f"- 采纳率: **{adoption_pct}%**",
+    out: list[str] = [
+        "**本周指标**",
+        "",
+        "| 指标 | 数值 |",
+        "|---|---|",
+        f"| 本周窗口 MR 数 | {mr_count} |",
+        f"| 项目累计 MR 数 | {mr_total} |",
+        f"| 累计 suggestion 数 | {suggestion_count} |",
+        f"| 采纳率 | {adoption_pct}% |",
         "",
         "**severity 分布**",
+        "",
     ]
     if sev:
-        # Two-column sub-table (severity / count) — fits even narrow panels.
-        lines.append("")
-        lines.append("| severity | count |")
-        lines.append("|---|---|")
+        out.append("| severity | count |")
+        out.append("|---|---|")
         for k, v in sev.items():
-            lines.append(f"| {k} | {v} |")
+            out.append(f"| {k} | {v} |")
     else:
-        lines.append("- (无)")
+        out.append("_(无)_")
 
-    lines.append("")
-    lines.append("**触发最多的规则**")
+    out.append("")
+    out.append("**触发最多的规则**")
+    out.append("")
     if rules:
+        out.append("| 规则 | 触发次数 |")
+        out.append("|---|---|")
         for rk, n in rules[:5]:
-            # No backticks — they break wrapping in DingTalk
-            lines.append(f"- {rk} ×{n}")
+            # Strip backticks: long inline-code strings do not wrap in
+            # DingTalk. _wrap() inserts <br> for rule names > width.
+            out.append(f"| {_wrap(rk, width=24)} | {n} |")
     else:
-        lines.append("- (无)")
+        out.append("_(无)_")
 
-    return "\n".join(lines)
+    return "\n".join(out)
 
 
 def _render_master_merges(data: dict[str, Any]) -> str:
@@ -147,12 +190,11 @@ def _render_master_merges(data: dict[str, Any]) -> str:
         merged_at = (mr.get("merged_at") or "")[:16].replace("T", " ")
         url = mr.get("url") or ""
         cell = f"[!{iid}]({url})" if url else f"!{iid}"
-        # DingTalk truncates wide cells; trim title to fit. The full
-        # title is preserved in the JSON artifact for TestMate.
-        title_short = (title or "").replace("|", "\\|").replace("\n", " ")
-        if len(title_short) > 32:
-            title_short = title_short[:31] + "…"
-        rows.append(f"| {cell} | {title_short} | {author} | {merged_at} |")
+        # Wrap the full title with <br> at word boundaries so DingTalk
+        # shows the complete title on multiple lines instead of
+        # horizontally truncating it. The full title is preserved in the
+        # JSON artifact for TestMate.
+        rows.append(f"| {cell} | {_wrap(title, width=22)} | {author} | {merged_at} |")
     return head + "\n" + "\n".join(rows)
 
 
