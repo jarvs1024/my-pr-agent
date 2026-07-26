@@ -28,6 +28,31 @@ SECTION_TITLES = {
 }
 
 
+_HEADING_RE = __import__("re").compile(r"^#{1,6}\s+(.+?)\s*$")
+
+
+def _demote_llm_headings(md: str | None) -> str:
+    """Demote LLM-produced ``#`` heading lines to ``**bold**`` so they
+    don't render as oversized titles in narrow DingTalk panels.
+
+    Tolerant: unknown / non-conforming LLM output is unchanged so we
+    never throw inside a render path.
+    """
+    if not md:
+        return md or ""
+    out_lines: list[str] = []
+    for line in md.splitlines():
+        m = _HEADING_RE.match(line.rstrip())
+        if not m:
+            out_lines.append(line)
+            continue
+        title = m.group(1).strip()
+        # Drop any trailing ## / # markers and wrap as bold.
+        out_lines.append(f"**{title}**")
+    return "\n".join(out_lines)
+
+
+
 def _wrap(s: str, width: int = 22) -> str:
     """Wrap a long string at word boundaries, joining lines with ``<br>``.
 
@@ -75,6 +100,9 @@ def render_markdown(artifact: WeeklyArtifact, *, project_name: str | None = None
     def _short(iso: str) -> str:
         return iso[:16].replace("T", " ") if iso else ""
 
+    def _date_only(iso: str) -> str:
+        return iso[:10] if iso else ""
+
     parts.append(
         title
         + "\n"
@@ -83,7 +111,9 @@ def render_markdown(artifact: WeeklyArtifact, *, project_name: str | None = None
         # <br> inside the blockquote so the 范围 part always lands on its
         # own line regardless of how DingTalk wraps the preceding text.
         + f"> 生成时间: {_short(artifact.generated_at.isoformat() if artifact.generated_at else '')}"
-        + f"<br>> 数据范围: {_short(artifact.week_start.isoformat())} ~ {_short(artifact.week_end.isoformat())}\n"
+        # Drop the redundant time-of-day portion of week_start/week_end
+        # (always 00:00 / 23:59) so the 数据范围 line fits on a single row.
+        + f"<br>> 数据范围: {_date_only(artifact.week_start.isoformat())} ~ {_date_only(artifact.week_end.isoformat())}\n"
     )
 
     failures: list[str] = []
@@ -114,12 +144,17 @@ def render_markdown(artifact: WeeklyArtifact, *, project_name: str | None = None
 
 def _render_section(name: str, section: SectionResult) -> str:
     if section.markdown:
-        return section.markdown.strip()
+        # Defensively demote any `#` headings the LLM emitted so they
+        # render as bold rather than oversized titles.
+        return _demote_llm_headings(section.markdown).strip()
 
     data = section.data or {}
     if name == "telemetry":
         return _render_telemetry(data)
     if name == "master_merges":
+        # Pre-rendered LLM Description markdown — demote headings inline.
+        cleaned = (data or {}).get("llm_description_markdown", "")
+        data = {**(data or {}), "llm_description_markdown": _demote_llm_headings(cleaned)}
         return _render_master_merges(data)
     return ""
 

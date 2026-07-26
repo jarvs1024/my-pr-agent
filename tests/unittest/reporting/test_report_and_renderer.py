@@ -270,3 +270,133 @@ def test_render_header_drops_timezone_and_wraps_range():
     # The 范围 part must be preceded by a <br> so it lands on its own line.
     assert "<br>> 数据范围:" in body or "<br>\n> 数据范围:" in body
     assert "> 生成时间:" in body
+
+
+def test_demote_llm_headings_strips_hash_blocks():
+    """LLM-emitted ``#`` headings should become **bold** so narrow
+    DingTalk panels don't render them as oversized titles."""
+    from pr_agent.reporting.renderer import _demote_llm_headings
+    md = (
+        "## 本周变更概览\n"
+        "本周合并 4 个 MR ...\n\n"
+        "### 新增\n"
+        "- foo.py\n\n"
+        "#### 嵌套标题\n"
+        "深层级也会降级\n"
+    )
+    out = _demote_llm_headings(md)
+    # No `#` heading markers survive.
+    assert "#" not in out
+    assert "**本周变更概览**" in out
+    assert "**新增**" in out
+    assert "**嵌套标题**" in out
+    # Bullet content untouched.
+    assert "- foo.py" in out
+    # Tolerant: empty / non-conforming inputs pass through.
+    assert _demote_llm_headings("") == ""
+    assert _demote_llm_headings(None) == ""
+
+
+def test_render_header_drops_time_and_shortens_range():
+    """The 数据范围 line should drop the redundant time-of-day portion
+    (always 00:00 / 23:59 in weekly reports) so it fits on a single
+    row in narrow DingTalk panels."""
+    from datetime import datetime, timezone
+    from pr_agent.reporting.collectors.base import SectionResult
+    from pr_agent.reporting.report import build_artifact
+    from pr_agent.reporting.renderer import render_markdown
+
+    start = datetime(2026, 7, 20, tzinfo=timezone.utc)
+    end = datetime(2026, 7, 26, 23, 59, 59, tzinfo=timezone.utc)
+    art = build_artifact(
+        project_id=42,
+        week_start=start,
+        week_end=end,
+        timezone="Asia/Shanghai",
+        sections={
+            "telemetry": SectionResult(status="ok", data={"mr_count": 0, "mr_total": 0, "suggestion_count": 0, "adoption_rate": 0, "severity_breakdown": {}, "top_rules": []}),
+            "master_merges": SectionResult(status="ok", data={"target_branch": "main", "merge_count": 0, "author_count": 0, "additions": 0, "deletions": 0, "mr_list": []}),
+            "repo_scan": SectionResult(status="ok", markdown="### x"),
+        },
+    )
+    body = render_markdown(art)
+    # 数据范围 should be compact: date-only, no time-of-day.
+    assert "> 数据范围: 2026-07-20 ~ 2026-07-26" in body, "数据范围 must be date-only"
+    # Time-of-day should not appear next to either side of the range.
+    assert "00:00 ~ 2026-07-26" not in body
+    assert "~ 2026-07-26 23:59" not in body
+    assert "(Asia/Shanghai)" not in body
+
+
+def test_render_repo_scan_section_demotes_llm_headings():
+    """Section 三 passes through section.markdown (LLM-produced). Any
+    ``### foo`` heading lines from MiniMax-M3 should be demoted to
+    ``**foo**`` so they don't render as oversized titles."""
+    from datetime import datetime, timezone
+    from pr_agent.reporting.collectors.base import SectionResult
+    from pr_agent.reporting.report import build_artifact
+    from pr_agent.reporting.renderer import render_markdown
+
+    start = datetime(2026, 7, 20, tzinfo=timezone.utc)
+    end = datetime(2026, 7, 26, 23, 59, 59, tzinfo=timezone.utc)
+    art = build_artifact(
+        project_id=42,
+        week_start=start,
+        week_end=end,
+        timezone="UTC",
+        sections={
+            "telemetry": SectionResult(status="ok", data={"mr_count": 0, "mr_total": 0, "suggestion_count": 0, "adoption_rate": 0, "severity_breakdown": {}, "top_rules": []}),
+            "master_merges": SectionResult(status="ok", data={"target_branch": "main", "merge_count": 0, "author_count": 0, "additions": 0, "deletions": 0, "mr_list": []}),
+            "repo_scan": SectionResult(
+                status="ok",
+                markdown="### 高风险模块\n- file_a.py\n\n### 测试覆盖\n- coverage 0%",
+            ),
+        },
+    )
+    body = render_markdown(art)
+    # Demoted headings survived as bold.
+    assert "**高风险模块**" in body
+    assert "**测试覆盖**" in body
+    # No markdown heading markers leaked through.
+    assert "### 高风险模块" not in body
+    assert "### 测试覆盖" not in body
+
+
+def test_render_master_merges_demotes_llm_description_headings():
+    """Same demotion applies to the LLM Description block in section 二."""
+    from datetime import datetime, timezone
+    from pr_agent.reporting.collectors.base import SectionResult
+    from pr_agent.reporting.report import build_artifact
+    from pr_agent.reporting.renderer import render_markdown
+
+    start = datetime(2026, 7, 20, tzinfo=timezone.utc)
+    end = datetime(2026, 7, 26, 23, 59, 59, tzinfo=timezone.utc)
+    art = build_artifact(
+        project_id=42,
+        week_start=start,
+        week_end=end,
+        timezone="UTC",
+        sections={
+            "telemetry": SectionResult(status="ok", data={"mr_count": 0, "mr_total": 0, "suggestion_count": 0, "adoption_rate": 0, "severity_breakdown": {}, "top_rules": []}),
+            "master_merges": SectionResult(
+                status="ok",
+                data={
+                    "target_branch": "main",
+                    "merge_count": 1,
+                    "author_count": 1,
+                    "additions": 5,
+                    "deletions": 0,
+                    "mr_list": [
+                        {"iid": 1, "title": "x", "author": "a", "merged_at": "2026-07-25T00:00:00Z", "url": "u", "source_branch": "s", "target_branch": "main"},
+                    ],
+                    "llm_description_markdown": "## 本周变更概览\n本周仅 1 个 MR, ...\n\n### 新增\n- foo.py",
+                },
+            ),
+            "repo_scan": SectionResult(status="ok", markdown="### x"),
+        },
+    )
+    body = render_markdown(art)
+    assert "**本周变更概览**" in body
+    assert "**新增**" in body
+    assert "## 本周变更概览" not in body
+    assert "### 新增" not in body
