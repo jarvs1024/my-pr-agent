@@ -112,7 +112,6 @@ def _ctx_extra(ctx: CollectorContext) -> dict[str, Any]:
     extra = getattr(ctx, "extra", None)
     if isinstance(extra, dict):
         return extra
-    # Fallback: read from WeeklyReportConfig.extra via env override (WEEKLY_EXTRA__key=value)
     out: dict[str, Any] = {}
     prefix = "WEEKLY_EXTRA__"
     for k, v in os.environ.items():
@@ -134,21 +133,17 @@ def _resolve_project_path(ctx: CollectorContext) -> str:
     4. Hardcoded fallback (``root/auto-review-test``) — preserved from upstream so an
        unconfigured install still produces a runnable (if wrong) URL.
 
-    Returns the bare path segment (no leading slash, no trailing ``.git``); the caller
-    appends ``.git`` if needed.
+    Returns the bare path segment (no leading slash, no trailing ``.git``).
     """
-    # 1. env override (operator escape hatch)
     env_path = os.environ.get("WEEKLY_REPO_PATH", "").strip().strip("/")
     if env_path:
         return env_path
 
-    # 2. toml override via ctx.extra — populated from [weekly_report] extra keys
     extra = _ctx_extra(ctx)
     toml_override = (extra.get("repo_path_override") or "").strip().strip("/")
     if toml_override:
         return toml_override
 
-    # 3. live GitLab API lookup
     if ctx.target_project_id:
         try:
             import gitlab  # type: ignore
@@ -163,7 +158,6 @@ def _resolve_project_path(ctx: CollectorContext) -> str:
         except Exception as exc:  # noqa: BLE001
             _log.warning("repo_scan: GitLab API lookup failed (%s); falling back", exc)
 
-    # 4. upstream fallback (kept so behavior matches the original hardcoded branch)
     return "root/auto-review-test"
 
 
@@ -186,7 +180,6 @@ def _collect_diff(repo: Path, branch: str, week_start: datetime, week_end: datet
     since = _format_date(week_start)
     until = _format_date(week_end)
 
-    # Walk the last N commits on the branch within the window.
     log_format = "%h%x09%an%x09%ad%x09%s"
     log_out = _run(
         ["git", "log", branch, f"--since={since}", f"--until={until}", "--no-merges", f"--pretty=format:{log_format}", "--date=iso"],
@@ -206,7 +199,6 @@ def _collect_diff(repo: Path, branch: str, week_start: datetime, week_end: datet
     if not commits:
         return "", {"files_changed": 0, "additions": 0, "deletions": 0, "commits": 0, "truncated": 0}
 
-    # Build a single combined diff for the entire window (capped).
     range_expr = f"{commits[-1][0]}..{commits[0][0]}"
     full_diff = _run(
         ["git", "diff", range_expr, "--stat", "--no-color"],
@@ -214,13 +206,12 @@ def _collect_diff(repo: Path, branch: str, week_start: datetime, week_end: datet
         timeout=60,
     )
     stat_lines = full_diff.splitlines()
-    files_changed = max(0, len(stat_lines) - 1) if stat_lines else 0  # last is summary
+    files_changed = max(0, len(stat_lines) - 1) if stat_lines else 0
     additions = 0
     deletions = 0
     for line in stat_lines:
         if " changed" in line or " insertion" in line or " deletion" in line:
             try:
-                # lines like " 3 files changed, 12 insertions(+), 4 deletions(-)"
                 if "insertion" in line:
                     additions += int(line.split("insertion")[0].rsplit(",", 1)[-1].split()[-1])
                 if "deletion" in line:
@@ -237,11 +228,63 @@ def _collect_diff(repo: Path, branch: str, week_start: datetime, week_end: datet
     truncated = 0
     if len(diff_text) > token_limit:
         truncated = 1
-        # Keep the first chunk plus a marker.
         diff_text = diff_text[:token_limit] + "\n\n... (diff truncated for LLM context window)\n"
 
     stats.update({"files_changed": files_changed, "additions": additions, "deletions": deletions, "truncated": truncated})
     return diff_text, stats
+
+
+_LLM_INIT_DONE = False
+
+
+def _init_litellm_from_settings() -> None:
+    """Populate ``litellm.api_key`` and provider env vars from pr-agent settings.
+
+    The webhook normally triggers ``LiteLLMAIHandler.__init__`` on each request,
+    which mirrors the same environment. The standalone scheduler has no such
+    bootstrap, so we replicate the minimum surface needed for ``litellm.completion``.
+    """
+    global _LLM_INIT_DONE
+    if _LLM_INIT_DONE:
+        return
+    try:
+        from pr_agent.config_loader import get_settings
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("repo_scan: settings loader unavailable (%s); skipping LLM bootstrap", exc)
+        return
+
+    settings = get_settings()
+
+    openai_key = (
+        settings.get("OPENAI.KEY")
+        or settings.get("openai.key")
+        or os.environ.get("OPENAI_API_KEY")
+    )
+    if openai_key:
+        os.environ.setdefault("OPENAI_API_KEY", openai_key)
+
+    deepseek_key = settings.get("DEEPSEEK.KEY") or os.environ.get("DEEPSEEK_API_KEY")
+    if deepseek_key:
+        os.environ.setdefault("DEEPSEEK_API_KEY", deepseek_key)
+
+    openai_base = settings.openai.get("api_base") if hasattr(settings, "openai") else None
+    if openai_base and not os.environ.get("OPENAI_API_BASE"):
+        os.environ["OPENAI_API_BASE"] = openai_base
+
+    try:
+        import litellm  # type: ignore
+        if openai_key:
+            litellm.api_key = openai_key
+            litellm.openai_key = openai_key
+    except Exception:  # pragma: no cover
+        pass
+
+    _LLM_INIT_DONE = True
+    _log.info(
+        "repo_scan: litellm bootstrap done (openai_key=%d_chars, base=%s)",
+        len(openai_key) if openai_key else 0,
+        openai_base or "(unset)",
+    )
 
 
 def _call_llm(prompt: str, model: str, dry_run: bool) -> str:
@@ -256,6 +299,7 @@ def _call_llm(prompt: str, model: str, dry_run: bool) -> str:
             "### 建议跟进\n"
             "- (mock) 后续接入真实 LLM 时, 增加 retry + timeout 控制\n"
         )
+    _init_litellm_from_settings()
     try:
         import litellm  # type: ignore
     except ImportError as exc:  # pragma: no cover
@@ -289,7 +333,6 @@ class RepoScanCollector:
             return SectionResult(status="failed", error="target_project_id not configured")
 
         clone_dir = Path(ctx.repo_clone_dir) / str(ctx.target_project_id)
-        # Resolve the project path *outside* _resolve_remote_url so we can log it once.
         project_path = _resolve_project_path(ctx)
         _log.info("repo_scan: using project path=%s for target_project_id=%s", project_path, ctx.target_project_id)
         remote_url = _gitlab_url_with_token(_resolve_remote_url(ctx, self.gitlab_url, project_path))
@@ -344,4 +387,4 @@ def _detect_default_branch(repo: Path) -> str:
         return "main"
 
 
-__all__ = ["RepoScanCollector", "_resolve_project_path", "_ctx_extra"]
+__all__ = ["RepoScanCollector", "_resolve_project_path", "_ctx_extra", "_call_llm"]
