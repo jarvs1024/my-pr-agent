@@ -107,9 +107,57 @@ def _ensure_clone(clone_dir: Path, remote_url: str) -> Path:
     return clone_dir
 
 
-def _resolve_remote_url(ctx: CollectorContext, gl_url: str | None = None) -> str:
+def _resolve_project_path(ctx: CollectorContext) -> str:
+    """Resolve the GitLab project ``path_with_namespace`` for ``ctx.target_project_id``.
+
+    Resolution order (first non-empty wins):
+    1. ``WEEKLY_REPO_PATH`` env var (e.g. ``epc/dml_epc_auto``) — operator override
+    2. ``ctx.extra["repo_path_override"]`` — [weekly_report] table in configuration.toml
+    3. GitLab API ``GET /projects/:id`` via ``GITLAB_URL`` + ``GITLAB_PERSONAL_ACCESS_TOKEN``
+    4. Hardcoded fallback (``root/auto-review-test``) — preserved from upstream so an
+       unconfigured install still produces a runnable (if wrong) URL.
+
+    Returns the bare path segment (no leading slash, no trailing ``.git``); the caller
+    appends ``.git`` if needed.
+    """
+    # 1. env override (operator escape hatch)
+    env_path = os.environ.get("WEEKLY_REPO_PATH", "").strip().strip("/")
+    if env_path:
+        return env_path
+
+    # 2. toml override via ctx.extra — populated from [weekly_report] extra keys
+    if isinstance(ctx.extra, dict):
+        toml_override = (ctx.extra.get("repo_path_override") or "").strip().strip("/")
+        if toml_override:
+            return toml_override
+
+    # 3. live GitLab API lookup
+    if ctx.target_project_id:
+        try:
+            import gitlab  # type: ignore
+            base = os.environ.get("GITLAB_URL", "https://gitlab.com").rstrip("/")
+            token = os.environ.get("GITLAB_PERSONAL_ACCESS_TOKEN", "")
+            gl = gitlab.Gitlab(base, private_token=token, ssl_verify=False)
+            project = gl.projects.get(ctx.target_project_id)
+            p = (project.path_with_namespace or "").strip().strip("/")
+            if p:
+                _log.info("repo_scan: resolved project %s -> %s", ctx.target_project_id, p)
+                return p
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("repo_scan: GitLab API lookup failed (%s); falling back", exc)
+
+    # 4. upstream fallback (kept so behavior matches the original hardcoded branch)
+    return "root/auto-review-test"
+
+
+def _resolve_remote_url(
+    ctx: CollectorContext,
+    gl_url: str | None = None,
+    project_path: str | None = None,
+) -> str:
     base = gl_url or os.environ.get("GITLAB_URL", "https://gitlab.com")
-    return f"{base.rstrip('/')}/root/auto-review-test.git"
+    path = (project_path or _resolve_project_path(ctx)).strip().strip("/")
+    return f"{base.rstrip('/')}/{path}.git"
 
 
 def _format_date(dt: datetime) -> str:
@@ -224,7 +272,10 @@ class RepoScanCollector:
             return SectionResult(status="failed", error="target_project_id not configured")
 
         clone_dir = Path(ctx.repo_clone_dir) / str(ctx.target_project_id)
-        remote_url = _gitlab_url_with_token(_resolve_remote_url(ctx, self.gitlab_url))
+        # Resolve the project path *outside* _resolve_remote_url so we can log it once.
+        project_path = _resolve_project_path(ctx)
+        _log.info("repo_scan: using project path=%s for target_project_id=%s", project_path, ctx.target_project_id)
+        remote_url = _gitlab_url_with_token(_resolve_remote_url(ctx, self.gitlab_url, project_path))
 
         try:
             repo_path = _ensure_clone(clone_dir, remote_url)
@@ -276,4 +327,4 @@ def _detect_default_branch(repo: Path) -> str:
         return "main"
 
 
-__all__ = ["RepoScanCollector"]
+__all__ = ["RepoScanCollector", "_resolve_project_path"]
