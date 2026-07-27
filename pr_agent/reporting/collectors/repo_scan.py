@@ -107,12 +107,29 @@ def _ensure_clone(clone_dir: Path, remote_url: str) -> Path:
     return clone_dir
 
 
+def _ctx_extra(ctx: CollectorContext) -> dict[str, Any]:
+    """Return ``ctx.extra`` as a dict, tolerating older CollectorContext without the field."""
+    extra = getattr(ctx, "extra", None)
+    if isinstance(extra, dict):
+        return extra
+    # Fallback: read from WeeklyReportConfig.extra via env override (WEEKLY_EXTRA__key=value)
+    out: dict[str, Any] = {}
+    prefix = "WEEKLY_EXTRA__"
+    for k, v in os.environ.items():
+        if k.startswith(prefix):
+            out[k[len(prefix):]] = v
+    if out:
+        return out
+    return {}
+
+
 def _resolve_project_path(ctx: CollectorContext) -> str:
     """Resolve the GitLab project ``path_with_namespace`` for ``ctx.target_project_id``.
 
     Resolution order (first non-empty wins):
     1. ``WEEKLY_REPO_PATH`` env var (e.g. ``epc/dml_epc_auto``) — operator override
-    2. ``ctx.extra["repo_path_override"]`` — [weekly_report] table in configuration.toml
+    2. ``ctx.extra["repo_path_override"]`` — populated from [weekly_report] extra keys
+       or ``WEEKLY_EXTRA__repo_path_override`` env var
     3. GitLab API ``GET /projects/:id`` via ``GITLAB_URL`` + ``GITLAB_PERSONAL_ACCESS_TOKEN``
     4. Hardcoded fallback (``root/auto-review-test``) — preserved from upstream so an
        unconfigured install still produces a runnable (if wrong) URL.
@@ -126,10 +143,10 @@ def _resolve_project_path(ctx: CollectorContext) -> str:
         return env_path
 
     # 2. toml override via ctx.extra — populated from [weekly_report] extra keys
-    if isinstance(ctx.extra, dict):
-        toml_override = (ctx.extra.get("repo_path_override") or "").strip().strip("/")
-        if toml_override:
-            return toml_override
+    extra = _ctx_extra(ctx)
+    toml_override = (extra.get("repo_path_override") or "").strip().strip("/")
+    if toml_override:
+        return toml_override
 
     # 3. live GitLab API lookup
     if ctx.target_project_id:
@@ -327,4 +344,4 @@ def _detect_default_branch(repo: Path) -> str:
         return "main"
 
 
-__all__ = ["RepoScanCollector", "_resolve_project_path"]
+__all__ = ["RepoScanCollector", "_resolve_project_path", "_ctx_extra"]
